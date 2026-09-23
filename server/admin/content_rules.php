@@ -13,18 +13,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'add')
     $severity = $_POST['severity'] ?? 'MEDIUM';
 
     if ($ruleName !== '' && $pattern !== '') {
-        // Neu la REGEX, kiem tra pattern hop le truoc khi luu (tranh loi khi Agent chay regex sai)
         $isValid = true;
         if ($ruleType === 'REGEX') {
             $isValid = @preg_match('/' . $pattern . '/', '') !== false;
         }
-
         if ($isValid) {
             $stmt = $pdo->prepare("INSERT INTO content_rules (rule_name, rule_type, pattern, category, severity) VALUES (?, ?, ?, ?, ?)");
             $stmt->execute([$ruleName, $ruleType, $pattern, $category, $severity]);
             $message = 'Da them rule moi.';
         } else {
-            $message = 'Loi: Regex pattern khong hop le, vui long kiem tra lai.';
+            $message = 'Loi: Regex pattern khong hop le.';
         }
     }
 }
@@ -43,7 +41,7 @@ if (isset($_GET['delete'])) {
 
 $rules = $pdo->query("SELECT * FROM content_rules ORDER BY category, rule_name")->fetchAll();
 
-$pageTitle = 'Content Rules';
+$pageTitle = 'PII / Content Rules';
 $activeMenu = 'content_rules';
 require __DIR__ . '/../includes/layout_header.php';
 ?>
@@ -53,7 +51,7 @@ require __DIR__ . '/../includes/layout_header.php';
 <?php endif; ?>
 
 <div class="card">
-    <h2>Them Content Rule moi</h2>
+    <h2>Them Content Rule moi (PII / Finance / Noi bo)</h2>
     <form method="POST">
         <input type="hidden" name="action" value="add">
         <div class="form-group">
@@ -80,7 +78,7 @@ require __DIR__ . '/../includes/layout_header.php';
             </select>
         </div>
         <div class="form-group">
-            <label>Muc do nghiem trong</label>
+            <label>Muc do</label>
             <select name="severity">
                 <option value="LOW">LOW</option>
                 <option value="MEDIUM" selected>MEDIUM</option>
@@ -95,9 +93,7 @@ require __DIR__ . '/../includes/layout_header.php';
 <div class="card">
     <h2>Danh sach Content Rules (<?= count($rules) ?>)</h2>
     <table>
-        <thead>
-        <tr><th>Ten rule</th><th>Loai</th><th>Pattern</th><th>Danh muc</th><th>Muc do</th><th>Trang thai</th><th>Hanh dong</th></tr>
-        </thead>
+        <thead><tr><th>Ten rule</th><th>Loai</th><th>Pattern</th><th>Danh muc</th><th>Muc do</th><th>Trang thai</th><th>Hanh dong</th></tr></thead>
         <tbody>
         <?php foreach ($rules as $r): ?>
             <tr>
@@ -108,11 +104,8 @@ require __DIR__ . '/../includes/layout_header.php';
                 <td><span class="badge <?= severity_badge_class($r['severity']) ?>"><?= h($r['severity']) ?></span></td>
                 <td><?= $r['is_active'] ? 'Dang bat' : 'Da tat' ?></td>
                 <td>
-                    <a href="content_rules.php?toggle=<?= (int)$r['id'] ?>" class="btn btn-secondary btn-sm">
-                        <?= $r['is_active'] ? 'Tat' : 'Bat' ?>
-                    </a>
-                    <a href="content_rules.php?delete=<?= (int)$r['id'] ?>" class="btn btn-danger btn-sm"
-                       onclick="return confirm('Xoa rule nay?')">Xoa</a>
+                    <a href="content_rules.php?toggle=<?= (int)$r['id'] ?>" class="btn btn-secondary btn-sm"><?= $r['is_active'] ? 'Tat' : 'Bat' ?></a>
+                    <a href="content_rules.php?delete=<?= (int)$r['id'] ?>" class="btn btn-danger btn-sm" onclick="return confirm('Xoa rule nay?')">Xoa</a>
                 </td>
             </tr>
         <?php endforeach; ?>

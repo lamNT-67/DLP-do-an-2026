@@ -42,9 +42,6 @@ require __DIR__ . '/../includes/layout_header.php';
 
 <div class="card">
     <h2>Them Domain/IP/Port vao Blacklist</h2>
-    <p style="font-size:13px; color:#616e7c; margin-bottom:14px;">
-        Ap dung chung cho toan he thong (khong theo tung nhom) - dung cho exit point Network (Bai toan 2).
-    </p>
     <form method="POST">
         <input type="hidden" name="action" value="add">
         <div class="form-group">
@@ -57,11 +54,11 @@ require __DIR__ . '/../includes/layout_header.php';
         </div>
         <div class="form-group">
             <label>Gia tri</label>
-            <input type="text" name="value" placeholder="VD: drive.google.com hoac 22" required>
+            <input type="text" name="value" required>
         </div>
         <div class="form-group">
             <label>Mo ta</label>
-            <input type="text" name="description" placeholder="VD: Google Drive upload">
+            <input type="text" name="description">
         </div>
         <button type="submit" class="btn btn-primary">Them vao Blacklist</button>
     </form>
@@ -72,9 +69,6 @@ require __DIR__ . '/../includes/layout_header.php';
     <table>
         <thead><tr><th>Loai</th><th>Gia tri</th><th>Mo ta</th><th>Trang thai</th><th>Hanh dong</th></tr></thead>
         <tbody>
-        <?php if (empty($items)): ?>
-            <tr><td colspan="5">Chua co du lieu.</td></tr>
-        <?php endif; ?>
         <?php foreach ($items as $i): ?>
             <tr>
                 <td><?= h($i['target_type']) ?></td>
@@ -82,11 +76,8 @@ require __DIR__ . '/../includes/layout_header.php';
                 <td><?= h($i['description']) ?></td>
                 <td><?= $i['is_active'] ? 'Dang bat' : 'Da tat' ?></td>
                 <td>
-                    <a href="network_blacklist.php?toggle=<?= (int)$i['id'] ?>" class="btn btn-secondary btn-sm">
-                        <?= $i['is_active'] ? 'Tat' : 'Bat' ?>
-                    </a>
-                    <a href="network_blacklist.php?delete=<?= (int)$i['id'] ?>" class="btn btn-danger btn-sm"
-                       onclick="return confirm('Xoa muc nay?')">Xoa</a>
+                    <a href="network_blacklist.php?toggle=<?= (int)$i['id'] ?>" class="btn btn-secondary btn-sm"><?= $i['is_active'] ? 'Tat' : 'Bat' ?></a>
+                    <a href="network_blacklist.php?delete=<?= (int)$i['id'] ?>" class="btn btn-danger btn-sm" onclick="return confirm('Xoa?')">Xoa</a>
                 </td>
             </tr>
         <?php endforeach; ?>

@@ -3,7 +3,6 @@ require_once __DIR__ . '/../includes/auth.php';
 require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/../includes/helpers.php';
 
-// --- Bo loc ---
 $filterExitPoint = $_GET['exit_point_type'] ?? '';
 $filterAction = $_GET['action_taken'] ?? '';
 $filterHostname = trim($_GET['hostname'] ?? '');
@@ -11,34 +10,25 @@ $filterHostname = trim($_GET['hostname'] ?? '');
 $where = [];
 $params = [];
 
-if ($filterExitPoint !== '') {
-    $where[] = 'v.exit_point_type = ?';
-    $params[] = $filterExitPoint;
-}
-if ($filterAction !== '') {
-    $where[] = 'v.action_taken = ?';
-    $params[] = $filterAction;
-}
-if ($filterHostname !== '') {
-    $where[] = 'e.hostname LIKE ?';
-    $params[] = '%' . $filterHostname . '%';
-}
+if ($filterExitPoint !== '') { $where[] = 'l.exit_point_type = ?'; $params[] = $filterExitPoint; }
+if ($filterAction !== '')    { $where[] = 'l.action_taken = ?';    $params[] = $filterAction; }
+if ($filterHostname !== '')  { $where[] = 'd.hostname LIKE ?';     $params[] = '%' . $filterHostname . '%'; }
 
 $whereSql = $where ? ('WHERE ' . implode(' AND ', $where)) : '';
 
 $stmt = $pdo->prepare("
-    SELECT v.*, e.hostname, e.username
-    FROM violation_summary v
-    JOIN endpoints e ON v.endpoint_id = e.id
+    SELECT l.*, d.hostname, d.username
+    FROM logs l
+    JOIN devices d ON l.device_id = d.id
     $whereSql
-    ORDER BY v.occurred_at DESC
+    ORDER BY l.occurred_at DESC
     LIMIT 200
 ");
 $stmt->execute($params);
-$violations = $stmt->fetchAll();
+$logs = $stmt->fetchAll();
 
-$pageTitle = 'Nhat ky vi pham';
-$activeMenu = 'violations';
+$pageTitle = 'Logs';
+$activeMenu = 'logs';
 require __DIR__ . '/../includes/layout_header.php';
 ?>
 
@@ -65,15 +55,15 @@ require __DIR__ . '/../includes/layout_header.php';
         </div>
         <div class="form-group" style="margin-bottom:0;">
             <label>Hostname</label>
-            <input type="text" name="hostname" value="<?= h($filterHostname) ?>" placeholder="Tim theo ten may">
+            <input type="text" name="hostname" value="<?= h($filterHostname) ?>">
         </div>
         <button type="submit" class="btn btn-primary">Loc</button>
-        <a href="violations.php" class="btn btn-secondary">Xoa loc</a>
+        <a href="logs.php" class="btn btn-secondary">Xoa loc</a>
     </form>
 </div>
 
 <div class="card">
-    <h2>Ket qua (<?= count($violations) ?> ban ghi, toi da 200)</h2>
+    <h2>Ket qua (<?= count($logs) ?> ban ghi, toi da 200)</h2>
     <table>
         <thead>
         <tr>
@@ -82,24 +72,22 @@ require __DIR__ . '/../includes/layout_header.php';
         </tr>
         </thead>
         <tbody>
-        <?php if (empty($violations)): ?>
+        <?php if (empty($logs)): ?>
             <tr><td colspan="9">Khong co ban ghi nao khop bo loc.</td></tr>
         <?php endif; ?>
-        <?php foreach ($violations as $v): ?>
+        <?php foreach ($logs as $l): ?>
             <tr>
-                <td><?= h(format_datetime($v['occurred_at'])) ?></td>
-                <td><?= h($v['hostname']) ?> <?= $v['username'] ? '('.h($v['username']).')' : '' ?></td>
-                <td><?= h($v['exit_point_type']) ?></td>
-                <td><?= h($v['action_taken']) ?></td>
-                <td style="max-width:200px; word-break:break-all; font-size:12px;"><?= h($v['file_path'] ?? '-') ?></td>
-                <td style="font-size:12px;"><?= h($v['matched_rule_ids'] ?? '-') ?></td>
-                <td>
-                    <?php if ($v['confidence_score']): ?>
-                        <span class="badge <?= severity_badge_class($v['confidence_score']) ?>"><?= h($v['confidence_score']) ?></span>
-                    <?php else: ?>-<?php endif; ?>
-                </td>
-                <td style="font-size:12px;"><?= h($v['destination_value'] ?? '-') ?></td>
-                <td style="font-size:12px;"><?= h($v['process_name'] ?? '-') ?></td>
+                <td><?= h(format_datetime($l['occurred_at'])) ?></td>
+                <td><?= h($l['hostname']) ?> <?= $l['username'] ? '('.h($l['username']).')' : '' ?></td>
+                <td><?= h($l['exit_point_type']) ?></td>
+                <td><?= h($l['action_taken']) ?></td>
+                <td style="max-width:200px; word-break:break-all; font-size:12px;"><?= h($l['file_path'] ?? '-') ?></td>
+                <td style="font-size:12px;"><?= h($l['matched_rule_ids'] ?? '-') ?></td>
+                <td><?php if ($l['confidence_score']): ?>
+                    <span class="badge <?= severity_badge_class($l['confidence_score']) ?>"><?= h($l['confidence_score']) ?></span>
+                <?php else: ?>-<?php endif; ?></td>
+                <td style="font-size:12px;"><?= h($l['destination_value'] ?? '-') ?></td>
+                <td style="font-size:12px;"><?= h($l['process_name'] ?? '-') ?></td>
             </tr>
         <?php endforeach; ?>
         </tbody>

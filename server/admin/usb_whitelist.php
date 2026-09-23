@@ -30,10 +30,8 @@ if (isset($_GET['delete'])) {
 $groups = $pdo->query("SELECT id, name FROM groups ORDER BY name")->fetchAll();
 
 $items = $pdo->query("
-    SELECT u.*, g.name as group_name
-    FROM usb_whitelist u
-    LEFT JOIN groups g ON u.group_id = g.id
-    ORDER BY u.added_at DESC
+    SELECT u.*, g.name as group_name FROM usb_whitelist u
+    LEFT JOIN groups g ON u.group_id = g.id ORDER BY u.added_at DESC
 ")->fetchAll();
 
 $pageTitle = 'USB Whitelist';
@@ -47,21 +45,18 @@ require __DIR__ . '/../includes/layout_header.php';
 
 <div class="card">
     <h2>Them thiet bi USB vao Whitelist</h2>
-    <p style="font-size:13px; color:#616e7c; margin-bottom:14px;">
-        Thiet bi trong danh sach nay se khong bi ap dung policy CONTROLLED/BLOCKED (xem Bai toan 3 - phan Whitelist).
-    </p>
     <form method="POST">
         <input type="hidden" name="action" value="add">
         <div class="form-group">
             <label>Serial Number</label>
-            <input type="text" name="serial_number" placeholder="VD: SN123456789" required>
+            <input type="text" name="serial_number" required>
         </div>
         <div class="form-group">
             <label>Mo ta</label>
-            <input type="text" name="description" placeholder="VD: USB cong ty cap cho phong Ke toan">
+            <input type="text" name="description">
         </div>
         <div class="form-group">
-            <label>Ap dung cho nhom (de trong = ap dung toan bo)</label>
+            <label>Ap dung cho Group (de trong = toan bo)</label>
             <select name="group_id">
                 <option value="">-- Toan bo --</option>
                 <?php foreach ($groups as $g): ?>
@@ -79,7 +74,7 @@ require __DIR__ . '/../includes/layout_header.php';
         <thead><tr><th>Serial Number</th><th>Mo ta</th><th>Ap dung cho</th><th>Nguoi them</th><th>Ngay them</th><th>Hanh dong</th></tr></thead>
         <tbody>
         <?php if (empty($items)): ?>
-            <tr><td colspan="6">Chua co thiet bi nao trong whitelist.</td></tr>
+            <tr><td colspan="6">Chua co thiet bi nao.</td></tr>
         <?php endif; ?>
         <?php foreach ($items as $i): ?>
             <tr>
@@ -88,10 +83,7 @@ require __DIR__ . '/../includes/layout_header.php';
                 <td><?= h($i['group_name'] ?? 'Toan bo') ?></td>
                 <td><?= h($i['added_by']) ?></td>
                 <td><?= h(format_datetime($i['added_at'])) ?></td>
-                <td>
-                    <a href="usb_whitelist.php?delete=<?= (int)$i['id'] ?>" class="btn btn-danger btn-sm"
-                       onclick="return confirm('Go thiet bi nay khoi whitelist?')">Xoa</a>
-                </td>
+                <td><a href="usb_whitelist.php?delete=<?= (int)$i['id'] ?>" class="btn btn-danger btn-sm" onclick="return confirm('Go khoi whitelist?')">Xoa</a></td>
             </tr>
         <?php endforeach; ?>
         </tbody>

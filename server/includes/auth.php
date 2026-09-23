@@ -1,8 +1,4 @@
 <?php
-/**
- * Include file nay o dau moi trang trong /admin/ (tru login.php)
- * de bat buoc phai dang nhap moi xem duoc.
- */
 session_start();
 
 if (!isset($_SESSION['admin_id'])) {

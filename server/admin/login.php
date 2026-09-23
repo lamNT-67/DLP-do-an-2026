@@ -3,7 +3,6 @@ session_start();
 require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/../includes/helpers.php';
 
-// Neu da dang nhap roi thi vao thang dashboard
 if (isset($_SESSION['admin_id'])) {
     header('Location: dashboard.php');
     exit;
@@ -27,9 +26,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $_SESSION['admin_username'] = $admin['username'];
             $_SESSION['admin_full_name'] = $admin['full_name'];
             $_SESSION['admin_role'] = $admin['role'];
-
             $pdo->prepare("UPDATE admins SET last_login = NOW() WHERE id = ?")->execute([$admin['id']]);
-
             header('Location: dashboard.php');
             exit;
         } else {

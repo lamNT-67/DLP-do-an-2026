@@ -1,23 +1,16 @@
 <?php
-/**
- * Include file nay SAU khi da: session_start(), require auth.php,
- * va dat bien $pageTitle + $activeMenu truoc do.
- *
- * Vi du dau trang:
- *   $pageTitle = 'Dashboard';
- *   $activeMenu = 'dashboard';
- *   require '../includes/layout_header.php';
- */
 $activeMenu = $activeMenu ?? '';
 $menuItems = [
-    'dashboard'         => ['label' => 'Dashboard',         'href' => 'dashboard.php'],
-    'groups'            => ['label' => 'Nhom nguoi dung',    'href' => 'groups.php'],
-    'policy'            => ['label' => 'Policy Exit Point',  'href' => 'policy.php'],
-    'content_rules'     => ['label' => 'Content Rules',      'href' => 'content_rules.php'],
+    'dashboard'         => ['label' => 'Dashboard',          'href' => 'dashboard.php'],
+    'devices'           => ['label' => 'Devices',            'href' => 'devices.php'],
+    'groups'            => ['label' => 'Groups',             'href' => 'groups.php'],
+    'policies'          => ['label' => 'DLP Policies',       'href' => 'policies.php'],
+    'content_rules'     => ['label' => 'PII / Content Rules','href' => 'content_rules.php'],
+    'file_types'        => ['label' => 'File Types',         'href' => 'file_types.php'],
     'usb_whitelist'     => ['label' => 'USB Whitelist',      'href' => 'usb_whitelist.php'],
     'network_blacklist' => ['label' => 'Network Blacklist',  'href' => 'network_blacklist.php'],
-    'endpoints'         => ['label' => 'Endpoints',          'href' => 'endpoints.php'],
-    'violations'        => ['label' => 'Nhat ky vi pham',    'href' => 'violations.php'],
+    'logs'              => ['label' => 'Logs',               'href' => 'logs.php'],
+    'settings'          => ['label' => 'Settings',           'href' => 'settings.php'],
 ];
 ?>
 <!DOCTYPE html>

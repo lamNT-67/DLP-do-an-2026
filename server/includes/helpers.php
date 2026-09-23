@@ -1,30 +1,21 @@
 <?php
-/**
- * Ham tien ich dung chung.
- */
 
-// Sinh API token ngau nhien khi tao endpoint moi
-function generate_api_token(): string {
-    return bin2hex(random_bytes(24)); // chuoi hex 48 ky tu
+function generate_token(int $bytes = 24): string {
+    return bin2hex(random_bytes($bytes));
 }
 
-// Escape output ra HTML de tranh XSS khi in du lieu tu DB ra trang
 function h(?string $value): string {
     return htmlspecialchars($value ?? '', ENT_QUOTES, 'UTF-8');
 }
 
-// Class CSS cho badge theo state cua policy
-function state_badge_class(string $state): string {
-    return match ($state) {
-        'OPEN'       => 'badge-open',
-        'MONITORED'  => 'badge-monitored',
-        'CONTROLLED' => 'badge-controlled',
-        'BLOCKED'    => 'badge-blocked',
-        default      => '',
+function action_badge_class(string $action): string {
+    return match ($action) {
+        'BLOCK'        => 'badge-blocked',
+        'REPORT_ONLY'  => 'badge-monitored',
+        default        => '',
     };
 }
 
-// Class CSS cho badge theo severity/confidence
 function severity_badge_class(string $level): string {
     return match ($level) {
         'LOW'      => 'badge-low',
@@ -35,7 +26,10 @@ function severity_badge_class(string $level): string {
     };
 }
 
-// Format datetime cho de doc
+function status_dot_class(string $status): string {
+    return $status === 'ONLINE' ? 'dot-online' : 'dot-offline';
+}
+
 function format_datetime(?string $dt): string {
     if (!$dt) return '-';
     return date('d/m/Y H:i:s', strtotime($dt));
