@@ -2,11 +2,7 @@
 /**
  * POST /api/agent_heartbeat.php
  * Header: Authorization: Bearer {token}
- * Body (JSON): { "hostname": "...", "agent_version": "..." }
- *
- * Agent goi endpoint nay dinh ky (VD: moi 30-60s) de bao con hoat dong.
- * Neu server khong nhan duoc heartbeat qua lau, co the coi endpoint la OFFLINE
- * (xu ly bang 1 cron/job rieng, xem ghi chu trong dashboard.php).
+ * Body: { hostname, agent_version, ip_address? }
  */
 header('Content-Type: application/json; charset=utf-8');
 require_once __DIR__ . '/../config/database.php';
@@ -31,13 +27,16 @@ if (empty($token) || empty($hostname)) {
     fail(400, 'Missing token or hostname');
 }
 
+$ipAddress = $input['ip_address'] ?? $_SERVER['REMOTE_ADDR'] ?? null;
+
 $stmt = $pdo->prepare("
-    UPDATE endpoints
-    SET last_seen = NOW(), status = 'ONLINE', agent_version = ?
+    UPDATE devices
+    SET last_seen = NOW(), status = 'ONLINE', agent_version = ?, ip_address = COALESCE(?, ip_address)
     WHERE hostname = ? AND api_token = ?
 ");
 $stmt->execute([
     $input['agent_version'] ?? null,
+    $ipAddress,
     $hostname,
     $token,
 ]);

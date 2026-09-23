@@ -2,8 +2,6 @@
 /**
  * GET /api/agent_policy.php?hostname={hostname}
  * Header: Authorization: Bearer {token}
- *
- * Agent goi endpoint nay dinh ky (VD: moi 60s) de lay policy moi nhat.
  */
 header('Content-Type: application/json; charset=utf-8');
 require_once __DIR__ . '/../config/database.php';
@@ -13,7 +11,6 @@ function fail(int $code, string $message) {
     die(json_encode(['error' => $message]));
 }
 
-// --- Lay token tu header Authorization ---
 $headers = getallheaders();
 $authHeader = $headers['Authorization'] ?? $headers['authorization'] ?? '';
 $token = trim(str_replace('Bearer', '', $authHeader));
@@ -22,79 +19,90 @@ if (empty($token)) {
     fail(401, 'Missing API token');
 }
 
-// --- Lay hostname tu query string ---
 $hostname = $_GET['hostname'] ?? '';
 if (empty($hostname)) {
     fail(400, 'Missing hostname parameter');
 }
 
-// --- Kiem tra token khop voi endpoint ---
-$stmt = $pdo->prepare("SELECT id, group_id FROM endpoints WHERE hostname = ? AND api_token = ?");
+$stmt = $pdo->prepare("SELECT id, group_id FROM devices WHERE hostname = ? AND api_token = ?");
 $stmt->execute([$hostname, $token]);
-$endpoint = $stmt->fetch();
+$device = $stmt->fetch();
 
-if (!$endpoint) {
+if (!$device) {
     fail(403, 'Invalid hostname or token');
 }
 
-$groupId = $endpoint['group_id'];
+$deviceId = $device['id'];
+$groupId = $device['group_id'];
 
-// --- Cap nhat last_seen + status = ONLINE ---
-$pdo->prepare("UPDATE endpoints SET last_seen = NOW(), status = 'ONLINE' WHERE id = ?")
-    ->execute([$endpoint['id']]);
+$pdo->prepare("UPDATE devices SET last_seen = NOW(), status = 'ONLINE' WHERE id = ?")
+    ->execute([$deviceId]);
 
-// --- Lay ten nhom ---
-$groupName = null;
-if ($groupId) {
-    $stmt = $pdo->prepare("SELECT name FROM groups WHERE id = ?");
-    $stmt->execute([$groupId]);
-    $groupName = $stmt->fetchColumn() ?: null;
-}
+$stmt = $pdo->prepare("
+    SELECT DISTINCT p.*
+    FROM dlp_policies p
+    LEFT JOIN dlp_policy_devices pd ON pd.policy_id = p.id
+    WHERE p.is_active = 1
+      AND (
+            (p.target_type = 'GROUP'  AND p.target_group_id = ?)
+         OR (p.target_type = 'DEVICE' AND pd.device_id = ?)
+      )
+");
+$stmt->execute([$groupId, $deviceId]);
+$policyRows = $stmt->fetchAll();
 
-$policies = [];
+$applicablePolicies = [];
 
-if ($groupId) {
-    // --- Lay policy_rules cua nhom nay ---
-    $stmt = $pdo->prepare("SELECT id, exit_point_type, state FROM policy_rules WHERE group_id = ?");
-    $stmt->execute([$groupId]);
-    $policyRows = $stmt->fetchAll();
+foreach ($policyRows as $p) {
+    $policyId = $p['id'];
 
-    foreach ($policyRows as $row) {
-        $contentRules = [];
+    $stmt2 = $pdo->prepare("SELECT exit_point_type FROM dlp_policy_exit_points WHERE policy_id = ?");
+    $stmt2->execute([$policyId]);
+    $exitPoints = array_column($stmt2->fetchAll(), 'exit_point_type');
 
-        // Chi can lay content_rules neu state la MONITORED hoac CONTROLLED
-        if (in_array($row['state'], ['MONITORED', 'CONTROLLED'])) {
-            $stmt2 = $pdo->prepare("
-                SELECT cr.id, cr.rule_name, cr.rule_type, cr.pattern, cr.category, cr.severity
-                FROM policy_content_rules pcr
-                JOIN content_rules cr ON pcr.content_rule_id = cr.id
-                WHERE pcr.policy_id = ? AND cr.is_active = 1
-            ");
-            $stmt2->execute([$row['id']]);
-            $contentRules = $stmt2->fetchAll();
-        }
-
-        $policies[] = [
-            'exit_point_type' => $row['exit_point_type'],
-            'state'           => $row['state'],
-            'content_rules'   => $contentRules,
-        ];
+    $stmt2 = $pdo->prepare("
+        SELECT ft.extension, ft.category, ft.always_block_regardless_content
+        FROM dlp_policy_file_types pft
+        JOIN dlp_file_types ft ON pft.file_type_id = ft.id
+        WHERE pft.policy_id = ?
+    ");
+    $stmt2->execute([$policyId]);
+    $fileTypes = $stmt2->fetchAll();
+    foreach ($fileTypes as &$ft) {
+        $ft['always_block_regardless_content'] = (bool)$ft['always_block_regardless_content'];
     }
+    unset($ft);
+
+    $stmt2 = $pdo->prepare("
+        SELECT cr.id, cr.rule_name, cr.rule_type, cr.pattern, cr.category, cr.severity
+        FROM dlp_policy_content_rules pcr
+        JOIN content_rules cr ON pcr.content_rule_id = cr.id
+        WHERE pcr.policy_id = ? AND cr.is_active = 1
+    ");
+    $stmt2->execute([$policyId]);
+    $rules = $stmt2->fetchAll();
+
+    $applicablePolicies[] = [
+        'policy_id'      => (int)$policyId,
+        'policy_name'    => $p['name'],
+        'action'         => $p['action'],
+        'exit_points'    => $exitPoints,
+        'file_types'     => $fileTypes,
+        'content_rules'  => $rules,
+    ];
 }
 
-// --- Lay USB whitelist (theo nhom hoac ap dung chung group_id IS NULL) ---
 $stmt = $pdo->prepare("SELECT serial_number FROM usb_whitelist WHERE group_id = ? OR group_id IS NULL");
 $stmt->execute([$groupId]);
 $usbWhitelist = array_column($stmt->fetchAll(), 'serial_number');
 
-// --- Lay network blacklist (ap dung chung toan he thong) ---
 $stmt = $pdo->query("SELECT target_type, value FROM network_blacklist WHERE is_active = 1");
 $networkBlacklist = $stmt->fetchAll();
 
-// --- Tra response ---
 echo json_encode([
-    'group_name'        => $groupName,
-    'policies'          => $policies,
-    'usb_whitelist'     => $usbWhitelist,
-    'network_blacklist' => $networkBlacklist,
+    'hostname'            => $hostname,
+    'is_assigned'         => $groupId !== null,
+    'applicable_policies' => $applicablePolicies,
+    'usb_whitelist'       => $usbWhitelist,
+    'network_blacklist'   => $networkBlacklist,
 ], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
