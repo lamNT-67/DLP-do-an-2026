@@ -38,11 +38,16 @@ require __DIR__ . '/../includes/layout_header.php';
         <div class="form-group" style="margin-bottom:0;">
             <label>Exit Point</label>
             <select name="exit_point_type">
-                <option value="">-- Tat ca --</option>
-                <?php foreach (['USB','CLIPBOARD','NETWORK_WEB','NETWORK_SCP_SFTP','NETWORK_FTP','RDP'] as $ep): ?>
-                    <option value="<?= $ep ?>" <?= $filterExitPoint === $ep ? 'selected' : '' ?>><?= $ep ?></option>
-                <?php endforeach; ?>
-            </select>
+    <option value="">-- Tất cả Exit Point --</option>
+    <option value="USB"               <?= $filterExit === 'USB' ? 'selected' : '' ?>>USB / Removable Media</option>
+    <option value="CLIPBOARD"         <?= $filterExit === 'CLIPBOARD' ? 'selected' : '' ?>>Clipboard</option>
+    <option value="NETWORK_WEB"       <?= $filterExit === 'NETWORK_WEB' ? 'selected' : '' ?>>Network - Web/Cloud</option>
+    <option value="NETWORK_SCP_SFTP"  <?= $filterExit === 'NETWORK_SCP_SFTP' ? 'selected' : '' ?>>Network - SCP/SFTP</option>
+    <option value="NETWORK_FTP"       <?= $filterExit === 'NETWORK_FTP' ? 'selected' : '' ?>>Network - FTP</option>
+    <option value="RDP"               <?= $filterExit === 'RDP' ? 'selected' : '' ?>>Remote Desktop (RDP)</option>
+    <option value="EMAIL_CLIENT"      <?= $filterExit === 'EMAIL_CLIENT' ? 'selected' : '' ?>>E-mail Client</option>
+    <option value="CLOUD_SYNC_FOLDER" <?= $filterExit === 'CLOUD_SYNC_FOLDER' ? 'selected' : '' ?>>Cloud Sync Folder</option>
+</select>
         </div>
         <div class="form-group" style="margin-bottom:0;">
             <label>Hanh dong</label>
