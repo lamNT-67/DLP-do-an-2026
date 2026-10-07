@@ -1,0 +1,5 @@
+[agent]
+hostname = PC-KINHDOANH-01
+api_token = 
+enrollment_key = DAN-ENROLLMENT-KEY-TU-TRANG-SETTINGS-VAO-DAY
+server_url = http://localhost/dlp_server/api
