@@ -1,0 +1,5 @@
+agent/config.ini
+agent/logs/
+__pycache__/
+*.pyc
+agent/service/nssm.exe
