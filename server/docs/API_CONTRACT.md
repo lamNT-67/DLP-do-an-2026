@@ -71,9 +71,11 @@ Ví dụ trên minh họa thiết bị **chưa gán Group nhưng có policy gán
 
 `action`: `BLOCK` | `REPORT_ONLY`.
 
-`exit_points`: `USB` | `CLIPBOARD` | `NETWORK_WEB` | `NETWORK_SCP_SFTP` | `NETWORK_FTP` | `RDP`.
+`exit_points`: `USB` | `CLIPBOARD` | `NETWORK_WEB` | `NETWORK_SCP_SFTP` | `NETWORK_FTP` | `RDP` | `SCREEN_CAPTURE`.
 
 `is_assigned` hiện phản ánh việc có Group hay chưa, **không** phải có policy hay không. Với thiết bị chưa có Group, USB whitelist global và network blacklist vẫn được trả về.
+
+**SCREEN_CAPTURE:** khi policy action là `BLOCK`, Agent cần chặn thao tác capture mà Agent hỗ trợ; với `REPORT_ONLY` chỉ ghi nhận. Không áp dụng kiểm tra file type/content rule cho exit point này. Server chỉ cấu hình và phân phối policy, không trực tiếp chặn ảnh chụp.
 
 ## 3. POST agent_heartbeat.php
 
