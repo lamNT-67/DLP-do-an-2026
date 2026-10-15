@@ -126,7 +126,7 @@ CREATE TABLE IF NOT EXISTS dlp_policy_exceptions (
     INDEX idx_policy_exceptions_policy (policy_id)
 );
 
--- 15. USB whitelist
+-- 12. USB whitelist
 CREATE TABLE usb_whitelist (
     id              INT PRIMARY KEY AUTO_INCREMENT,
     serial_number   VARCHAR(100) NOT NULL UNIQUE,
@@ -137,7 +137,7 @@ CREATE TABLE usb_whitelist (
     FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE SET NULL
 );
 
--- 12. Network blacklist
+-- 13. Network blacklist
 CREATE TABLE network_blacklist (
     id              INT PRIMARY KEY AUTO_INCREMENT,
     target_type     ENUM('DOMAIN','IP','PORT') NOT NULL,
@@ -147,7 +147,7 @@ CREATE TABLE network_blacklist (
     created_at      DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
--- 13. LOGS - tab rieng
+-- 14. LOGS - tab rieng
 CREATE TABLE logs (
     id                  INT PRIMARY KEY AUTO_INCREMENT,
     device_id           INT NOT NULL,
@@ -168,7 +168,7 @@ CREATE TABLE logs (
     INDEX idx_logs_action (action_taken)
 );
 
--- 14. Admin
+-- 15. Admin
 CREATE TABLE admins (
     id              INT PRIMARY KEY AUTO_INCREMENT,
     username        VARCHAR(100) NOT NULL UNIQUE,
