@@ -10,7 +10,7 @@ $hostname = api_string($data, 'hostname', 100, true);
 $exit = api_string($data, 'exit_point_type', 40, true);
 $action = api_string($data, 'action_taken', 40, true);
 $occurred = api_string($data, 'occurred_at', 40, true);
-if (!in_array($exit, ['USB','CLIPBOARD','NETWORK_WEB','NETWORK_SCP_SFTP','NETWORK_FTP','RDP'], true)) api_error(400, 'Invalid exit_point_type');
+if (!in_array($exit, ['USB','CLIPBOARD','NETWORK_WEB','NETWORK_SCP_SFTP','NETWORK_FTP','RDP','SCREEN_CAPTURE'], true)) api_error(400, 'Invalid exit_point_type');
 if (!in_array($action, ['ALLOWED','LOGGED','BLOCKED_DELETE','BLOCKED_FIREWALL','BLOCKED_KILL'], true)) api_error(400, 'Invalid action_taken');
 try {
     $dt = new DateTimeImmutable($occurred);
