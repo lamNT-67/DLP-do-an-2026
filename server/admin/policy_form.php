@@ -13,8 +13,7 @@ $exitPointLabels = [
     'NETWORK_SCP_SFTP'  => 'Network - SCP/SFTP',
     'NETWORK_FTP'       => 'Network - FTP',
     'RDP'               => 'Remote Desktop (RDP)',
-    'EMAIL_CLIENT'      => 'E-mail Client (SMTP)',
-    'CLOUD_SYNC_FOLDER' => 'Cloud Sync Folder (Dropbox/OneDrive/Google Drive)',
+    'SCREEN_CAPTURE'    => 'Screen Capture (chặn chụp màn hình)',
 ];
 
 $groups = $pdo->query("SELECT id, name FROM groups ORDER BY name")->fetchAll();
@@ -246,6 +245,7 @@ require_once __DIR__ . '/../includes/layout_header.php';
 
     <div class="form-section">
         <h3>Bước 2 — Tick File Type cần chặn</h3>
+        <p class="hint">File Type áp dụng cho các kênh truyền file. SCREEN_CAPTURE không phụ thuộc File Type: chọn BLOCK để yêu cầu Agent chặn chụp màn hình.</p>
         <?php foreach ($fileTypesByCategory as $category => $items): ?>
         <h4><?= h($category) ?></h4>
         <div class="checkbox-list">
