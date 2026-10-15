@@ -93,7 +93,7 @@ CREATE TABLE dlp_policy_devices (
 -- 8. Exit point duoc tick trong Policy
 CREATE TABLE dlp_policy_exit_points (
     policy_id           INT NOT NULL,
-    exit_point_type     ENUM('USB','CLIPBOARD','NETWORK_WEB','NETWORK_SCP_SFTP','NETWORK_FTP','RDP') NOT NULL,
+    exit_point_type     ENUM('USB','CLIPBOARD','NETWORK_WEB','NETWORK_SCP_SFTP','NETWORK_FTP','RDP','SCREEN_CAPTURE') NOT NULL,
     PRIMARY KEY (policy_id, exit_point_type),
     FOREIGN KEY (policy_id) REFERENCES dlp_policies(id) ON DELETE CASCADE
 );
@@ -142,7 +142,7 @@ CREATE TABLE logs (
     id                  INT PRIMARY KEY AUTO_INCREMENT,
     device_id           INT NOT NULL,
     policy_id           INT DEFAULT NULL,
-    exit_point_type     ENUM('USB','CLIPBOARD','NETWORK_WEB','NETWORK_SCP_SFTP','NETWORK_FTP','RDP') NOT NULL,
+    exit_point_type     ENUM('USB','CLIPBOARD','NETWORK_WEB','NETWORK_SCP_SFTP','NETWORK_FTP','RDP','SCREEN_CAPTURE') NOT NULL,
     action_taken        ENUM('ALLOWED','LOGGED','BLOCKED_DELETE','BLOCKED_FIREWALL','BLOCKED_KILL') NOT NULL,
     file_path           VARCHAR(500),
     file_hash_sha256    VARCHAR(64),

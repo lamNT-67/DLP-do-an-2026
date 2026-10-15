@@ -1,48 +1,18 @@
 <?php
-/**
- * POST /api/agent_heartbeat.php
- * Header: Authorization: Bearer {token}
- * Body: { hostname, agent_version, ip_address? }
- */
+declare(strict_types=1);
 header('Content-Type: application/json; charset=utf-8');
 require_once __DIR__ . '/../config/database.php';
-
-function fail(int $code, string $message) {
-    http_response_code($code);
-    die(json_encode(['error' => $message]));
-}
-
-if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
-    fail(405, 'Method not allowed, use POST');
-}
-
-$headers = getallheaders();
-$authHeader = $headers['Authorization'] ?? $headers['authorization'] ?? '';
-$token = trim(str_replace('Bearer', '', $authHeader));
-
-$input = json_decode(file_get_contents('php://input'), true);
-$hostname = $input['hostname'] ?? '';
-
-if (empty($token) || empty($hostname)) {
-    fail(400, 'Missing token or hostname');
-}
-
-$ipAddress = $input['ip_address'] ?? $_SERVER['REMOTE_ADDR'] ?? null;
-
-$stmt = $pdo->prepare("
-    UPDATE devices
-    SET last_seen = NOW(), status = 'ONLINE', agent_version = ?, ip_address = COALESCE(?, ip_address)
-    WHERE hostname = ? AND api_token = ?
-");
-$stmt->execute([
-    $input['agent_version'] ?? null,
-    $ipAddress,
-    $hostname,
-    $token,
-]);
-
-if ($stmt->rowCount() === 0) {
-    fail(403, 'Invalid hostname or token');
-}
-
-echo json_encode(['status' => 'ok']);
+require_once __DIR__ . '/../includes/api_common.php';
+api_method('POST');
+$token = api_token();
+$data = api_json();
+$hostname = api_string($data, 'hostname', 100, true);
+$version = api_string($data, 'agent_version', 20);
+$ip = api_string($data, 'ip_address', 45) ?? ($_SERVER['REMOTE_ADDR'] ?? null);
+if ($ip !== null && filter_var($ip, FILTER_VALIDATE_IP) === false) api_error(400, 'Invalid IP address');
+try {
+    $device = api_device($pdo, $token, $hostname);
+    $stmt = $pdo->prepare("UPDATE devices SET last_seen = NOW(), status = 'ONLINE', agent_version = COALESCE(?, agent_version), ip_address = COALESCE(?, ip_address) WHERE id = ?");
+    $stmt->execute([$version, $ip, $device['id']]);
+    echo json_encode(['status' => 'ok']);
+} catch (PDOException $e) { api_db_error($e); }

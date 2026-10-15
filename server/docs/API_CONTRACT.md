@@ -1,194 +1,147 @@
-# API Contract — DLP System
+# DLP Agent–Server API Contract (v2)
 
-Tai lieu nay la "hop dong giao tiep" giua Agent va DLP Management Server.
-Nguoi lam Agent chi can doc file nay, KHONG can doc code PHP ben trong `/api/`.
+Tài liệu này mô tả API thực tế trên branch `fix/server-agent-api-validation`.
 
-Base URL (khi test trong mang LAN): `http://<IP-may-XAMPP>/dlp_server/api/`
+**Base URL (lab):** `http://<SERVER-IP>/dlp_server/api/`. Dùng HTTPS trong triển khai thực tế.
 
----
+## Xác thực
 
-## Xac thuc
+- `agent_register.php`: xác thực bằng enrollment key trong JSON.
+- Các endpoint còn lại: `Authorization: Bearer <api_token>`.
+- Agent lưu token được cấp khi đăng ký; không đăng ký lại sau mỗi lần restart. Hostname trùng sẽ nhận HTTP 409.
+- Gửi `Content-Type: application/json` cho tất cả POST.
 
-Moi request (tru khi noi khac) phai gui header:
+## 1. POST agent_register.php
 
-```
-Authorization: Bearer <api_token>
-```
-
-`api_token` duoc Admin tao san cho tung endpoint trong trang `admin/endpoints.php`,
-dua cho nguoi phu trach Agent dien vao file config cua Agent tren may do.
-
----
-
-## 1. GET /agent_policy.php?hostname={hostname}
-
-Agent goi dinh ky (khuyen nghi: moi 60 giay) de lay policy moi nhat.
-
-**Request**
-```
-GET /api/agent_policy.php?hostname=PC-KINHDOANH-01
-Authorization: Bearer test-token-kd-01
-```
-
-**Response 200 OK**
 ```json
 {
-    "group_name": "Kinh doanh",
-    "policies": [
-        {
-            "exit_point_type": "USB",
-            "state": "CONTROLLED",
-            "content_rules": [
-                {
-                    "id": 1,
-                    "rule_name": "PII_CCCD",
-                    "rule_type": "REGEX",
-                    "pattern": "\\b\\d{12}\\b",
-                    "category": "PII",
-                    "severity": "HIGH"
-                }
-            ]
-        },
-        { "exit_point_type": "CLIPBOARD", "state": "CONTROLLED", "content_rules": [] },
-        { "exit_point_type": "NETWORK_WEB", "state": "MONITORED", "content_rules": [] },
-        { "exit_point_type": "NETWORK_SCP_SFTP", "state": "BLOCKED", "content_rules": [] }
-    ],
-    "usb_whitelist": ["SN123456789"],
-    "network_blacklist": [
-        { "target_type": "DOMAIN", "value": "drive.google.com" },
-        { "target_type": "PORT", "value": "22" }
-    ]
+  "hostname": "PC-LAB-01",
+  "enrollment_key": "DLP-ENROLL-DEMO-2026",
+  "ip_address": "192.168.1.20",
+  "os_info": "Windows 10",
+  "username": "labuser",
+  "agent_version": "1.0.0"
 }
 ```
 
-**Cac gia tri enum can biet**
-- `exit_point_type`: `USB` | `CLIPBOARD` | `NETWORK_WEB` | `NETWORK_SCP_SFTP` | `NETWORK_FTP` | `RDP`
-- `state`: `OPEN` | `MONITORED` | `CONTROLLED` | `BLOCKED`
-  - `OPEN` → Agent KHONG can chay watcher cho kenh nay (tiet kiem tai nguyen).
-  - `MONITORED` → Agent van quet noi dung, luon CHO QUA, chi ghi log.
-  - `CONTROLLED` → Agent quet noi dung, neu vi pham thi CHAN.
-  - `BLOCKED` → Chan hoan toan, khong can quet noi dung.
-- `content_rules` chi co du lieu khi state la `MONITORED` hoac `CONTROLLED`.
-- `rule_type`: `REGEX` | `DICTIONARY` (voi DICTIONARY, `pattern` la chuoi tu khoa cach nhau boi dau phay, vi du `"Mat,Confidential,Noi bo"`)
-- `severity`: `LOW` | `MEDIUM` | `HIGH` | `CRITICAL`
+Bắt buộc: `hostname`, `enrollment_key`. Thành công: **201 Created**:
 
-**Loi co the gap**
-| Code | Y nghia |
+```json
+{
+  "status": "registered",
+  "device_id": 3,
+  "api_token": "<new-device-token>",
+  "note": "Unassigned until an admin assigns a group or device policy"
+}
+```
+
+`enrollment_key` demo và token mẫu chỉ dành cho lab. Không đưa chúng vào bản build Agent triển khai thực tế.
+
+## 2. GET agent_policy.php
+
+Header: `Authorization: Bearer <api_token>`. Không cần query hostname.
+
+```json
+{
+  "hostname": "PC-LAB-01",
+  "is_assigned": false,
+  "group_id": null,
+  "applicable_policies": [
+    {
+      "policy_id": 1,
+      "name": "USB lab policy",
+      "action": "BLOCK",
+      "exit_points": ["USB"],
+      "file_types": [
+        {"id": 1, "extension": "docx", "category": "DOCUMENT", "always_block_regardless_content": false}
+      ],
+      "content_rules": [
+        {"id": 1, "rule_name": "PII_CCCD", "rule_type": "REGEX", "pattern": "\\b\\d{12}\\b", "category": "PII", "severity": "HIGH"}
+      ],
+      "allowed_locations": [],
+      "allowed_files": []
+    }
+  ],
+  "usb_whitelist": [],
+  "network_blacklist": []
+}
+```
+
+Ví dụ trên minh họa thiết bị **chưa gán Group nhưng có policy gán trực tiếp**. Giá trị thực tế phụ thuộc database.
+
+`action`: `BLOCK` | `REPORT_ONLY`.
+
+`exit_points`: `USB` | `CLIPBOARD` | `NETWORK_WEB` | `NETWORK_SCP_SFTP` | `NETWORK_FTP` | `RDP` | `SCREEN_CAPTURE`.
+
+`is_assigned` hiện phản ánh việc có Group hay chưa, **không** phải có policy hay không. Với thiết bị chưa có Group, USB whitelist global và network blacklist vẫn được trả về.
+
+**SCREEN_CAPTURE:** khi policy action là `BLOCK`, Agent cần chặn thao tác capture mà Agent hỗ trợ; với `REPORT_ONLY` chỉ ghi nhận. Không áp dụng kiểm tra file type/content rule cho exit point này. Server chỉ cấu hình và phân phối policy, không trực tiếp chặn ảnh chụp.
+
+## 3. POST agent_heartbeat.php
+
+Header: `Authorization: Bearer <api_token>`.
+
+```json
+{
+  "hostname": "PC-LAB-01",
+  "agent_version": "1.0.0",
+  "ip_address": "192.168.1.20"
+}
+```
+
+Bắt buộc: `hostname`. Response 200: `{"status":"ok"}`.
+
+Khuyến nghị Agent gửi mỗi 30–60 giây. Trạng thái OFFLINE phụ thuộc logic timeout trên giao diện hoặc job server; heartbeat không tự đánh dấu thiết bị khác OFFLINE.
+
+## 4. POST agent_report.php
+
+Header: `Authorization: Bearer <api_token>`.
+
+```json
+{
+  "hostname": "PC-LAB-01",
+  "policy_id": null,
+  "exit_point_type": "USB",
+  "action_taken": "LOGGED",
+  "file_path": "C:\\Lab\\sample.txt",
+  "file_hash_sha256": null,
+  "matched_rule_ids": [1],
+  "confidence_score": "HIGH",
+  "destination_value": "USB-SERIAL",
+  "process_name": "explorer.exe",
+  "occurred_at": "2026-10-15T10:00:00Z"
+}
+```
+
+Bắt buộc: `hostname`, `exit_point_type`, `action_taken`, `occurred_at`.
+
+`action_taken`: `ALLOWED` | `LOGGED` | `BLOCKED_DELETE` | `BLOCKED_FIREWALL` | `BLOCKED_KILL`.
+
+`confidence_score`: `LOW` | `MEDIUM` | `HIGH` | `CRITICAL`.
+
+`occurred_at` phải là ISO 8601 có timezone, ví dụ `2026-10-15T10:00:00Z` hoặc `2026-10-15T17:00:00+07:00`. Server chuẩn hóa về UTC trước khi lưu vào cột DATETIME.
+
+`policy_id` có thể null; nếu có, phải là policy đang active và áp dụng cho thiết bị (theo Group hoặc Device). `matched_rule_ids` có thể là mảng số nguyên dương hoặc chuỗi `"1,2"`. SHA-256, nếu cung cấp, phải là 64 ký tự hex.
+
+Thành công: **201 Created**, ví dụ `{"status":"ok","id":42}`.
+
+## HTTP status
+
+| Status | Ý nghĩa |
 |---|---|
-| 400 | Thieu tham so `hostname` |
-| 401 | Thieu header `Authorization` |
-| 403 | `hostname` + token khong khop trong database |
-| 500 | Loi server/database |
+| 200 | GET policy hoặc heartbeat thành công |
+| 201 | Đăng ký Agent hoặc tạo log thành công |
+| 400 | JSON/field/enum/timestamp/policy không hợp lệ |
+| 401 | Token không hợp lệ hoặc không khớp thiết bị |
+| 403 | Enrollment key không hợp lệ |
+| 405 | Sai HTTP method |
+| 409 | Hostname đã đăng ký |
+| 413 | Body vượt giới hạn 64 KiB |
+| 415 | POST không gửi Content-Type application/json |
+| 500 | Lỗi nội bộ; chi tiết chỉ ghi vào server error log |
 
----
+## Lưu ý tích hợp
 
-## 2. POST /agent_report.php
-
-Agent goi moi khi co su kien tai exit point can ghi nhan (cho phep / canh bao / chan).
-
-**Request**
-```
-POST /api/agent_report.php
-Authorization: Bearer test-token-kd-01
-Content-Type: application/json
-
-{
-    "hostname": "PC-KINHDOANH-01",
-    "exit_point_type": "USB",
-    "policy_state": "CONTROLLED",
-    "action_taken": "BLOCKED_DELETE",
-    "file_path": "D:\\bao_cao_khach_hang.xlsx",
-    "file_hash_sha256": "a1b2c3d4...",
-    "matched_rule_ids": [1, 4],
-    "confidence_score": "HIGH",
-    "destination_value": "SN987654321",
-    "process_name": null,
-    "occurred_at": "2026-08-28T10:15:32Z"
-}
-```
-
-**Cac field bat buoc:** `hostname`, `exit_point_type`, `policy_state`, `action_taken`, `occurred_at`
-**Cac field tuy chon (co the null/bo qua):** `file_path`, `file_hash_sha256`, `matched_rule_ids`, `confidence_score`, `destination_value`, `process_name`
-
-**Ghi chu quan trong:**
-- `matched_rule_ids` co the gui dang mang JSON `[1, 4]` HOAC chuoi `"1,4"` — server tu chuan hoa, khong bat buoc phai giong 1 kieu.
-- `occurred_at` nen gui theo chuan ISO 8601 (`2026-08-28T10:15:32Z`), server tu convert sang dinh dang MySQL.
-- `policy_state` chi nhan `MONITORED` hoac `CONTROLLED` (khong gui `OPEN`/`BLOCKED` vi 2 state nay khong can quet/log chi tiet).
-- `action_taken`: `ALLOWED` | `LOGGED` | `BLOCKED_DELETE` | `BLOCKED_FIREWALL` | `BLOCKED_KILL`
-
-**Response 200 OK**
-```json
-{ "status": "ok", "id": 42 }
-```
-
-**Loi co the gap**
-| Code | Y nghia |
-|---|---|
-| 400 | Thieu field bat buoc, hoac JSON khong hop le |
-| 401 | Thieu header `Authorization` |
-| 403 | `hostname` + token khong khop |
-| 405 | Goi sai method (phai la POST) |
-
----
-
-## 3. POST /agent_heartbeat.php
-
-Agent goi dinh ky (khuyen nghi: moi 30-60 giay) de bao con hoat dong.
-Neu qua 5 phut khong co heartbeat, Server tu dong danh dau endpoint la `OFFLINE`
-(hien thi tren Dashboard/trang Endpoints).
-
-**Request**
-```
-POST /api/agent_heartbeat.php
-Authorization: Bearer test-token-kd-01
-Content-Type: application/json
-
-{
-    "hostname": "PC-KINHDOANH-01",
-    "agent_version": "1.0.0"
-}
-```
-
-**Response 200 OK**
-```json
-{ "status": "ok" }
-```
-
----
-
-## Cach lay API Token de test
-
-1. Dang nhap trang Admin (`admin/login.php`), vao muc "Endpoints".
-2. Tao endpoint moi (nhap hostname + chon nhom) → Server tu sinh token, hien thi 1 lan duy nhat.
-3. Copy token do dien vao file config cua Agent (vi du `config.ini`).
-
-**Du lieu mau da co san (seed trong schema.sql), dung ngay de test khong can tao moi:**
-
-| hostname | group | api_token |
-|---|---|---|
-| PC-KINHDOANH-01 | Kinh doanh | `test-token-kd-01` |
-| PC-IT-01 | IT | `test-token-it-01` |
-
----
-
-## Vi du test nhanh bang cURL (truoc khi Agent that goi vao)
-
-```bash
-# Lay policy
-curl "http://192.168.1.10/dlp_server/api/agent_policy.php?hostname=PC-KINHDOANH-01" \
-     -H "Authorization: Bearer test-token-kd-01"
-
-# Gui bao cao vi pham
-curl -X POST "http://192.168.1.10/dlp_server/api/agent_report.php" \
-     -H "Authorization: Bearer test-token-kd-01" \
-     -H "Content-Type: application/json" \
-     -d '{"hostname":"PC-KINHDOANH-01","exit_point_type":"USB","policy_state":"CONTROLLED","action_taken":"BLOCKED_DELETE","occurred_at":"2026-08-28T10:15:32Z"}'
-
-# Heartbeat
-curl -X POST "http://192.168.1.10/dlp_server/api/agent_heartbeat.php" \
-     -H "Authorization: Bearer test-token-kd-01" \
-     -H "Content-Type: application/json" \
-     -d '{"hostname":"PC-KINHDOANH-01","agent_version":"1.0.0"}'
-```
-
-(Thay `192.168.1.10` bang IP LAN thuc te cua may chay XAMPP)
+- Không còn sử dụng `policy_state` hoặc các trạng thái `OPEN/MONITORED/CONTROLLED/BLOCKED` của contract cũ.
+- Khi mất kết nối, Agent phải có chiến lược cache policy và retry riêng; server hiện chưa có policy version/ETag.
+- Các API chưa được kiểm thử end-to-end trên XAMPP/MySQL; cần chạy test với Agent trước khi triển khai.
