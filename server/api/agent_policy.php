@@ -4,42 +4,15 @@
 
 require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/../includes/helpers.php';
+require_once __DIR__ . '/../includes/api_common.php';
 
 header('Content-Type: application/json; charset=utf-8');
 
-// ---- 1. Xac thuc bang Bearer token (api_token cua device) ----
-$headers = getallheaders();
-$authHeader = $headers['Authorization'] ?? $headers['authorization'] ?? '';
-
-if (!preg_match('/Bearer\s+(.+)/', $authHeader, $m)) {
-    http_response_code(401);
-    echo json_encode(['error' => 'Thieu hoac sai dinh dang Authorization header. Can: Bearer <api_token>']);
-    exit;
-}
-$apiToken = trim($m[1]);
-
-$stmt = $pdo->prepare("SELECT * FROM devices WHERE api_token = ?");
-$stmt->execute([$apiToken]);
-$device = $stmt->fetch();
-
-if (!$device) {
-    http_response_code(401);
-    echo json_encode(['error' => 'api_token khong hop le. Device chua duoc dang ky hoac token sai.']);
-    exit;
-}
-
-// ---- 2. Device chua duoc gan Group -> chua co policy nao ca ----
-if ($device['group_id'] === null) {
-    echo json_encode([
-        'hostname'            => $device['hostname'],
-        'is_assigned'         => false,
-        'applicable_policies' => [],
-        'usb_whitelist'       => [],
-        'network_blacklist'   => [],
-        'note'                => 'Device chua duoc admin gan vao Group nao. Chua co policy ap dung.',
-    ]);
-    exit;
-}
+// Authenticate by device token. A device without a group can still have direct policies.
+api_method('GET');
+try {
+    $device = api_device($pdo, api_token());
+} catch (PDOException $e) { api_db_error($e); }
 
 // ---- 3. Lay danh sach policy ap dung: theo Group HOAC theo Device cu the ----
 $sql = "
@@ -132,8 +105,8 @@ $networkBlacklist = $stmt->fetchAll();
 // ---- 6. Tra ket qua ----
 echo json_encode([
     'hostname'            => $device['hostname'],
-    'is_assigned'         => true,
-    'group_id'            => (int)$device['group_id'],
+    'is_assigned'         => $device['group_id'] !== null,
+    'group_id'            => $device['group_id'] === null ? null : (int)$device['group_id'],
     'applicable_policies' => $applicablePolicies,
     'usb_whitelist'       => $usbWhitelist,
     'network_blacklist'   => $networkBlacklist,
