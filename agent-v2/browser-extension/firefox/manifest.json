@@ -1,0 +1,32 @@
+{
+  "manifest_version": 2,
+  "name": "DLP Lab Upload Guard Firefox",
+  "version": "0.1.0",
+  "description": "Lab prototype: checks file picker against local Agent rules.",
+  "permissions": [
+    "storage",
+    "alarms",
+    "http://127.0.0.1:18765/*"
+  ],
+  "background": {
+    "scripts": [
+      "../background.js"
+    ]
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "../content.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ],
+  "browser_action": {
+    "default_title": "DLP Upload Guard"
+  }
+}
