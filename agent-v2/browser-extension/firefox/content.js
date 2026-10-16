@@ -18,11 +18,11 @@
   }
   function refresh() {
     try {
-      browser.runtime.sendMessage({type: "GET_WEB_RULES"}, response => {
-        if (browser.runtime.lastError || !response) { lastSync = 0; return; }
+      browser.runtime.sendMessage({type: "GET_WEB_RULES"}).then(response => {
+        if (!response) { lastSync = 0; return; }
         rules = Array.isArray(response.webRules) ? response.webRules : [];
         lastSync = response.lastSync || 0;
-      });
+      }).catch(() => { lastSync = 0; });
     } catch (_) { lastSync = 0; }
   }
   refresh();
