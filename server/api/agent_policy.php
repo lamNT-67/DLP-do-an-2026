@@ -105,7 +105,8 @@ $networkBlacklist = $stmt->fetchAll();
 // ---- 6. Tra ket qua ----
 echo json_encode([
     'hostname'            => $device['hostname'],
-    'is_assigned'         => $device['group_id'] !== null,
+    // A device can be assigned directly via a DEVICE policy without belonging to any group.
+    'is_assigned'         => $device['group_id'] !== null || count($applicablePolicies) > 0,
     'group_id'            => $device['group_id'] === null ? null : (int)$device['group_id'],
     'applicable_policies' => $applicablePolicies,
     'usb_whitelist'       => $usbWhitelist,
