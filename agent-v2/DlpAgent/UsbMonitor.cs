@@ -55,6 +55,7 @@ internal sealed class UsbMonitor : IDisposable
                     InternalBufferSize = 32768
                 };
                 watcher.Created += OnFile;
+                watcher.Changed += OnFile;
                 watcher.Renamed += OnRename;
                 watcher.Error += (_, e) => _logger.LogWarning(e.GetException(), "USB watcher error on {Root}", root);
                 watcher.EnableRaisingEvents = true;
@@ -129,11 +130,24 @@ internal sealed record UsbRule(int PolicyId, string Action, HashSet<string> Exte
         if (!Extensions.Contains(ext)) return false;
         if (AllowedFiles.Any(x => string.Equals(x, Path.GetFileName(file), StringComparison.OrdinalIgnoreCase) ||
                                   string.Equals(x, file, StringComparison.OrdinalIgnoreCase))) return false;
-        if (AllowedLocations.Any(x =>
-            !string.IsNullOrWhiteSpace(x) && file.StartsWith(
-                Path.GetFullPath(x).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar,
-                StringComparison.OrdinalIgnoreCase))) return false;
+        if (AllowedLocations.Any(x => IsAllowedFolder(path: file, configuredFolder: x))) return false;
         return true;
+    }
+
+    private static bool IsAllowedFolder(string path, string configuredFolder)
+    {
+        // Ignore non-path exceptions (such as domains) in the USB file monitor.
+        if (string.IsNullOrWhiteSpace(configuredFolder) || !Path.IsPathFullyQualified(configuredFolder))
+            return false;
+        try
+        {
+            var folder = Path.GetFullPath(configuredFolder).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            return path.StartsWith(folder, StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception e) when (e is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return false;
+        }
     }
 }
 
