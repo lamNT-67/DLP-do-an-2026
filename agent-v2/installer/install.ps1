@@ -68,6 +68,8 @@ if (-not $isReinstall) {
         enrollment_key = $EnrollmentKey
         heartbeat_seconds = 45
         policy_refresh_seconds = 60
+        usb_monitor_enabled = $true
+        usb_enforce_block = $false
     } | ConvertTo-Json
     [IO.File]::WriteAllText($configPath, $config, [Text.UTF8Encoding]::new($false))
 } else {
