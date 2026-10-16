@@ -153,7 +153,7 @@ CREATE TABLE logs (
     device_id           INT NOT NULL,
     policy_id           INT DEFAULT NULL,
     exit_point_type     ENUM('USB','CLIPBOARD','NETWORK_WEB','NETWORK_SCP_SFTP','NETWORK_FTP','RDP','SCREEN_CAPTURE') NOT NULL,
-    action_taken        ENUM('ALLOWED','LOGGED','BLOCKED_DELETE','BLOCKED_FIREWALL','BLOCKED_KILL') NOT NULL,
+    action_taken        ENUM('ALLOWED','LOGGED','BLOCKED_DELETE','BLOCKED_FIREWALL','BLOCKED_KILL','BLOCKED_PROXY') NOT NULL,
     file_path           VARCHAR(500),
     file_hash_sha256    VARCHAR(64),
     matched_rule_ids    VARCHAR(255),
