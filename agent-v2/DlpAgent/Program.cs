@@ -32,6 +32,7 @@ internal sealed class AgentSettings
     [JsonPropertyName("policy_refresh_seconds")] public int PolicyRefreshSeconds { get; set; } = 60;
     [JsonPropertyName("usb_monitor_enabled")] public bool UsbMonitorEnabled { get; set; } = true;
     [JsonPropertyName("usb_enforce_block")] public bool UsbEnforceBlock { get; set; } = false;
+    [JsonPropertyName("http_proxy_enabled")] public bool HttpProxyEnabled { get; set; } = false;
 }
 
 internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundService
@@ -46,6 +47,7 @@ internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundServi
     private string? _token;
     private UsbMonitor? _usb;
     private NetworkPolicy? _networkPolicy;
+    private HttpUploadProxy? _httpProxy;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -89,6 +91,13 @@ internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundServi
         try { _networkPolicy.Start(); }
         catch (Exception ex) { logger.LogWarning(ex, "Browser policy bridge cannot start; USB/service can still run"); }
 
+        if (_settings.HttpProxyEnabled)
+        {
+            _httpProxy = new HttpUploadProxy(logger, ReportHttpAsync);
+            try { _httpProxy.Start(); }
+            catch (Exception ex) { logger.LogWarning(ex, "HTTP proxy cannot start (port 18766?)"); }
+        }
+
         DateTimeOffset nextHeartbeat = DateTimeOffset.MinValue, nextPolicy = DateTimeOffset.MinValue;
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -121,6 +130,7 @@ internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundServi
             try { await Task.Delay(TimeSpan.FromSeconds(3), stoppingToken); }
             catch (OperationCanceledException) { break; }
         }
+        _httpProxy?.Dispose();
         _networkPolicy?.Dispose();
         _usb?.Dispose();
         _http.Dispose();
@@ -208,6 +218,7 @@ internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundServi
         File.Move(temp, PolicyPath, true);
         _usb?.UpdatePolicy(body);
         _networkPolicy?.Update(body);
+        _httpProxy?.UpdatePolicy(body);
         logger.LogInformation("Policy refreshed: {Count} applicable policies", policies.GetArrayLength());
     }
 
@@ -233,6 +244,31 @@ internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundServi
         catch (Exception e) when (e is not OperationCanceledException)
         {
             logger.LogWarning(e, "USB event report failed for {File}", decision.FilePath);
+        }
+    }
+
+    private async Task ReportHttpAsync(int policyId, string fileName, string action, CancellationToken ct)
+    {
+        if (_token is null) return;
+        try
+        {
+            using var request = Request(HttpMethod.Post, "agent_report.php");
+            request.Content = JsonContent.Create(new
+            {
+                hostname = _settings.Hostname,
+                policy_id = policyId,
+                exit_point_type = "NETWORK_WEB",
+                action_taken = action,
+                file_path = fileName,
+                occurred_at = DateTimeOffset.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
+            });
+            using var response = await _http.SendAsync(request, ct);
+            if (!response.IsSuccessStatusCode)
+                logger.LogWarning("HTTP upload log rejected with status {Status}", (int)response.StatusCode);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger.LogWarning(ex, "HTTP upload event reporting failed");
         }
     }
 
