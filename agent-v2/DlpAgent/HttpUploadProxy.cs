@@ -124,7 +124,7 @@ internal sealed class HttpUploadProxy : IDisposable
             (!long.TryParse(length, out size) || size < 0 || size > MaxBodyBytes)) {
             await ReplyAsync(stream, 413, "Invalid or oversized request body", ct); return;
         }
-        if (method is "POST" or "PUT" or "PATCH" && !headers.ContainsKey("Content-Length")) {
+        if ((method is "POST" or "PUT" or "PATCH") && !headers.ContainsKey("Content-Length")) {
             await ReplyAsync(stream, 411, "Content-Length required", ct); return;
         }
         var body = new byte[(int)size];
@@ -132,7 +132,7 @@ internal sealed class HttpUploadProxy : IDisposable
 
         var contentType = headers.GetValueOrDefault("Content-Type") ?? "";
         var multipart = contentType.StartsWith("multipart/form-data", StringComparison.OrdinalIgnoreCase);
-        if (multipart && method is "POST" or "PUT" or "PATCH") {
+        if (multipart && (method is "POST" or "PUT" or "PATCH")) {
             var text = Encoding.Latin1.GetString(body);
             foreach (Match match in Filename.Matches(text)) {
                 var file = Path.GetFileName(match.Groups["name"].Value.Trim());
@@ -141,7 +141,7 @@ internal sealed class HttpUploadProxy : IDisposable
                 if (hit is null) continue;
                 if (hit.Value.Action == "BLOCK") {
                     _logger.LogWarning("HTTP upload blocked by policy {Policy}: {Name}", hit.Value.Id, file);
-                    await _report(hit.Value.Id, file, "BLOCK", ct);
+                    await _report(hit.Value.Id, file, "BLOCKED_PROXY", ct);
                     await ReplyAsync(stream, 403, "DLP policy blocked file type", ct);
                     return;
                 }
@@ -163,7 +163,6 @@ internal sealed class HttpUploadProxy : IDisposable
             }
             using var response = await _upstream.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
             var status = (int)response.StatusCode;
-            using var result = new MemoryStream();
             // Response is streamed directly; the proxy closes connection afterwards.
             var statusLine = Encoding.ASCII.GetBytes($"HTTP/1.1 {status} {response.ReasonPhrase}\r\nConnection: close\r\n");
             await stream.WriteAsync(statusLine, ct);
