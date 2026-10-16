@@ -57,8 +57,8 @@ function Assert-Icacls {
     & icacls.exe $Target @Options | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Failed to set ACL on $Target (icacls exit code $LASTEXITCODE)" }
 }
-Assert-Icacls $dataDir @('/inheritance:r')
 Assert-Icacls $dataDir @('/grant:r', '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F')
+Assert-Icacls $dataDir @('/inheritance:r')
 
 $tokenPath = Join-Path $dataDir 'token.dat'
 if (-not $isReinstall) {
@@ -79,8 +79,8 @@ if (-not $isReinstall) {
 # Explicitly repair known state files, including old installations.
 foreach ($stateFile in @($configPath, $tokenPath, (Join-Path $dataDir 'policy.json'))) {
     if (Test-Path -LiteralPath $stateFile) {
-        Assert-Icacls $stateFile @('/inheritance:r')
         Assert-Icacls $stateFile @('/grant:r', '*S-1-5-18:F', '*S-1-5-32-544:F')
+        Assert-Icacls $stateFile @('/inheritance:r')
     }
 }
 # Check config read access before installing/starting the service.
