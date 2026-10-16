@@ -1,0 +1,7 @@
+{
+  "server_url": "http://192.168.1.10/dlp_server/api",
+  "hostname": "PC-LAB-01",
+  "enrollment_key": "REPLACE_WITH_KEY_FROM_SERVER",
+  "heartbeat_seconds": 45,
+  "policy_refresh_seconds": 60
+}
