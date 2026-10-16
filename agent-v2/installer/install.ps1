@@ -63,13 +63,15 @@ if (-not (Test-Path $configPath)) {
 if ($LASTEXITCODE -ne 0) { throw 'Unable to restrict agent data permissions' }
 
 if (-not $service) {
-    & sc.exe create DLPAgent ('binPath= "' + $exe + '"') 'start= auto' 'obj= LocalSystem' 'DisplayName= DLP Agent'
-    if ($LASTEXITCODE -ne 0) { throw 'sc.exe create failed' }
+    # New-Service handles Service Control Manager argument quoting correctly,
+    # including the spaces in C:\Program Files.
+    New-Service -Name 'DLPAgent' -BinaryPathName ('"' + $exe + '"') `
+        -DisplayName 'DLP Agent' -StartupType Automatic -ErrorAction Stop | Out-Null
 } else {
-    & sc.exe config DLPAgent 'start= auto'
-    if ($LASTEXITCODE -ne 0) { throw 'sc.exe config failed' }
+    Set-Service -Name 'DLPAgent' -StartupType Automatic -ErrorAction Stop
 }
-& sc.exe failure DLPAgent 'reset= 86400' 'actions= restart/5000/restart/5000/restart/5000' | Out-Null
+# sc.exe needs separate arguments: option= VALUE (not a single string).
+& sc.exe failure DLPAgent reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Service recovery configuration failed' }
 Start-Service DLPAgent
 Start-Sleep -Seconds 5
