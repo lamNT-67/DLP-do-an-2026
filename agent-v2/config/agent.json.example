@@ -3,5 +3,7 @@
   "hostname": "PC-LAB-01",
   "enrollment_key": "REPLACE_WITH_KEY_FROM_SERVER",
   "heartbeat_seconds": 45,
-  "policy_refresh_seconds": 60
+  "policy_refresh_seconds": 60,
+  "usb_monitor_enabled": true,
+  "usb_enforce_block": false
 }
