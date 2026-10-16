@@ -103,6 +103,18 @@ def _block_connection(pid, remote_ip, remote_port):
         return "LOGGED"
 
 
+def _remove_rules(pattern):
+    if platform.system() != "Windows":
+        return
+    try:
+        subprocess.run(["powershell", "-NoProfile", "-Command",
+            "Get-NetFirewallRule -DisplayName '%s' -ErrorAction SilentlyContinue | "
+            "Remove-NetFirewallRule -ErrorAction SilentlyContinue" % pattern],
+            capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        print("[network_agent] Loi khi go rule %s: %s" % (pattern, e))
+
+
 def _get_process_name(pid):
     try:
         return psutil.Process(pid).name()
@@ -139,6 +151,7 @@ def run():
     last_heartbeat = 0.0
     reactive_ips = set()
     recent = {}
+    reactive_clean = False
 
     print("[network_agent] Bat dau giam sat tren %s ..." % hostname)
     while True:
@@ -164,6 +177,15 @@ def run():
         state = status["effective_action"]
 
         unconditional = status["is_governed"] and state == "BLOCK" and not status["content_rules"]
+        blocking = status["is_governed"] and state == "BLOCK"
+        if blocking:
+            reactive_clean = False
+        elif not reactive_clean:
+            _remove_rules("DLP_Block_*")
+            reactive_ips.clear()
+            recent.clear()
+            reactive_clean = True
+            print("[network_agent] Khong con policy chan web, da go cac rule DLP_Block_*")
         if now - last_sync >= PROACTIVE_SYNC_SECONDS:
             last_sync = now
             domains = [e["value"] for e in blacklist if e.get("target_type", "").upper() == "DOMAIN"]

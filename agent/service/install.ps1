@@ -173,8 +173,28 @@ try {
         Invoke-Nssm set $n AppRotateBytes 5242880
         Invoke-Nssm set $n AppExit Default Restart
         Invoke-Nssm set $n AppRestartDelay 5000
+        Invoke-Nssm set $n AppEnvironmentExtra "DLP_LOG_DIR=$LogDir"
         Invoke-Nssm start $n
         Write-Host "  da cai: $n"
+    }
+
+    # ---- 7b. Thong bao tren may endpoint ----
+    Step 'Cai thong bao khi bi chan'
+    $NotifyDir = Join-Path $InstallDir 'notify'
+    New-Item -ItemType Directory -Force $NotifyDir | Out-Null
+    $notifySrc = Join-Path $PSScriptRoot 'notify.ps1'
+    if (Test-Path $notifySrc) {
+        Stop-ScheduledTask -TaskName 'DLPNotifier' -ErrorAction SilentlyContinue
+        Copy-Item $notifySrc (Join-Path $NotifyDir 'notify.ps1') -Force
+        $act = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File "C:\DLP\notify\notify.ps1"'
+        $trg = New-ScheduledTaskTrigger -AtLogOn
+        $pri = New-ScheduledTaskPrincipal -GroupId 'BUILTIN\Users' -RunLevel Limited
+        $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
+        Register-ScheduledTask -TaskName 'DLPNotifier' -Action $act -Trigger $trg -Principal $pri -Settings $set -Force | Out-Null
+        Start-ScheduledTask -TaskName 'DLPNotifier'
+        Write-Host '  da cai: DLPNotifier (thong bao khi bi chan)'
+    } else {
+        Write-Host '  khong thay notify.ps1, bo qua phan thong bao'
     }
 
     # ---- 8. Kiem tra ----

@@ -20,6 +20,9 @@ foreach ($n in 'DLPNetworkAgent', 'DLPSftpScpAgent') {
     }
 }
 
+Stop-ScheduledTask -TaskName 'DLPNotifier' -ErrorAction SilentlyContinue
+Unregister-ScheduledTask -TaskName 'DLPNotifier' -Confirm:$false -ErrorAction SilentlyContinue
+Write-Host 'Da xoa tac vu thong bao DLPNotifier'
 Get-NetFirewallRule -DisplayName 'DLP_*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
 Write-Host 'Da xoa firewall rule DLP_*'
 

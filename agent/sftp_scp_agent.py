@@ -89,7 +89,7 @@ def _block_process_and_connection(proc, ip, port):
     except psutil.AccessDenied: pass
     if ip and port and platform.system() == "Windows":
         for proto in ("TCP", "UDP"):
-            rn = f"DLP_Block_{ip}_{port}_{proto}"
+            rn = f"DLP_BlockSftp_{ip}_{port}_{proto}"
             try:
                 chk = subprocess.run(["powershell", "-Command",
                     f"Get-NetFirewallRule -DisplayName '{rn}' -ErrorAction SilentlyContinue"],
@@ -104,12 +104,25 @@ def _block_process_and_connection(proc, ip, port):
     return "BLOCKED_KILL" if killed else "LOGGED"
 
 
+def _remove_rules(pattern):
+    if platform.system() != "Windows":
+        return
+    try:
+        subprocess.run(["powershell", "-NoProfile", "-Command",
+            f"Get-NetFirewallRule -DisplayName '{pattern}' -ErrorAction SilentlyContinue | "
+            f"Remove-NetFirewallRule -ErrorAction SilentlyContinue"],
+            capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"[sftp_scp_agent] Loi khi go rule {pattern}: {e}")
+
+
 def run():
     cfg = load_config()
     client = _ensure_registered(cfg)
     policy_cache, last_fetch = None, 0.0
     last_heartbeat = 0.0
     already = set()
+    reactive_clean = False
     print(f"[sftp_scp_agent] Bat dau giam sat tren {cfg['agent']['hostname']} ...")
     while True:
         now = time.time()
@@ -126,6 +139,15 @@ def run():
                 time.sleep(POLL_INTERVAL_SECONDS); continue
 
         aps = policy_cache.get("applicable_policies", [])
+        blocking = any(get_exit_point_status(aps, e)["effective_action"] == "BLOCK"
+                       for e in ("NETWORK_SCP_SFTP", "NETWORK_FTP"))
+        if blocking:
+            reactive_clean = False
+        elif not reactive_clean:
+            _remove_rules("DLP_BlockSftp_*")
+            already.clear()
+            reactive_clean = True
+            print("[sftp_scp_agent] Khong con policy chan SCP/SFTP/FTP, da go cac rule DLP_BlockSftp_*")
         for proc, ept in _detect_transferring_processes():
             status = get_exit_point_status(aps, ept)
             if not status["is_governed"]: continue
