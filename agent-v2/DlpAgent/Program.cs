@@ -1,0 +1,200 @@
+using System.Net;
+using System.Net.Http.Headers;
+using System.Net.Http.Json;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+
+namespace DlpAgent;
+
+internal static class Program
+{
+    public static async Task Main(string[] args)
+    {
+        var builder = Host.CreateApplicationBuilder(args);
+        builder.Services.AddWindowsService(options => options.ServiceName = "DLPAgent");
+        builder.Services.AddHostedService<AgentWorker>();
+        using var host = builder.Build();
+        await host.RunAsync();
+    }
+}
+
+internal sealed class AgentSettings
+{
+    [JsonPropertyName("server_url")] public string ServerUrl { get; set; } = "";
+    [JsonPropertyName("hostname")] public string Hostname { get; set; } = Environment.MachineName;
+    [JsonPropertyName("enrollment_key")] public string EnrollmentKey { get; set; } = "";
+    [JsonPropertyName("heartbeat_seconds")] public int HeartbeatSeconds { get; set; } = 45;
+    [JsonPropertyName("policy_refresh_seconds")] public int PolicyRefreshSeconds { get; set; } = 60;
+}
+
+internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundService
+{
+    private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true, WriteIndented = true };
+    private static readonly string StateDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "DLPAgent");
+    private static readonly string ConfigPath = Path.Combine(StateDir, "agent.json");
+    private static readonly string TokenPath = Path.Combine(StateDir, "token.dat");
+    private static readonly string PolicyPath = Path.Combine(StateDir, "policy.json");
+    private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(10) };
+    private AgentSettings _settings = new();
+    private string? _token;
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        try
+        {
+            if (!File.Exists(ConfigPath))
+            {
+                logger.LogError("Missing config: {Path}. Run installer first.", ConfigPath);
+                return;
+            }
+            _settings = JsonSerializer.Deserialize<AgentSettings>(await File.ReadAllTextAsync(ConfigPath, stoppingToken), JsonOptions)
+                ?? throw new InvalidOperationException("Invalid agent config");
+            if (!Uri.TryCreate(_settings.ServerUrl.TrimEnd('/') + "/", UriKind.Absolute, out var baseUrl) ||
+                (baseUrl.Scheme != Uri.UriSchemeHttp && baseUrl.Scheme != Uri.UriSchemeHttps))
+                throw new InvalidOperationException("server_url must be an absolute http(s) URL pointing to /api");
+            _http.BaseAddress = baseUrl;
+            _settings.Hostname = _settings.Hostname.Trim();
+            if (_settings.Hostname.Length == 0) throw new InvalidOperationException("hostname is empty");
+            _settings.HeartbeatSeconds = Math.Clamp(_settings.HeartbeatSeconds, 10, 3600);
+            _settings.PolicyRefreshSeconds = Math.Clamp(_settings.PolicyRefreshSeconds, 10, 3600);
+            _token = LoadToken();
+            logger.LogInformation("DLP Agent started for {Hostname}; server={Server}", _settings.Hostname, baseUrl);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "DLP Agent configuration error");
+            return;
+        }
+
+        // Cached policy is retained for diagnostics; no enforcement until modules are implemented.
+        if (File.Exists(PolicyPath))
+            logger.LogInformation("Found cached policy at {Path}", PolicyPath);
+
+        DateTimeOffset nextHeartbeat = DateTimeOffset.MinValue, nextPolicy = DateTimeOffset.MinValue;
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                if (_token is null)
+                {
+                    if (!await RegisterAsync(stoppingToken))
+                    {
+                        await Task.Delay(TimeSpan.FromSeconds(30), stoppingToken);
+                        continue;
+                    }
+                }
+                var now = DateTimeOffset.UtcNow;
+                if (now >= nextHeartbeat)
+                {
+                    await HeartbeatAsync(stoppingToken);
+                    nextHeartbeat = now.AddSeconds(_settings.HeartbeatSeconds);
+                }
+                if (now >= nextPolicy)
+                {
+                    await RefreshPolicyAsync(stoppingToken);
+                    nextPolicy = now.AddSeconds(_settings.PolicyRefreshSeconds);
+                }
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { break; }
+            catch (Exception ex) { logger.LogWarning(ex, "Agent cycle failed; will retry"); }
+            try { await Task.Delay(TimeSpan.FromSeconds(3), stoppingToken); }
+            catch (OperationCanceledException) { break; }
+        }
+        _http.Dispose();
+    }
+
+    private string? LoadToken()
+    {
+        if (!File.Exists(TokenPath)) return null;
+        try
+        {
+            var bytes = ProtectedData.Unprotect(File.ReadAllBytes(TokenPath), null, DataProtectionScope.LocalMachine);
+            return Encoding.UTF8.GetString(bytes);
+        }
+        catch (CryptographicException ex)
+        {
+            logger.LogError(ex, "Unable to decrypt saved token; refusing automatic re-enrollment");
+            // Prevent duplicate device registrations when a token exists but cannot be read.
+            throw;
+        }
+    }
+
+    private async Task<bool> RegisterAsync(CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(_settings.EnrollmentKey))
+        {
+            logger.LogError("Not registered and enrollment_key missing in config");
+            return false;
+        }
+        var payload = new {
+            hostname = _settings.Hostname, enrollment_key = _settings.EnrollmentKey,
+            os_info = Environment.OSVersion.VersionString, agent_version = "2.0.0-test"
+        };
+        using var resp = await _http.PostAsJsonAsync("agent_register.php", payload, ct);
+        if (resp.StatusCode == HttpStatusCode.Conflict)
+        {
+            logger.LogError("Registration rejected (409). Hostname already exists: recover token or reset device on server.");
+            return false;
+        }
+        if (!resp.IsSuccessStatusCode)
+        {
+            logger.LogWarning("Registration failed: HTTP {Status}", (int)resp.StatusCode);
+            return false;
+        }
+        using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync(ct));
+        var token = doc.RootElement.GetProperty("api_token").GetString();
+        if (string.IsNullOrWhiteSpace(token)) throw new InvalidOperationException("Server returned empty API token");
+        Directory.CreateDirectory(StateDir);
+        var encrypted = ProtectedData.Protect(Encoding.UTF8.GetBytes(token), null, DataProtectionScope.LocalMachine);
+        var tmp = TokenPath + ".tmp";
+        await File.WriteAllBytesAsync(tmp, encrypted, ct);
+        File.Move(tmp, TokenPath, true);
+        _token = token;
+        // Do not retain enrollment key on disk after registration.
+        _settings.EnrollmentKey = "";
+        await File.WriteAllTextAsync(ConfigPath, JsonSerializer.Serialize(_settings, JsonOptions), ct);
+        logger.LogInformation("Device registered and token stored encrypted");
+        return true;
+    }
+
+    private async Task HeartbeatAsync(CancellationToken ct)
+    {
+        using var req = Request(HttpMethod.Post, "agent_heartbeat.php");
+        req.Content = JsonContent.Create(new { hostname = _settings.Hostname, agent_version = "2.0.0-test" });
+        using var resp = await _http.SendAsync(req, ct);
+        if (resp.IsSuccessStatusCode) logger.LogInformation("Heartbeat OK");
+        else logger.LogWarning("Heartbeat HTTP {Status}", (int)resp.StatusCode);
+    }
+
+    private async Task RefreshPolicyAsync(CancellationToken ct)
+    {
+        using var req = Request(HttpMethod.Get, "agent_policy.php");
+        using var resp = await _http.SendAsync(req, ct);
+        if (!resp.IsSuccessStatusCode)
+        {
+            logger.LogWarning("Policy fetch HTTP {Status}", (int)resp.StatusCode);
+            return;
+        }
+        var body = await resp.Content.ReadAsStringAsync(ct);
+        using var json = JsonDocument.Parse(body);
+        if (!json.RootElement.TryGetProperty("applicable_policies", out var policies) || policies.ValueKind != JsonValueKind.Array)
+            throw new InvalidOperationException("Server policy response missing applicable_policies array");
+        // Atomic cache replacement: preserve old policy on interrupted writes.
+        var temp = PolicyPath + ".tmp";
+        await File.WriteAllTextAsync(temp, body, ct);
+        File.Move(temp, PolicyPath, true);
+        logger.LogInformation("Policy refreshed: {Count} applicable policies", policies.GetArrayLength());
+    }
+
+    private HttpRequestMessage Request(HttpMethod method, string relativeUrl)
+    {
+        var req = new HttpRequestMessage(method, relativeUrl);
+        req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _token);
+        return req;
+    }
+}
