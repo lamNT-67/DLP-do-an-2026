@@ -10,22 +10,28 @@ $principal = [Security.Principal.WindowsPrincipal] [Security.Principal.WindowsId
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw 'Run PowerShell as Administrator.'
 }
-if (-not $ServerUrl) { $ServerUrl = Read-Host 'Server API URL (http://IP/dlp_server/api)' }
-if (-not $EnrollmentKey) { $EnrollmentKey = Read-Host 'Enrollment key' }
-if (-not $Hostname) { throw 'Hostname cannot be empty' }
-$parsedUrl = $null
-if (-not [Uri]::TryCreate($ServerUrl, [UriKind]::Absolute, [ref]$parsedUrl) -or
-    $parsedUrl.Scheme -notin @('http','https')) {
-    throw 'ServerUrl must start with http:// or https://'
-}
-if ($parsedUrl.Scheme -eq 'http') {
-    Write-Warning 'HTTP exposes enrollment credentials on the network. Only use in an isolated lab; use HTTPS otherwise.'
+$dataDir = Join-Path $env:ProgramData 'DLPAgent'
+$configPath = Join-Path $dataDir 'agent.json'
+$isReinstall = Test-Path -LiteralPath $configPath
+if (-not $isReinstall) {
+    if (-not $ServerUrl) { $ServerUrl = Read-Host 'Server API URL (http://IP/dlp_server/api)' }
+    if (-not $EnrollmentKey) { $EnrollmentKey = Read-Host 'Enrollment key' }
+    if (-not $Hostname) { throw 'Hostname cannot be empty' }
+    $parsedUrl = $null
+    if (-not [Uri]::TryCreate($ServerUrl, [UriKind]::Absolute, [ref]$parsedUrl) -or
+        $parsedUrl.Scheme -notin @('http','https')) {
+        throw 'ServerUrl must start with http:// or https://'
+    }
+    if ($parsedUrl.Scheme -eq 'http') {
+        Write-Warning 'HTTP exposes enrollment credentials on the network. Only use in an isolated lab; use HTTPS otherwise.'
+    }
+} else {
+    Write-Host 'Existing agent.json found; retaining saved server URL, hostname and registration.'
 }
 $root = Split-Path $PSScriptRoot -Parent
 $project = Join-Path $root 'DlpAgent\DlpAgent.csproj'
 $publish = Join-Path $env:TEMP 'DlpAgent-v2-publish'
 $installDir = Join-Path $env:ProgramFiles 'DLPAgent'
-$dataDir = Join-Path $env:ProgramData 'DLPAgent'
 $exe = Join-Path $installDir 'DlpAgent.exe'
 if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
     throw 'Install .NET 8 SDK from Microsoft first.'
@@ -43,9 +49,19 @@ if ($service) {
 }
 Copy-Item (Join-Path $publish '*') $installDir -Recurse -Force
 
-$configPath = Join-Path $dataDir 'agent.json'
+# Set inheritance on the folder BEFORE writing configuration. This gives new files
+# the required SYSTEM / Administrators access rather than removing it afterwards.
+# On reinstall also repair any existing state file left with an empty ACL.
+function Assert-Icacls {
+    param([string]$Target, [string[]]$Options)
+    & icacls.exe $Target @Options | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Failed to set ACL on $Target (icacls exit code $LASTEXITCODE)" }
+}
+Assert-Icacls $dataDir @('/inheritance:r')
+Assert-Icacls $dataDir @('/grant:r', '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F')
+
 $tokenPath = Join-Path $dataDir 'token.dat'
-if (-not (Test-Path $configPath)) {
+if (-not $isReinstall) {
     $config = @{
         server_url = $ServerUrl.TrimEnd('/')
         hostname = $Hostname
@@ -58,9 +74,21 @@ if (-not (Test-Path $configPath)) {
     Write-Host 'Existing config preserved, including server URL and hostname.'
     if (Test-Path $tokenPath) { Write-Host 'Existing encrypted token preserved.' }
 }
-# Restrict state files: SYSTEM and local Administrators only.
-& icacls.exe $dataDir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /T /Q | Out-Null
-if ($LASTEXITCODE -ne 0) { throw 'Unable to restrict agent data permissions' }
+# Do not apply /inheritance:r /T to files: it can remove their only
+# inherited access entries, causing an empty ACL and "Access denied".
+# Explicitly repair known state files, including old installations.
+foreach ($stateFile in @($configPath, $tokenPath, (Join-Path $dataDir 'policy.json'))) {
+    if (Test-Path -LiteralPath $stateFile) {
+        Assert-Icacls $stateFile @('/inheritance:r')
+        Assert-Icacls $stateFile @('/grant:r', '*S-1-5-18:F', '*S-1-5-32-544:F')
+    }
+}
+# Check config read access before installing/starting the service.
+try {
+    $null = [IO.File]::ReadAllText($configPath)
+} catch {
+    throw "Config is not readable after ACL repair: $configPath : $($_.Exception.Message)"
+}
 
 if (-not $service) {
     # New-Service handles Service Control Manager argument quoting correctly,
