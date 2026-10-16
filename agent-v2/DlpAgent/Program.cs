@@ -45,6 +45,7 @@ internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundServi
     private AgentSettings _settings = new();
     private string? _token;
     private UsbMonitor? _usb;
+    private NetworkPolicy? _networkPolicy;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -84,6 +85,10 @@ internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundServi
             logger.LogWarning("USB monitor enabled. Actual deletion on BLOCK policies: {Enabled}", _settings.UsbEnforceBlock);
         }
 
+        _networkPolicy = new NetworkPolicy(logger);
+        try { _networkPolicy.Start(); }
+        catch (Exception ex) { logger.LogWarning(ex, "Browser policy bridge cannot start; USB/service can still run"); }
+
         DateTimeOffset nextHeartbeat = DateTimeOffset.MinValue, nextPolicy = DateTimeOffset.MinValue;
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -116,6 +121,7 @@ internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundServi
             try { await Task.Delay(TimeSpan.FromSeconds(3), stoppingToken); }
             catch (OperationCanceledException) { break; }
         }
+        _networkPolicy?.Dispose();
         _usb?.Dispose();
         _http.Dispose();
     }
@@ -201,6 +207,7 @@ internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundServi
         await File.WriteAllTextAsync(temp, body, ct);
         File.Move(temp, PolicyPath, true);
         _usb?.UpdatePolicy(body);
+        _networkPolicy?.Update(body);
         logger.LogInformation("Policy refreshed: {Count} applicable policies", policies.GetArrayLength());
     }
 
