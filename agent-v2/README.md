@@ -11,8 +11,9 @@
 - Install as a Windows Service called **DLPAgent**, set to automatic startup and restart-on-failure.
 - Preserve token and configuration across service restarts and machine reboots.
 - Avoid the previous race where two independent services both register the same hostname.
+- **USB file-type monitor (test version):** detect newly created/renamed files on removable drives, match the active policy's USB exit point and extension, respect allowed_files / allowed_locations, then send events via agent_report.php. BLOCK takes priority over REPORT_ONLY. Default is **log-only**, with no file deletion until explicitly enabled.
 
-**Not yet implemented:** USB/SCP/SFTP interception, browser upload prevention, screenshot blocking, file type enforcement, policy exception evaluation, event reporting, MSI packaging. This build is intentionally **monitoring/control-plane only** and creates no firewall rules or process-kill actions. Do not use it as DLP protection yet.
+**Not yet implemented:** kernel-level pre-write USB interception, SCP/SFTP enforcement, browser upload prevention, screenshot blocking, event retry queue, MSI packaging. USB enforcement is currently **best effort, post-write**: data may already have been copied to USB before deletion and some copies may be missed. No firewall rules or process kills are created. Use only in a disposable test VM, not as reliable DLP protection.
 
 ## Requirements
 
@@ -45,6 +46,15 @@ Get-Content "C:\ProgramData\DLPAgent\policy.json"
 The policy JSON appears after the first successful sync. Review service errors in **Event Viewer → Windows Logs → Application**. Alternatively, stop the service and run `DlpAgent.exe` manually from an elevated terminal for console logs (do not run both at once).
 
 If the hostname already exists on the Server and `token.dat` is lost, registration will return HTTP 409. Restore the prior token securely or explicitly remove the stale device from Server before re-enrolling. Do **not** delete server data without reviewing logs.
+
+## USB File Type block test
+
+1. In Admin, create an **active** policy targeting this Device (or its Group), select **USB**, choose a file type (e.g. `.txt`), and choose **BLOCK**. Wait until `policy.json` reflects the change. Policy needs to match the actual file extension; no content scanning is performed.
+2. Start in observation mode. Default `usb_monitor_enabled: true` and `usb_enforce_block: false`; this logs matches to Server with `action_taken: LOGGED`, without deleting files.
+3. For an isolated VM/test USB with disposable files only, edit `C:\\ProgramData\\DLPAgent\\agent.json` as Administrator and set `"usb_enforce_block": true`. Restart the service with `Restart-Service DLPAgent`. A newly copied matching file on a Windows drive identified as `DriveType.Removable` will be **deleted after creation if possible** and reported with `BLOCKED_DELETE`.
+4. A nonmatching file must remain. An `allowed_files` or `allowed_locations` exception also causes the file to be skipped. Do not test on valuable drives/files.
+
+**Limits:** Requires a USB volume exposed as `DriveType.Removable`; USB external disks exposed as Fixed may not be monitored. FileSystemWatcher can miss events, and locked/long-running transfers can be missed. It does not guarantee prevention of data exfiltration; even a deleted file may have been copied. This is not a production endpoint-protection mechanism.
 
 ## Uninstall
 
