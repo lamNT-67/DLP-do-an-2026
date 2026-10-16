@@ -5,5 +5,6 @@
   "heartbeat_seconds": 45,
   "policy_refresh_seconds": 60,
   "usb_monitor_enabled": true,
-  "usb_enforce_block": false
+  "usb_enforce_block": false,
+  "http_proxy_enabled": false
 }
