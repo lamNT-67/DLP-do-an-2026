@@ -30,6 +30,8 @@ internal sealed class AgentSettings
     [JsonPropertyName("enrollment_key")] public string EnrollmentKey { get; set; } = "";
     [JsonPropertyName("heartbeat_seconds")] public int HeartbeatSeconds { get; set; } = 45;
     [JsonPropertyName("policy_refresh_seconds")] public int PolicyRefreshSeconds { get; set; } = 60;
+    [JsonPropertyName("usb_monitor_enabled")] public bool UsbMonitorEnabled { get; set; } = true;
+    [JsonPropertyName("usb_enforce_block")] public bool UsbEnforceBlock { get; set; } = false;
 }
 
 internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundService
@@ -42,6 +44,7 @@ internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundServi
     private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(10) };
     private AgentSettings _settings = new();
     private string? _token;
+    private UsbMonitor? _usb;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -75,6 +78,12 @@ internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundServi
         if (File.Exists(PolicyPath))
             logger.LogInformation("Found cached policy at {Path}", PolicyPath);
 
+        if (_settings.UsbMonitorEnabled)
+        {
+            _usb = new UsbMonitor(logger, _settings.UsbEnforceBlock);
+            logger.LogWarning("USB monitor enabled. Actual deletion on BLOCK policies: {Enabled}", _settings.UsbEnforceBlock);
+        }
+
         DateTimeOffset nextHeartbeat = DateTimeOffset.MinValue, nextPolicy = DateTimeOffset.MinValue;
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -88,6 +97,8 @@ internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundServi
                         continue;
                     }
                 }
+                _usb?.RefreshDrives();
+                if (_usb is not null) await _usb.DrainAsync(ReportUsbAsync, stoppingToken);
                 var now = DateTimeOffset.UtcNow;
                 if (now >= nextHeartbeat)
                 {
@@ -105,6 +116,7 @@ internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundServi
             try { await Task.Delay(TimeSpan.FromSeconds(3), stoppingToken); }
             catch (OperationCanceledException) { break; }
         }
+        _usb?.Dispose();
         _http.Dispose();
     }
 
@@ -188,7 +200,33 @@ internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundServi
         var temp = PolicyPath + ".tmp";
         await File.WriteAllTextAsync(temp, body, ct);
         File.Move(temp, PolicyPath, true);
+        _usb?.UpdatePolicy(body);
         logger.LogInformation("Policy refreshed: {Count} applicable policies", policies.GetArrayLength());
+    }
+
+    private async Task ReportUsbAsync(UsbDecision decision, CancellationToken ct)
+    {
+        if (_token is null) return;
+        try
+        {
+            using var req = Request(HttpMethod.Post, "agent_report.php");
+            req.Content = JsonContent.Create(new
+            {
+                hostname = _settings.Hostname,
+                policy_id = decision.PolicyId,
+                exit_point_type = "USB",
+                action_taken = decision.Action,
+                file_path = decision.FilePath,
+                occurred_at = DateTimeOffset.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
+            });
+            using var response = await _http.SendAsync(req, ct);
+            if (!response.IsSuccessStatusCode)
+                logger.LogWarning("USB report HTTP {Status}: {File}", (int)response.StatusCode, decision.FilePath);
+        }
+        catch (Exception e) when (e is not OperationCanceledException)
+        {
+            logger.LogWarning(e, "USB event report failed for {File}", decision.FilePath);
+        }
     }
 
     private HttpRequestMessage Request(HttpMethod method, string relativeUrl)
