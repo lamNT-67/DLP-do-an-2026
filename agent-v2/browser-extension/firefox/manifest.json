@@ -10,7 +10,7 @@
   ],
   "background": {
     "scripts": [
-      "../background.js"
+      "background.js"
     ]
   },
   "content_scripts": [
@@ -20,7 +20,7 @@
         "https://*/*"
       ],
       "js": [
-        "../content.js"
+        "content.js"
       ],
       "run_at": "document_start",
       "all_frames": true
