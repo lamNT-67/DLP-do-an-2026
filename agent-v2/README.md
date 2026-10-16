@@ -56,7 +56,26 @@ If the hostname already exists on the Server and `token.dat` is lost, registrati
 
 **Limits:** Requires a USB volume exposed as `DriveType.Removable`; USB external disks exposed as Fixed may not be monitored. FileSystemWatcher can miss events, and locked/long-running transfers can be missed. It does not guarantee prevention of data exfiltration; even a deleted file may have been copied. This is not a production endpoint-protection mechanism.
 
+
+## Web upload and protocol upload prototypes (agent-test)
+
+**Chrome Web Upload Guard:** The Windows Service exposes a minimal, read-only policy snapshot at `http://127.0.0.1:18765/rules` (bound only to localhost). In Chrome, open `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and select `agent-v2/browser-extension`. The extension refreshes matching `NETWORK_WEB` file extensions from the Agent. Test a disposable `.txt` file using a basic HTML file picker or drag/drop form on a test webpage while an active BLOCK policy includes `NETWORK_WEB` and `.txt`. Matching selections are cleared and some file drops/submits are blocked in the page before normal handlers run. The extension needs to be installed in each browser profile; a service alone cannot block Chrome uploads.
+
+**Firefox Web Upload Guard:** Open `about:debugging#/runtime/this-firefox` → **Load Temporary Add-on** and choose `agent-v2/browser-extension/firefox/manifest.json`. This is a temporary development extension and disappears after browser restart unless packaged/signed properly.
+
+**Limitations:** This is a **best-effort extension prototype**, not reliable browser upload interception. It does not guarantee prevention of fetch/XHR, dynamically generated blobs, paste uploads, network requests triggered before an extension is initialized, specialized drag/drop implementations, or unsupported tabs. Web pages cannot normally read the bridge response through CORS; however it is readable by any local process, so it intentionally contains no secret/token. Browser rule matching uses file extensions only and does not yet apply allowed-files/allowed-locations exceptions or report per-upload events to the Server. If no fresh Agent policy is available, the extension fails open to preserve browsing; do not rely on it as a security boundary.
+
+**SCP/SFTP/FTP guarded command launcher:** For a *controlled lab transfer* use `agent-v2/protocol-guard/guarded-upload.ps1`. This launcher checks the locally synchronized Agent policy and denies transfers of matching file extensions for `NETWORK_SCP_SFTP` (SCP and SFTP) or `NETWORK_FTP` (FTP) **before invoking the client**:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\agent-v2\protocol-guard\guarded-upload.ps1 -Protocol SCP -File C:\Lab\secret.txt -Destination "kali@192.168.106.131:/tmp/" -DryRun
+powershell -ExecutionPolicy Bypass -File .\agent-v2\protocol-guard\guarded-upload.ps1 -Protocol SCP -File C:\Lab\secret.txt -Destination "kali@192.168.106.131:/tmp/"
+```
+
+For `-Protocol SFTP`, use an `sftp://...` URL and `curl.exe` with SFTP support; FTP uses `ftp://...` or `ftps://...`. Authentication is delegated to the chosen system client. Use `-DryRun` first. This launcher has **no capability to intercept arbitrary** `scp.exe`, WinSCP, FileZilla, or browser traffic if the user does not invoke the launcher. It does not create a firewall rule, terminate processes, or send protocol events to the Server. The CLI guard fails closed when it cannot fetch Agent policy. For true system-wide enforcement, additional OS/network integration is required. Do not claim those protocols are universally blocked yet.
+
 ## Uninstall
+
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\agent-v2\installer\uninstall.ps1
