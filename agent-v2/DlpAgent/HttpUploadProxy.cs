@@ -105,9 +105,15 @@ internal sealed class HttpUploadProxy : IDisposable
                 await ReplyAsync(stream, 400, "Duplicate header rejected", ct); return;
             }
         }
-        if (headers.ContainsKey("Transfer-Encoding") || headers.ContainsKey("Upgrade") ||
-            headers.ContainsKey("Expect")) {
+        if (headers.ContainsKey("Transfer-Encoding") || headers.ContainsKey("Upgrade")) {
             await ReplyAsync(stream, 501, "Unsupported streaming or upgrade request", ct); return;
+        }
+        // curl and browsers may wait for HTTP 100 Continue before sending a
+        // multipart body. Acknowledge only this exact expectation; do not relay
+        // Expect upstream after the proxy has consumed and inspected the body.
+        var expectsContinue = headers.TryGetValue("Expect", out var expectation);
+        if (expectsContinue && !string.Equals(expectation, "100-continue", StringComparison.OrdinalIgnoreCase)) {
+            await ReplyAsync(stream, 417, "Expectation Failed", ct); return;
         }
         var target = first[1];
         if (!Uri.TryCreate(target, UriKind.Absolute, out var uri) || uri.Scheme != Uri.UriSchemeHttp ||
@@ -127,6 +133,10 @@ internal sealed class HttpUploadProxy : IDisposable
         if ((method is "POST" or "PUT" or "PATCH") && !headers.ContainsKey("Content-Length")) {
             await ReplyAsync(stream, 411, "Content-Length required", ct); return;
         }
+        if (expectsContinue && size > 0) {
+            await stream.WriteAsync(Encoding.ASCII.GetBytes("HTTP/1.1 100 Continue\r\n\r\n"), ct);
+            await stream.FlushAsync(ct);
+        }
         var body = new byte[(int)size];
         if (size > 0) await stream.ReadExactlyAsync(body, ct);
 
@@ -145,7 +155,7 @@ internal sealed class HttpUploadProxy : IDisposable
                     await ReplyAsync(stream, 403, "DLP policy blocked file type", ct);
                     return;
                 }
-                await _report(hit.Value.Id, file, "REPORT_ONLY", ct);
+                await _report(hit.Value.Id, file, "LOGGED", ct);
             }
         }
 
@@ -157,7 +167,8 @@ internal sealed class HttpUploadProxy : IDisposable
                 if (pair.Key.Equals("Host", StringComparison.OrdinalIgnoreCase) ||
                     pair.Key.Equals("Connection", StringComparison.OrdinalIgnoreCase) ||
                     pair.Key.Equals("Proxy-Connection", StringComparison.OrdinalIgnoreCase) ||
-                    pair.Key.Equals("Content-Length", StringComparison.OrdinalIgnoreCase)) continue;
+                    pair.Key.Equals("Content-Length", StringComparison.OrdinalIgnoreCase) ||
+                    pair.Key.Equals("Expect", StringComparison.OrdinalIgnoreCase)) continue;
                 if (!request.Headers.TryAddWithoutValidation(pair.Key, pair.Value))
                     request.Content?.Headers.TryAddWithoutValidation(pair.Key, pair.Value);
             }
