@@ -70,6 +70,7 @@ if (-not $isReinstall) {
         policy_refresh_seconds = 60
         usb_monitor_enabled = $true
         usb_enforce_block = $false
+        http_proxy_enabled = $false
     } | ConvertTo-Json
     [IO.File]::WriteAllText($configPath, $config, [Text.UTF8Encoding]::new($false))
 } else {
