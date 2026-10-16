@@ -1,0 +1,28 @@
+name: Build DLP Agent v2
+
+on:
+  push:
+    branches: [agent-test]
+    paths:
+      - 'agent-v2/DlpAgent/**'
+      - '.github/workflows/build-agent-v2.yml'
+  pull_request:
+    paths:
+      - 'agent-v2/DlpAgent/**'
+
+jobs:
+  windows-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Restore and compile
+        run: dotnet build agent-v2/DlpAgent/DlpAgent.csproj -c Release -r win-x64
+      - name: Publish self-contained binary
+        run: dotnet publish agent-v2/DlpAgent/DlpAgent.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o agent-v2-publish
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DlpAgent-v2-win-x64
+          path: agent-v2-publish/
