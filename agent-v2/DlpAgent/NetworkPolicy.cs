@@ -127,15 +127,25 @@ internal sealed class NetworkPolicy : IDisposable
             return;
         }
         if (request.ContentType?.StartsWith("application/json", StringComparison.OrdinalIgnoreCase) != true ||
-            request.ContentLength64 is < 2 or > 4096)
+            request.ContentLength64 > 4096)
         {
             response.StatusCode = 400;
             return;
         }
         try
         {
-            using var reader = new StreamReader(request.InputStream, Encoding.UTF8, leaveOpen: true);
-            var body = await reader.ReadToEndAsync(ct);
+            // Extension fetch may send chunked JSON without Content-Length.
+            // Enforce the same 4 KiB cap while reading, regardless of framing.
+            using var incoming = new MemoryStream();
+            var buffer = new byte[1024];
+            while (true)
+            {
+                var n = await request.InputStream.ReadAsync(buffer.AsMemory(0, Math.Min(buffer.Length, 4097 - (int)incoming.Length)), ct);
+                if (n == 0) break;
+                incoming.Write(buffer, 0, n);
+                if (incoming.Length > 4096) { response.StatusCode = 413; return; }
+            }
+            var body = Encoding.UTF8.GetString(incoming.ToArray());
             using var doc = JsonDocument.Parse(body);
             var node = doc.RootElement;
             var channel = node.GetProperty("channel").GetString() ?? "";
