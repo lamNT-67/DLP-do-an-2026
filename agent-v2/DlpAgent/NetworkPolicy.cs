@@ -20,7 +20,8 @@ internal sealed class NetworkPolicy : IDisposable
     {
         using var doc = JsonDocument.Parse(json);
         var buckets = new Dictionary<string, List<object>> {
-            ["web"] = [], ["scp"] = [], ["ftp"] = []
+            ["web"] = [], ["chrome"] = [], ["edge"] = [], ["firefox"] = [],
+            ["scp"] = [], ["sftp"] = [], ["ftp"] = [], ["winscp"] = [], ["filezilla"] = []
         };
         foreach (var policy in doc.RootElement.GetProperty("applicable_policies").EnumerateArray())
         {
@@ -35,11 +36,32 @@ internal sealed class NetworkPolicy : IDisposable
                 .Where(x => !string.IsNullOrEmpty(x)).Distinct().ToArray();
             var id = policy.GetProperty("policy_id").GetInt32();
             var rule = new { policy_id = id, action, extensions };
-            if (points.Contains("NETWORK_WEB")) buckets["web"].Add(rule);
-            if (points.Contains("NETWORK_SCP_SFTP")) buckets["scp"].Add(rule);
-            if (points.Contains("NETWORK_FTP")) buckets["ftp"].Add(rule);
+            if (points.Contains("NETWORK_WEB")) {
+                buckets["web"].Add(rule);
+                buckets["chrome"].Add(rule); buckets["edge"].Add(rule); buckets["firefox"].Add(rule);
+            }
+            if (points.Contains("BROWSER_CHROME")) buckets["chrome"].Add(rule);
+            if (points.Contains("BROWSER_EDGE")) buckets["edge"].Add(rule);
+            if (points.Contains("BROWSER_FIREFOX")) buckets["firefox"].Add(rule);
+            if (points.Contains("NETWORK_SCP_SFTP")) {
+                buckets["scp"].Add(rule); buckets["sftp"].Add(rule); buckets["winscp"].Add(rule);
+            }
+            if (points.Contains("CLIENT_SCP")) buckets["scp"].Add(rule);
+            if (points.Contains("CLIENT_SFTP")) buckets["sftp"].Add(rule);
+            if (points.Contains("CLIENT_WINSCP")) buckets["winscp"].Add(rule);
+            if (points.Contains("NETWORK_FTP")) {
+                buckets["ftp"].Add(rule); buckets["filezilla"].Add(rule);
+            }
+            if (points.Contains("CLIENT_FTP")) buckets["ftp"].Add(rule);
+            if (points.Contains("CLIENT_FILEZILLA")) buckets["filezilla"].Add(rule);
         }
-        _rules = JsonSerializer.Serialize(new { updated = true, web = buckets["web"], scp = buckets["scp"], ftp = buckets["ftp"] });
+        _rules = JsonSerializer.Serialize(new {
+            updated = true,
+            web = buckets["web"],
+            chrome = buckets["chrome"], edge = buckets["edge"], firefox = buckets["firefox"],
+            scp = buckets["scp"], sftp = buckets["sftp"], ftp = buckets["ftp"],
+            winscp = buckets["winscp"], filezilla = buckets["filezilla"]
+        });
     }
 
     internal void Start()
