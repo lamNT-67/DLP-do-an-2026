@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "DLP Lab Upload Guard",
-  "version": "0.1.0",
-  "description": "Lab prototype: checks file-picker uploads against local DLP Agent policy.",
+  "version": "0.2.0",
+  "description": "Lab best-effort Chrome/Edge upload block by file type with DLP Agent policies.",
   "permissions": [
     "alarms",
     "storage"
@@ -20,10 +20,23 @@
         "https://*/*"
       ],
       "js": [
+        "main-guard.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
         "content.js"
       ],
       "run_at": "document_start",
-      "all_frames": true
+      "all_frames": true,
+      "world": "ISOLATED"
     }
   ],
   "action": {
