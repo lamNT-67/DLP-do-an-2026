@@ -14,7 +14,7 @@ $ErrorActionPreference = 'Stop'
 $source = (Resolve-Path -LiteralPath $File -ErrorAction Stop).ProviderPath
 if (-not [IO.File]::Exists($source)) { throw 'Source must be a regular file' }
 $extension = [IO.Path]::GetExtension($source).TrimStart('.').ToLowerInvariant()
-$bucket = if ($Protocol -eq 'FTP') { 'ftp' } else { 'scp' }
+$bucket = $Protocol.ToLowerInvariant()
 try {
     $policy = Invoke-RestMethod -Uri 'http://127.0.0.1:18765/rules' -TimeoutSec 3
     if (-not $policy.updated) { throw 'Agent has no synchronized policy' }
