@@ -27,7 +27,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // Only relay from a content script injected by this extension in a web tab.
       // The Agent independently validates the policy, extension and filename.
       const url = sender?.url || "";
-      if (!/^https?:\\/\\//.test(url) || !sender.tab ||
+      if (!(url.startsWith("http://") || url.startsWith("https://")) || !sender.tab ||
           !Number.isInteger(msg.policy_id) ||
           typeof msg.file_name !== "string" || msg.file_name.length > 240) {
         sendResponse({ok: false, error: "invalid sender/event"});
