@@ -40,16 +40,16 @@ require __DIR__ . '/../includes/layout_header.php';
             <select name="exit_point_type">
     <option value="">-- Tất cả Exit Point --</option>
     <option value="USB"               <?= $filterExitPoint === 'USB' ? 'selected' : '' ?>>USB / Removable Media</option>
-    <option value="CLIPBOARD"         <?= $filterExit === 'CLIPBOARD' ? 'selected' : '' ?>>Clipboard</option>
+    <option value="CLIPBOARD"         <?= $filterExitPoint === 'CLIPBOARD' ? 'selected' : '' ?>>Clipboard</option>
     <option value="BROWSER_CHROME"    <?= $filterExitPoint === 'BROWSER_CHROME' ? 'selected' : '' ?>>Google Chrome</option>
     <option value="BROWSER_EDGE"      <?= $filterExitPoint === 'BROWSER_EDGE' ? 'selected' : '' ?>>Microsoft Edge</option>
     <option value="BROWSER_FIREFOX"   <?= $filterExitPoint === 'BROWSER_FIREFOX' ? 'selected' : '' ?>>Mozilla Firefox</option>
-    <option value="NETWORK_WEB"       <?= $filterExit === 'NETWORK_WEB' ? 'selected' : '' ?>>Network - Web/Cloud</option>
-    <option value="NETWORK_SCP_SFTP"  <?= $filterExit === 'NETWORK_SCP_SFTP' ? 'selected' : '' ?>>Network - SCP/SFTP</option>
-    <option value="NETWORK_FTP"       <?= $filterExit === 'NETWORK_FTP' ? 'selected' : '' ?>>Network - FTP</option>
-    <option value="RDP"               <?= $filterExit === 'RDP' ? 'selected' : '' ?>>Remote Desktop (RDP)</option>
-    <option value="EMAIL_CLIENT"      <?= $filterExit === 'EMAIL_CLIENT' ? 'selected' : '' ?>>E-mail Client</option>
-    <option value="CLOUD_SYNC_FOLDER" <?= $filterExit === 'CLOUD_SYNC_FOLDER' ? 'selected' : '' ?>>Cloud Sync Folder</option>
+    <option value="NETWORK_WEB"       <?= $filterExitPoint === 'NETWORK_WEB' ? 'selected' : '' ?>>Network - Web/Cloud</option>
+    <option value="NETWORK_SCP_SFTP"  <?= $filterExitPoint === 'NETWORK_SCP_SFTP' ? 'selected' : '' ?>>Network - SCP/SFTP</option>
+    <option value="NETWORK_FTP"       <?= $filterExitPoint === 'NETWORK_FTP' ? 'selected' : '' ?>>Network - FTP</option>
+    <option value="RDP"               <?= $filterExitPoint === 'RDP' ? 'selected' : '' ?>>Remote Desktop (RDP)</option>
+    <option value="EMAIL_CLIENT"      <?= $filterExitPoint === 'EMAIL_CLIENT' ? 'selected' : '' ?>>E-mail Client</option>
+    <option value="CLOUD_SYNC_FOLDER" <?= $filterExitPoint === 'CLOUD_SYNC_FOLDER' ? 'selected' : '' ?>>Cloud Sync Folder</option>
 </select>
         </div>
         <div class="form-group" style="margin-bottom:0;">
@@ -85,7 +85,7 @@ require __DIR__ . '/../includes/layout_header.php';
         <?php endif; ?>
         <?php foreach ($logs as $l): ?>
             <tr>
-                <td><?= h(format_datetime($l['occurred_at'])) ?></td>
+                <td><?= h(format_log_datetime($l['occurred_at'])) ?></td>
                 <td><?= h($l['hostname']) ?> <?= $l['username'] ? '('.h($l['username']).')' : '' ?></td>
                 <td><?= h($l['exit_point_type']) ?></td>
                 <td><?= h($l['action_taken']) ?></td>
