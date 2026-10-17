@@ -239,7 +239,8 @@ require_once __DIR__ . '/../includes/layout_header.php';
     </div>
 
     <div class="form-section">
-        <h3>Bước 1 — Tick Exit Point cần kiểm soát</h3>
+        <h3>Bước 1 — Chọn ứng dụng / kênh truyền cần kiểm soát</h3>
+        <p class="hint">Chrome/Edge/Firefox: cần cài và bật browser extension của Agent; chặn theo File Type mới hỗ trợ một số luồng file-picker, kéo/thả. SCP/SFTP/FTP: hiện cần chạy qua guarded-upload.ps1. WinSCP/FileZilla: đang là kênh policy dự kiến, <strong>chưa có module chặn tự động</strong>. Không có kênh nào được đảm bảo chỉ bằng cách tick checkbox.</p>
         <div class="checkbox-list">
             <?php foreach ($exitPointLabels as $value => $label): ?>
             <label>
