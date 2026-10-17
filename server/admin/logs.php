@@ -39,8 +39,11 @@ require __DIR__ . '/../includes/layout_header.php';
             <label>Exit Point</label>
             <select name="exit_point_type">
     <option value="">-- Tất cả Exit Point --</option>
-    <option value="USB"               <?= $filterExit === 'USB' ? 'selected' : '' ?>>USB / Removable Media</option>
+    <option value="USB"               <?= $filterExitPoint === 'USB' ? 'selected' : '' ?>>USB / Removable Media</option>
     <option value="CLIPBOARD"         <?= $filterExit === 'CLIPBOARD' ? 'selected' : '' ?>>Clipboard</option>
+    <option value="BROWSER_CHROME"    <?= $filterExitPoint === 'BROWSER_CHROME' ? 'selected' : '' ?>>Google Chrome</option>
+    <option value="BROWSER_EDGE"      <?= $filterExitPoint === 'BROWSER_EDGE' ? 'selected' : '' ?>>Microsoft Edge</option>
+    <option value="BROWSER_FIREFOX"   <?= $filterExitPoint === 'BROWSER_FIREFOX' ? 'selected' : '' ?>>Mozilla Firefox</option>
     <option value="NETWORK_WEB"       <?= $filterExit === 'NETWORK_WEB' ? 'selected' : '' ?>>Network - Web/Cloud</option>
     <option value="NETWORK_SCP_SFTP"  <?= $filterExit === 'NETWORK_SCP_SFTP' ? 'selected' : '' ?>>Network - SCP/SFTP</option>
     <option value="NETWORK_FTP"       <?= $filterExit === 'NETWORK_FTP' ? 'selected' : '' ?>>Network - FTP</option>
@@ -53,7 +56,7 @@ require __DIR__ . '/../includes/layout_header.php';
             <label>Hanh dong</label>
             <select name="action_taken">
                 <option value="">-- Tat ca --</option>
-                <?php foreach (['ALLOWED','LOGGED','BLOCKED_DELETE','BLOCKED_FIREWALL','BLOCKED_KILL'] as $a): ?>
+                <?php foreach (['ALLOWED','LOGGED','BLOCKED_DELETE','BLOCKED_FIREWALL','BLOCKED_KILL','BLOCKED_PROXY','BLOCKED_BROWSER'] as $a): ?>
                     <option value="<?= $a ?>" <?= $filterAction === $a ? 'selected' : '' ?>><?= $a ?></option>
                 <?php endforeach; ?>
             </select>
