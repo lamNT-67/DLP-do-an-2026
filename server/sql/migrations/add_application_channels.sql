@@ -1,0 +1,7 @@
+-- Existing dlp_system database: run once before saving application-specific exit points.
+-- Must update BOTH tables; MySQL enum values outside the current list cannot be stored.
+ALTER TABLE dlp_policy_exit_points
+  MODIFY exit_point_type ENUM('USB','CLIPBOARD','NETWORK_WEB','NETWORK_SCP_SFTP','NETWORK_FTP','RDP','SCREEN_CAPTURE','BROWSER_CHROME','BROWSER_EDGE','BROWSER_FIREFOX','CLIENT_SCP','CLIENT_SFTP','CLIENT_FTP','CLIENT_WINSCP','CLIENT_FILEZILLA') NOT NULL;
+
+ALTER TABLE logs
+  MODIFY exit_point_type ENUM('USB','CLIPBOARD','NETWORK_WEB','NETWORK_SCP_SFTP','NETWORK_FTP','RDP','SCREEN_CAPTURE','BROWSER_CHROME','BROWSER_EDGE','BROWSER_FIREFOX','CLIENT_SCP','CLIENT_SFTP','CLIENT_FTP','CLIENT_WINSCP','CLIENT_FILEZILLA') NOT NULL;
