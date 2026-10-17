@@ -87,7 +87,7 @@ internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundServi
             logger.LogWarning("USB monitor enabled. Actual deletion on BLOCK policies: {Enabled}", _settings.UsbEnforceBlock);
         }
 
-        _networkPolicy = new NetworkPolicy(logger);
+        _networkPolicy = new NetworkPolicy(logger, ReportBrowserAsync);
         try { _networkPolicy.Start(); }
         catch (Exception ex) { logger.LogWarning(ex, "Browser policy bridge cannot start; USB/service can still run"); }
 
@@ -269,6 +269,36 @@ internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundServi
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             logger.LogWarning(ex, "HTTP upload event reporting failed");
+        }
+    }
+
+    private async Task ReportBrowserAsync(int policyId, string channel, string fileName, string destination, CancellationToken ct)
+    {
+        if (_token is null) throw new InvalidOperationException("Agent is not enrolled");
+        var exit = channel switch
+        {
+            "chrome" => "BROWSER_CHROME",
+            "edge" => "BROWSER_EDGE",
+            "firefox" => "BROWSER_FIREFOX",
+            _ => throw new ArgumentOutOfRangeException(nameof(channel))
+        };
+        using var req = Request(HttpMethod.Post, "agent_report.php");
+        req.Content = JsonContent.Create(new {
+            hostname = _settings.Hostname,
+            policy_id = policyId,
+            exit_point_type = exit,
+            action_taken = "BLOCKED_BROWSER",
+            file_path = fileName,
+            destination_value = destination,
+            process_name = channel == "edge" ? "msedge.exe" : channel == "chrome" ? "chrome.exe" : "firefox.exe",
+            occurred_at = DateTimeOffset.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
+        });
+        using var resp = await _http.SendAsync(req, ct);
+        if (!resp.IsSuccessStatusCode)
+        {
+            var reason = await resp.Content.ReadAsStringAsync(ct);
+            logger.LogWarning("Browser report failed: HTTP {Status}: {Message}", (int)resp.StatusCode, reason);
+            throw new HttpRequestException($"Browser report rejected HTTP {(int)resp.StatusCode}");
         }
     }
 
