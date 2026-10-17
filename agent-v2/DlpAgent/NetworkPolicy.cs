@@ -186,6 +186,11 @@ internal sealed class NetworkPolicy : IDisposable
         {
             response.StatusCode = 400;
         }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "Could not forward browser DLP event to server");
+            response.StatusCode = 502;
+        }
     }
 
     public void Dispose()
