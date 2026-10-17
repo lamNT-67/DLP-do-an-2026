@@ -22,6 +22,9 @@
         if (chrome.runtime.lastError || !response) { lastSync = 0; return; }
         rules = Array.isArray(response.webRules) ? response.webRules : [];
         lastSync = response.lastSync || 0;
+        window.dispatchEvent(new CustomEvent("dlp-lab-rules", {
+          detail: {rules, updatedAt: lastSync}
+        }));
       });
     } catch (_) { lastSync = 0; }
   }
@@ -29,6 +32,8 @@
   setInterval(refresh, 15000);
   function block(files) { return Array.from(files || []).some(f => decision(f)?.action === "BLOCK"); }
   function announce() { console.warn("[DLP] File Type blocked by NETWORK_WEB policy"); window.alert("DLP policy: file upload blocked"); }
+  // A file-picker change is cancellable only at DOM propagation level;
+  // clearing the input prevents ordinary forms and handlers from obtaining the file.
   document.addEventListener("change", e => {
     const el = e.target;
     if (!(el instanceof HTMLInputElement) || el.type !== "file" || !el.files) return;
@@ -38,12 +43,22 @@
       announce();
     }
   }, true);
+  document.addEventListener("input", e => {
+    const el = e.target;
+    if (el instanceof HTMLInputElement && el.type === "file" && el.files && block(el.files)) {
+      e.preventDefault(); e.stopImmediatePropagation(); el.value = ""; announce();
+    }
+  }, true);
   // Also block drop events with files before the website's drop handler.
   document.addEventListener("drop", e => {
     if (!e.dataTransfer?.files?.length || !block(e.dataTransfer.files)) return;
     e.preventDefault(); e.stopImmediatePropagation(); announce();
   }, true);
-  // A final check for ordinary HTML form submit; this does not intercept fetch/XHR.
+  document.addEventListener("paste", e => {
+    if (!e.clipboardData?.files?.length || !block(e.clipboardData.files)) return;
+    e.preventDefault(); e.stopImmediatePropagation(); announce();
+  }, true);
+  // A final check for ordinary HTML form submit.
   document.addEventListener("submit", e => {
     const form = e.target;
     if (!(form instanceof HTMLFormElement)) return;
