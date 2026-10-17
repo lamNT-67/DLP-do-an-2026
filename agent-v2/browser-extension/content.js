@@ -30,14 +30,50 @@
   }
   refresh();
   setInterval(refresh, 15000);
-  function block(files) { return Array.from(files || []).some(f => decision(f)?.action === "BLOCK"); }
+  const sent = new Map();
+  function report(file, policyId) {
+    const name = String(file?.name || "").slice(0, 240);
+    if (!name || !Number.isInteger(policyId)) return;
+    const key = policyId + "|" + name + "|" + location.origin;
+    const now = Date.now();
+    if (now - (sent.get(key) || 0) < 3000) return;
+    sent.set(key, now);
+    if (sent.size > 100) {
+      for (const [k, t] of sent) if (now - t > 10000) sent.delete(k);
+    }
+    try {
+      chrome.runtime.sendMessage({
+        type: "REPORT_BROWSER_BLOCK",
+        policy_id: policyId,
+        file_name: name,
+        destination: location.origin
+      }, reply => {
+        if (chrome.runtime.lastError || !reply?.ok)
+          console.warn("[DLP] Could not report block to Agent", chrome.runtime.lastError?.message, reply);
+      });
+    } catch (error) { console.warn("[DLP] Event report failed", error); }
+  }
+  function blocked(files) {
+    const matched = Array.from(files || []).map(f => ({file: f, rule: decision(f)}))
+      .filter(x => x.rule?.action === "BLOCK");
+    for (const hit of matched) report(hit.file, hit.rule.policy_id);
+    return matched.length > 0;
+  }
+  window.addEventListener("dlp-lab-blocked", e => {
+    const name = String(e.detail?.name || "");
+    const policyId = Number(e.detail?.policy_id);
+    if (!name || !Number.isInteger(policyId)) return;
+    const extension = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1).toLowerCase() : "";
+    if (!rules.some(r => r.action === "BLOCK" && r.policy_id === policyId && r.extensions?.includes(extension))) return;
+    report({name}, policyId);
+  });
   function announce() { console.warn("[DLP] File Type blocked by NETWORK_WEB policy"); window.alert("DLP policy: file upload blocked"); }
   // A file-picker change is cancellable only at DOM propagation level;
   // clearing the input prevents ordinary forms and handlers from obtaining the file.
   document.addEventListener("change", e => {
     const el = e.target;
     if (!(el instanceof HTMLInputElement) || el.type !== "file" || !el.files) return;
-    if (block(el.files)) {
+    if (blocked(el.files)) {
       e.preventDefault(); e.stopImmediatePropagation();
       el.value = "";
       announce();
@@ -45,17 +81,17 @@
   }, true);
   document.addEventListener("input", e => {
     const el = e.target;
-    if (el instanceof HTMLInputElement && el.type === "file" && el.files && block(el.files)) {
+    if (el instanceof HTMLInputElement && el.type === "file" && el.files && blocked(el.files)) {
       e.preventDefault(); e.stopImmediatePropagation(); el.value = ""; announce();
     }
   }, true);
   // Also block drop events with files before the website's drop handler.
   document.addEventListener("drop", e => {
-    if (!e.dataTransfer?.files?.length || !block(e.dataTransfer.files)) return;
+    if (!e.dataTransfer?.files?.length || !blocked(e.dataTransfer.files)) return;
     e.preventDefault(); e.stopImmediatePropagation(); announce();
   }, true);
   document.addEventListener("paste", e => {
-    if (!e.clipboardData?.files?.length || !block(e.clipboardData.files)) return;
+    if (!e.clipboardData?.files?.length || !blocked(e.clipboardData.files)) return;
     e.preventDefault(); e.stopImmediatePropagation(); announce();
   }, true);
   // A final check for ordinary HTML form submit.
@@ -63,7 +99,7 @@
     const form = e.target;
     if (!(form instanceof HTMLFormElement)) return;
     for (const input of form.querySelectorAll('input[type="file"]')) {
-      if (input.files && block(input.files)) {
+      if (input.files && blocked(input.files)) {
         e.preventDefault(); e.stopImmediatePropagation(); announce(); return;
       }
     }
