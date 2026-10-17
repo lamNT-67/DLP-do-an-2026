@@ -1,12 +1,13 @@
 // Chrome MV3 extension: get a reduced, read-only policy from the local Agent.
 const BRIDGE = "http://127.0.0.1:18765/rules";
+const browserChannel = /Edg\//.test(navigator.userAgent) ? "edge" : "chrome";
 async function sync() {
   try {
     const resp = await fetch(BRIDGE, {cache: "no-store"});
     if (!resp.ok) throw new Error("Agent HTTP " + resp.status);
     const data = await resp.json();
-    if (!data.updated || !Array.isArray(data.web)) throw new Error("Policy not ready");
-    await chrome.storage.local.set({webRules: data.web, lastSync: Date.now()});
+    if (!data.updated || !Array.isArray(data[browserChannel])) throw new Error("Policy not ready");
+    await chrome.storage.local.set({webRules: data[browserChannel], lastSync: Date.now()});
   } catch (err) {
     // Never treat an inaccessible/unknown policy as a permissive empty policy.
     await chrome.storage.local.set({lastSync: 0});
