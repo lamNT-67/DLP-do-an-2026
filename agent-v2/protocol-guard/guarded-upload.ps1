@@ -13,21 +13,26 @@ param(
 $ErrorActionPreference = 'Stop'
 $source = (Resolve-Path -LiteralPath $File -ErrorAction Stop).ProviderPath
 if (-not [IO.File]::Exists($source)) { throw 'Source must be a regular file' }
-$extension = [IO.Path]::GetExtension($source).TrimStart('.').ToLowerInvariant()
-$bucket = $Protocol.ToLowerInvariant()
-try {
-    $policy = Invoke-RestMethod -Uri 'http://127.0.0.1:18765/rules' -TimeoutSec 3
-    if (-not $policy.updated) { throw 'Agent has no synchronized policy' }
-} catch {
-    throw 'DLP local policy not reachable. Refusing guarded upload (fail closed).'
+# Run the same C# inspection engine as the Agent, but under the CALLER'S
+# Windows account. It cannot inspect files the user does not have permission to read.
+$agentExe = Join-Path $env:ProgramFiles 'DLPAgent\DlpAgent.exe'
+if (-not (Test-Path -LiteralPath $agentExe -PathType Leaf)) {
+    throw "DLP inspection executable not found: $agentExe"
 }
-$rules = @($policy.$bucket | Where-Object { @($_.extensions) -contains $extension })
-if ($rules | Where-Object { $_.action -eq 'BLOCK' }) {
-    Write-Warning "DLP BLOCK: $Protocol upload denied for .$extension file (policy matched)."
+# Exit status 4 means inspection/policy unavailable. Fail closed.
+$raw = & $agentExe --inspect-file $Protocol $source
+if ($LASTEXITCODE -ne 0) {
+    throw "DLP inspection failed (exit $LASTEXITCODE). Refusing transfer."
+}
+try { $decision = ($raw | Out-String | ConvertFrom-Json -ErrorAction Stop) }
+catch { throw "DLP inspector returned invalid JSON. Refusing transfer." }
+Write-Host ("DLP: decision={0}; reason={1}; policy={2}" -f $decision.decision, $decision.reason, $decision.policy_id)
+if ($decision.decision -eq 'BLOCK') {
+    Write-Warning "DLP BLOCK: $Protocol transfer denied ($($decision.reason))."
     exit 3
 }
-if ($rules | Where-Object { $_.action -eq 'REPORT_ONLY' }) {
-    Write-Host "DLP REPORT_ONLY: .$extension matched. This launcher does not yet send an event."
+if ($decision.decision -ne 'ALLOW' -and $decision.decision -ne 'REPORT_ONLY') {
+    throw "Unknown DLP decision. Refusing transfer."
 }
 if ($DryRun) {
     Write-Host "DLP ALLOW (dry-run): $source -> $Destination via $Protocol"
