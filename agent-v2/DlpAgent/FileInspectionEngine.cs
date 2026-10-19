@@ -17,8 +17,6 @@ internal static class FileInspectionEngine
     {
         if (!System.IO.File.Exists(file)) throw new FileNotFoundException("Source file is missing", file);
         var info = new FileInfo(file);
-        if (info.Length > MaxBytes)
-            return new { decision = "BLOCK", reason = "FILE_TOO_LARGE_TO_INSPECT", policy_id = (int?)null, matched_rule_ids = Array.Empty<int>() };
         var extension = info.Extension.TrimStart('.').ToLowerInvariant();
         var points = channel.ToUpperInvariant() switch
         {
@@ -50,6 +48,8 @@ internal static class FileInspectionEngine
             // Policies without a file_types selection do not match arbitrary files.
             if (selected.ValueKind == JsonValueKind.Undefined) continue;
             var id = policy.GetProperty("policy_id").GetInt32();
+            if (info.Length > MaxBytes)
+                return new { decision = "BLOCK", reason = "FILE_TOO_LARGE_TO_INSPECT", policy_id = (int?)id, matched_rule_ids = Array.Empty<int>() };
             var rules = policy.TryGetProperty("content_rules", out var cr) && cr.ValueKind == JsonValueKind.Array
                 ? cr.EnumerateArray().ToArray() : Array.Empty<JsonElement>();
             bool matched = false;
