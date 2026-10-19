@@ -56,7 +56,7 @@ require __DIR__ . '/../includes/layout_header.php';
             <label>Hanh dong</label>
             <select name="action_taken">
                 <option value="">-- Tat ca --</option>
-                <?php foreach (['ALLOWED','LOGGED','BLOCKED_DELETE','BLOCKED_FIREWALL','BLOCKED_KILL','BLOCKED_PROXY','BLOCKED_BROWSER'] as $a): ?>
+                <?php foreach (['ALLOWED','LOGGED','BLOCKED_DELETE','BLOCKED_FIREWALL','BLOCKED_KILL','BLOCKED_PROXY','BLOCKED_BROWSER','BLOCKED_TRANSFER'] as $a): ?>
                     <option value="<?= $a ?>" <?= $filterAction === $a ? 'selected' : '' ?>><?= $a ?></option>
                 <?php endforeach; ?>
             </select>
