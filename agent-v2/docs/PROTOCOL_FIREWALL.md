@@ -12,6 +12,8 @@ This module implements actual automatic outbound firewall blocks for **known Win
 | `NETWORK_SCP_SFTP` (legacy) | SCP and SFTP above | 22 | Both |
 | `NETWORK_FTP` (legacy) | FTP above | 21 | FTP |
 
+**OpenSSH Windows behavior:** `scp.exe` and `sftp.exe` may spawn `C:\\Windows\\System32\\OpenSSH\\ssh.exe`, which owns the TCP 22 socket. The Agent now also creates a `DLPAgent Protocol SSH-TRANSPORT` rule when SCP or SFTP blocking is selected. This **also prevents ordinary interactive `ssh.exe` connections to port 22**. A program-specific Windows Firewall rule cannot distinguish between the SSH session's SCP/SFTP subsystem and interactive shell usage. Verify with `scp -v` and `Get-NetFirewallRule -DisplayName 'DLPAgent Protocol *'` on the test VM.
+
 Rules use built-in `New-NetFirewallRule` with `-Program`, `-Protocol TCP`, `-RemotePort`, `-Direction Outbound`, and `-Action Block`. Only files at these **standard Windows paths** are covered. Alternate installs, custom clients, nonstandard ports, proxies, other protocols and tunneling can bypass these rules. This does not block SSH terminal commands (`ssh.exe`) and does not intercept WinSCP or FileZilla.
 
 **Important policy semantics:** A BLOCK policy with `CLIENT_SCP` and selected `.txt` causes *every* matching `scp.exe` connection to TCP 22 to fail, **including JPGs**. The file_types field is ignored by this firewall module. Use this only when full-protocol denial is intended. `REPORT_ONLY` does not create blocks. Windows Firewall blocks themselves do not produce per-file DLP server logs with this prototype.
