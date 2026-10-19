@@ -45,6 +45,12 @@ internal sealed class ProtocolFirewall
         // The policy's file_types are intentionally NOT used for firewall decisions.
         var specs = new List<(string Tag, string Executable, int Port)>();
         var system = Environment.GetFolderPath(Environment.SpecialFolder.System);
+        // OpenSSH scp.exe/sftp.exe can delegate the actual TCP socket to ssh.exe.
+        // The Windows Firewall -Program filter must match the socket-owning process.
+        // This is intentionally coarse: matching ssh.exe also blocks interactive SSH
+        // over TCP 22, not just SCP/SFTP transfers.
+        if (blocked.Contains("SCP") || blocked.Contains("SFTP"))
+            specs.Add(("SSH-TRANSPORT", Path.Combine(system, "OpenSSH", "ssh.exe"), 22));
         if (blocked.Contains("SCP"))
             specs.Add(("SCP", Path.Combine(system, "OpenSSH", "scp.exe"), 22));
         if (blocked.Contains("SFTP"))
