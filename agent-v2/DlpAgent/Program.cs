@@ -50,6 +50,7 @@ internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundServi
     private NetworkPolicy? _networkPolicy;
     private HttpUploadProxy? _httpProxy;
     private ProtocolFirewall? _protocolFirewall;
+    private ProtocolEventMonitor? _protocolEventMonitor;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -103,6 +104,7 @@ internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundServi
         if (_settings.ProtocolFirewallEnabled)
         {
             _protocolFirewall = new ProtocolFirewall(logger);
+            _protocolEventMonitor = new ProtocolEventMonitor(logger);
             logger.LogWarning("PROTOCOL FIREWALL MODE ENABLED. Any matching BLOCK policy denies the entire client protocol on default ports; selected file_types do not restrict firewall rules.");
         }
 
@@ -132,6 +134,8 @@ internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundServi
                     await RefreshPolicyAsync(stoppingToken);
                     nextPolicy = now.AddSeconds(_settings.PolicyRefreshSeconds);
                 }
+                if (_protocolEventMonitor is not null)
+                    await _protocolEventMonitor.PollAsync(ReportProtocolAsync, stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { break; }
             catch (Exception ex) { logger.LogWarning(ex, "Agent cycle failed; will retry"); }
@@ -228,6 +232,7 @@ internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundServi
         _networkPolicy?.Update(body);
         _httpProxy?.UpdatePolicy(body);
         if (_protocolFirewall is not null) await _protocolFirewall.ApplyPolicyAsync(body, ct);
+        _protocolEventMonitor?.UpdatePolicy(body);
         logger.LogInformation("Policy refreshed: {Count} applicable policies", policies.GetArrayLength());
     }
 
@@ -309,6 +314,32 @@ internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundServi
             logger.LogWarning("Browser report failed: HTTP {Status}: {Message}", (int)resp.StatusCode, reason);
             throw new HttpRequestException($"Browser report rejected HTTP {(int)resp.StatusCode}");
         }
+    }
+
+    private async Task ReportProtocolAsync(int policyId, string exitPoint, string processName, string destination, CancellationToken ct)
+    {
+        if (_token is null) throw new InvalidOperationException("Agent is not enrolled");
+        using var request = Request(HttpMethod.Post, "agent_report.php");
+        request.Content = JsonContent.Create(new
+        {
+            hostname = _settings.Hostname,
+            policy_id = policyId,
+            exit_point_type = exitPoint,
+            action_taken = "BLOCKED_FIREWALL",
+            // WFP 5157 proves connection denial; it cannot recover the requested filename.
+            file_path = (string?)null,
+            destination_value = destination,
+            process_name = processName,
+            occurred_at = DateTimeOffset.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
+        });
+        using var resp = await _http.SendAsync(request, ct);
+        if (!resp.IsSuccessStatusCode)
+        {
+            var reason = await resp.Content.ReadAsStringAsync(ct);
+            logger.LogWarning("Protocol block report failed: HTTP {Status}: {Body}", (int)resp.StatusCode, reason);
+            throw new HttpRequestException($"Protocol report HTTP {(int)resp.StatusCode}");
+        }
+        logger.LogInformation("Protocol firewall event reported: {Process} -> {Destination}", processName, destination);
     }
 
     private HttpRequestMessage Request(HttpMethod method, string relativeUrl)
