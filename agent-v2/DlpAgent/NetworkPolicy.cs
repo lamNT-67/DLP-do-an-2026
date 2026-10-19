@@ -66,7 +66,19 @@ internal sealed class NetworkPolicy : IDisposable
             if (points.Contains("CLIENT_FTP")) buckets["ftp"].Add(rule);
             if (points.Contains("CLIENT_FILEZILLA")) buckets["filezilla"].Add(rule);
         }
-        _inspectionPolicy = json;
+        // Publish only the fields needed for filename checks; exclude content rules and secrets.
+        _inspectionPolicy = JsonSerializer.Serialize(new
+        {
+            applicable_policies = doc.RootElement.GetProperty("applicable_policies").EnumerateArray().Select(p => new
+            {
+                policy_id = p.GetProperty("policy_id").GetInt32(),
+                action = p.GetProperty("action").GetString(),
+                exit_points = p.GetProperty("exit_points").EnumerateArray().Select(x => x.GetString()).ToArray(),
+                file_types = p.GetProperty("file_types").EnumerateArray().Select(x => new { extension = x.GetProperty("extension").GetString() }).ToArray(),
+                allowed_files = p.TryGetProperty("allowed_files", out var allowedFiles) ? allowedFiles.EnumerateArray().Select(x => x.GetString()).ToArray() : Array.Empty<string>(),
+                allowed_locations = p.TryGetProperty("allowed_locations", out var allowedLocations) ? allowedLocations.EnumerateArray().Select(x => x.GetString()).ToArray() : Array.Empty<string>()
+            }).ToArray()
+        });
         _rules = JsonSerializer.Serialize(new {
             updated = true,
             web = buckets["web"],
@@ -110,8 +122,8 @@ internal sealed class NetworkPolicy : IDisposable
                 else if (request.HttpMethod == "GET" && request.Url?.AbsolutePath == "/inspection-policy" &&
                          request.Headers["X-DLP-Client"] == "ManagedTransfer")
                 {
-                    // Read-only lab policy bridge: exposes content regex/dictionary values to local users.
-                    // This is not an authentication boundary. Never include API tokens in policy snapshots.
+                    // Read-only local filename policy bridge, excludes regex and dictionary content.
+                    // Header is not an authentication boundary; this is a lab integration.
                     response.ContentType = "application/json; charset=utf-8";
                     var data = Encoding.UTF8.GetBytes(_inspectionPolicy);
                     response.ContentLength64 = data.Length;
