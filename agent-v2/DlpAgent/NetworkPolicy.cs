@@ -16,7 +16,7 @@ internal sealed class NetworkPolicy : IDisposable
     private readonly Func<int, string, string, string, CancellationToken, Task> _report;
     private readonly Dictionary<string, DateTimeOffset> _recent = new();
     private readonly object _recentLock = new();
-    private volatile string _inspectionPolicy = "{\\"applicable_policies\\":[]}";
+    private volatile string _inspectionPolicy = @"{""applicable_policies"":[]}";
     private volatile string _rules = "{\"updated\":false,\"web\":[],\"scp\":[],\"ftp\":[]}";
     internal NetworkPolicy(ILogger logger, Func<int, string, string, string, CancellationToken, Task> report)
     {
