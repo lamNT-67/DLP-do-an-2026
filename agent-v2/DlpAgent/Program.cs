@@ -15,6 +15,26 @@ internal static class Program
 {
     public static async Task Main(string[] args)
     {
+        if (args.Length == 3 && args[0] == "--inspect-file")
+        {
+            try
+            {
+                using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+                using var request = new HttpRequestMessage(HttpMethod.Get, "http://127.0.0.1:18765/inspection-policy");
+                request.Headers.Add("X-DLP-Client", "ManagedTransfer");
+                using var response = await client.SendAsync(request);
+                response.EnsureSuccessStatusCode();
+                var policy = await response.Content.ReadAsStringAsync();
+                Console.WriteLine(JsonSerializer.Serialize(FileInspectionEngine.Check(policy, args[1], args[2])));
+                return;
+            }
+            catch (Exception e)
+            {
+                Console.Error.WriteLine("DLP inspection failed: " + e.Message);
+                Environment.ExitCode = 4; // Managed launcher must fail closed.
+                return;
+            }
+        }
         var builder = Host.CreateApplicationBuilder(args);
         builder.Services.AddWindowsService(options => options.ServiceName = "DLPAgent");
         builder.Services.AddHostedService<AgentWorker>();
