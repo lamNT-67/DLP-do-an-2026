@@ -27,6 +27,25 @@ if ($LASTEXITCODE -ne 0) {
 try { $decision = ($raw | Out-String | ConvertFrom-Json -ErrorAction Stop) }
 catch { throw "DLP inspector returned invalid JSON. Refusing transfer." }
 Write-Host ("DLP: decision={0}; reason={1}; policy={2}" -f $decision.decision, $decision.reason, $decision.policy_id)
+if ($decision.policy_id -and $decision.decision -in @('BLOCK','REPORT_ONLY')) {
+    $body = @{
+        channel = $Protocol
+        policy_id = [int]$decision.policy_id
+        action = [string]$decision.decision
+        file_name = [IO.Path]::GetFileName($source)
+        destination = $Destination
+        matched_rule_ids = @($decision.matched_rule_ids)
+    } | ConvertTo-Json -Depth 6 -Compress
+    try {
+        $headers = @{ 'X-DLP-Client' = 'ManagedTransfer' }
+        $null = Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:18765/transfer-event' `
+            -ContentType 'application/json' -Headers $headers -Body $body -TimeoutSec 10
+        Write-Host 'DLP event successfully reported to Agent'
+    } catch {
+        # Do NOT allow a blocked file through because the log server is unavailable.
+        Write-Warning "DLP report not confirmed by Agent: $_"
+    }
+}
 if ($decision.decision -eq 'BLOCK') {
     Write-Warning "DLP BLOCK: $Protocol transfer denied ($($decision.reason))."
     exit 3
