@@ -1,0 +1,4 @@
+-- Existing MySQL dlp_system: enable managed SCP/SFTP/FTP file-inspection event action.
+ALTER TABLE logs MODIFY COLUMN action_taken
+ENUM('ALLOWED','LOGGED','BLOCKED_DELETE','BLOCKED_FIREWALL','BLOCKED_KILL',
+     'BLOCKED_PROXY','BLOCKED_BROWSER','BLOCKED_TRANSFER') NOT NULL;
