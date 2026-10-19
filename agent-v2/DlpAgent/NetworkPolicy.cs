@@ -14,14 +14,17 @@ internal sealed class NetworkPolicy : IDisposable
     private CancellationTokenSource? _shutdown;
     private Task? _loop;
     private readonly Func<int, string, string, string, CancellationToken, Task> _report;
+    private readonly Func<int, string, string, string, string, int[], CancellationToken, Task> _transferReport;
     private readonly Dictionary<string, DateTimeOffset> _recent = new();
     private readonly object _recentLock = new();
     private volatile string _inspectionPolicy = @"{""applicable_policies"":[]}";
     private volatile string _rules = "{\"updated\":false,\"web\":[],\"scp\":[],\"ftp\":[]}";
-    internal NetworkPolicy(ILogger logger, Func<int, string, string, string, CancellationToken, Task> report)
+    internal NetworkPolicy(ILogger logger, Func<int, string, string, string, CancellationToken, Task> report,
+        Func<int, string, string, string, string, int[], CancellationToken, Task> transferReport)
     {
         _logger = logger;
         _report = report;
+        _transferReport = transferReport;
     }
 
     internal void Update(string json)
@@ -113,6 +116,10 @@ internal sealed class NetworkPolicy : IDisposable
                     var data = Encoding.UTF8.GetBytes(_inspectionPolicy);
                     response.ContentLength64 = data.Length;
                     await response.OutputStream.WriteAsync(data, ct);
+                }
+                else if (request.HttpMethod == "POST" && request.Url?.AbsolutePath == "/transfer-event")
+                {
+                    await ReceiveTransferEventAsync(context, ct);
                 }
                 else if (request.HttpMethod == "POST" && request.Url?.AbsolutePath == "/event")
                 {
@@ -211,6 +218,74 @@ internal sealed class NetworkPolicy : IDisposable
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _logger.LogWarning(ex, "Could not forward browser DLP event to server");
+            response.StatusCode = 502;
+        }
+    }
+
+    private async Task ReceiveTransferEventAsync(HttpListenerContext context, CancellationToken ct)
+    {
+        var req = context.Request;
+        var response = context.Response;
+        // Local managed launcher, not browser JavaScript. Only loopback + no Origin;
+        // this is a lab integration, NOT a tamper-proof source of evidence.
+        if (req.Headers["Origin"] is not null || req.Headers["X-DLP-Client"] != "ManagedTransfer")
+        {
+            response.StatusCode = 403;
+            return;
+        }
+        if (req.ContentType?.StartsWith("application/json", StringComparison.OrdinalIgnoreCase) != true ||
+            req.ContentLength64 is < 2 or > 4096)
+        {
+            response.StatusCode = 400;
+            return;
+        }
+        try
+        {
+            using var reader = new StreamReader(req.InputStream, Encoding.UTF8, leaveOpen: true);
+            var body = await reader.ReadToEndAsync(ct);
+            if (body.Length > 4096) { response.StatusCode = 413; return; }
+            using var doc = JsonDocument.Parse(body);
+            var data = doc.RootElement;
+            var channel = data.GetProperty("channel").GetString()?.ToUpperInvariant() ?? "";
+            var policyId = data.GetProperty("policy_id").GetInt32();
+            var action = data.GetProperty("action").GetString() ?? "";
+            var fileName = data.GetProperty("file_name").GetString() ?? "";
+            var destination = data.GetProperty("destination").GetString() ?? "";
+            var matchedIds = data.GetProperty("matched_rule_ids").EnumerateArray().Select(x => x.GetInt32()).ToArray();
+            if (channel is not ("SCP" or "SFTP" or "FTP") ||
+                action is not ("BLOCK" or "REPORT_ONLY") ||
+                fileName.Length is < 1 or > 240 || fileName.Contains('/') || fileName.Contains('\\') ||
+                destination.Length > 255 || matchedIds.Length > 30)
+            {
+                response.StatusCode = 400;
+                return;
+            }
+            using var p = JsonDocument.Parse(_inspectionPolicy);
+            var relevant = channel switch
+            {
+                "SCP" => new[] { "CLIENT_SCP", "NETWORK_SCP_SFTP" },
+                "SFTP" => new[] { "CLIENT_SFTP", "NETWORK_SCP_SFTP" },
+                _ => new[] { "CLIENT_FTP", "NETWORK_FTP" }
+            };
+            // Validate the policy ID, channel and decision against the last policy snapshot.
+            var match = p.RootElement.GetProperty("applicable_policies").EnumerateArray().Any(pol =>
+                pol.GetProperty("policy_id").GetInt32() == policyId &&
+                pol.GetProperty("action").GetString() == action &&
+                pol.GetProperty("exit_points").EnumerateArray().Any(ep => relevant.Contains(ep.GetString())) &&
+                pol.GetProperty("file_types").EnumerateArray().Any(ft =>
+                    string.Equals(ft.GetProperty("extension").GetString()?.TrimStart('.'),
+                        Path.GetExtension(fileName).TrimStart('.'), StringComparison.OrdinalIgnoreCase)));
+            if (!match) { response.StatusCode = 409; return; }
+            await _transferReport(policyId, channel, action, fileName, destination, matchedIds, ct);
+            response.StatusCode = 202;
+        }
+        catch (Exception ex) when (ex is JsonException or InvalidOperationException or KeyNotFoundException or FormatException)
+        {
+            response.StatusCode = 400;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "Transfer event could not be reported");
             response.StatusCode = 502;
         }
     }
