@@ -16,6 +16,7 @@ internal sealed class NetworkPolicy : IDisposable
     private readonly Func<int, string, string, string, CancellationToken, Task> _report;
     private readonly Dictionary<string, DateTimeOffset> _recent = new();
     private readonly object _recentLock = new();
+    private volatile string _inspectionPolicy = "{\\"applicable_policies\\":[]}";
     private volatile string _rules = "{\"updated\":false,\"web\":[],\"scp\":[],\"ftp\":[]}";
     internal NetworkPolicy(ILogger logger, Func<int, string, string, string, CancellationToken, Task> report)
     {
@@ -62,6 +63,7 @@ internal sealed class NetworkPolicy : IDisposable
             if (points.Contains("CLIENT_FTP")) buckets["ftp"].Add(rule);
             if (points.Contains("CLIENT_FILEZILLA")) buckets["filezilla"].Add(rule);
         }
+        _inspectionPolicy = json;
         _rules = JsonSerializer.Serialize(new {
             updated = true,
             web = buckets["web"],
@@ -101,6 +103,16 @@ internal sealed class NetworkPolicy : IDisposable
                     var bytes = Encoding.UTF8.GetBytes(_rules);
                     response.ContentLength64 = bytes.Length;
                     await response.OutputStream.WriteAsync(bytes, ct);
+                }
+                else if (request.HttpMethod == "GET" && request.Url?.AbsolutePath == "/inspection-policy" &&
+                         request.Headers["X-DLP-Client"] == "ManagedTransfer")
+                {
+                    // Read-only lab policy bridge: exposes content regex/dictionary values to local users.
+                    // This is not an authentication boundary. Never include API tokens in policy snapshots.
+                    response.ContentType = "application/json; charset=utf-8";
+                    var data = Encoding.UTF8.GetBytes(_inspectionPolicy);
+                    response.ContentLength64 = data.Length;
+                    await response.OutputStream.WriteAsync(data, ct);
                 }
                 else if (request.HttpMethod == "POST" && request.Url?.AbsolutePath == "/event")
                 {
