@@ -110,7 +110,7 @@ internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundServi
             logger.LogWarning("USB monitor enabled. Actual deletion on BLOCK policies: {Enabled}", _settings.UsbEnforceBlock);
         }
 
-        _networkPolicy = new NetworkPolicy(logger, ReportBrowserAsync);
+        _networkPolicy = new NetworkPolicy(logger, ReportBrowserAsync, ReportTransferAsync);
         try { _networkPolicy.Start(); }
         catch (Exception ex) { logger.LogWarning(ex, "Browser policy bridge cannot start; USB/service can still run"); }
 
@@ -360,6 +360,35 @@ internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundServi
             throw new HttpRequestException($"Protocol report HTTP {(int)resp.StatusCode}");
         }
         logger.LogInformation("Protocol firewall event reported: {Process} -> {Destination}", processName, destination);
+    }
+
+    private async Task ReportTransferAsync(int policyId, string channel, string action, string fileName,
+        string destination, int[] matchedRuleIds, CancellationToken ct)
+    {
+        if (_token is null) throw new InvalidOperationException("Agent not registered");
+        var exit = channel switch
+        {
+            "SCP" => "CLIENT_SCP",
+            "SFTP" => "CLIENT_SFTP",
+            "FTP" => "CLIENT_FTP",
+            _ => throw new InvalidOperationException("Invalid channel")
+        };
+        using var req = Request(HttpMethod.Post, "agent_report.php");
+        req.Content = JsonContent.Create(new
+        {
+            hostname = _settings.Hostname,
+            policy_id = policyId,
+            exit_point_type = exit,
+            action_taken = action == "BLOCK" ? "BLOCKED_TRANSFER" : "LOGGED",
+            file_path = fileName,
+            destination_value = destination,
+            process_name = channel.ToLowerInvariant() + ".exe",
+            matched_rule_ids = matchedRuleIds,
+            occurred_at = DateTimeOffset.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
+        });
+        using var response = await _http.SendAsync(req, ct);
+        if (!response.IsSuccessStatusCode)
+            throw new HttpRequestException($"Transfer log HTTP {(int)response.StatusCode}: {await response.Content.ReadAsStringAsync(ct)}");
     }
 
     private HttpRequestMessage Request(HttpMethod method, string relativeUrl)
