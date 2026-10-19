@@ -33,6 +33,7 @@ internal sealed class AgentSettings
     [JsonPropertyName("usb_monitor_enabled")] public bool UsbMonitorEnabled { get; set; } = true;
     [JsonPropertyName("usb_enforce_block")] public bool UsbEnforceBlock { get; set; } = false;
     [JsonPropertyName("http_proxy_enabled")] public bool HttpProxyEnabled { get; set; } = false;
+    [JsonPropertyName("protocol_firewall_enabled")] public bool ProtocolFirewallEnabled { get; set; } = false;
 }
 
 internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundService
@@ -48,6 +49,7 @@ internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundServi
     private UsbMonitor? _usb;
     private NetworkPolicy? _networkPolicy;
     private HttpUploadProxy? _httpProxy;
+    private ProtocolFirewall? _protocolFirewall;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -96,6 +98,12 @@ internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundServi
             _httpProxy = new HttpUploadProxy(logger, ReportHttpAsync);
             try { _httpProxy.Start(); }
             catch (Exception ex) { logger.LogWarning(ex, "HTTP proxy cannot start (port 18766?)"); }
+        }
+
+        if (_settings.ProtocolFirewallEnabled)
+        {
+            _protocolFirewall = new ProtocolFirewall(logger);
+            logger.LogWarning("PROTOCOL FIREWALL MODE ENABLED. Any matching BLOCK policy denies the entire client protocol on default ports; selected file_types do not restrict firewall rules.");
         }
 
         DateTimeOffset nextHeartbeat = DateTimeOffset.MinValue, nextPolicy = DateTimeOffset.MinValue;
@@ -219,6 +227,7 @@ internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundServi
         _usb?.UpdatePolicy(body);
         _networkPolicy?.Update(body);
         _httpProxy?.UpdatePolicy(body);
+        if (_protocolFirewall is not null) await _protocolFirewall.ApplyPolicyAsync(body, ct);
         logger.LogInformation("Policy refreshed: {Count} applicable policies", policies.GetArrayLength());
     }
 
