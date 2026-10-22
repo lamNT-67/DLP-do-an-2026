@@ -6,12 +6,13 @@ def get_exit_point_status(applicable_policies, exit_point_type):
     matching = get_policies_for_exit_point(applicable_policies, exit_point_type)
     if not matching:
         return {"is_governed": False, "effective_action": "OPEN", "content_rules": [],
-                "file_types": [], "policy_ids": []}
+                "file_types": [], "policy_ids": [], "allowed_files": [], "allowed_locations": []}
 
     effective_action = "REPORT_ONLY"
     seen_rule_ids, merged_rules = set(), []
     seen_ext, merged_ft = set(), []
     policy_ids = []
+    allowed_files, allowed_locations = [], []
 
     for p in matching:
         policy_ids.append(p.get("policy_id"))
@@ -22,6 +23,8 @@ def get_exit_point_status(applicable_policies, exit_point_type):
             if rid not in seen_rule_ids:
                 seen_rule_ids.add(rid)
                 merged_rules.append(rule)
+        allowed_files.extend(x for x in (p.get("allowed_files") or []) if x not in allowed_files)
+        allowed_locations.extend(x for x in (p.get("allowed_locations") or []) if x not in allowed_locations)
         for ft in (p.get("file_types") or []):
             ext = ft.get("extension")
             if ext not in seen_ext:
@@ -29,7 +32,8 @@ def get_exit_point_status(applicable_policies, exit_point_type):
                 merged_ft.append(ft)
 
     return {"is_governed": True, "effective_action": effective_action,
-            "content_rules": merged_rules, "file_types": merged_ft, "policy_ids": policy_ids}
+            "content_rules": merged_rules, "file_types": merged_ft, "policy_ids": policy_ids,
+            "allowed_files": allowed_files, "allowed_locations": allowed_locations}
 
 
 def file_always_blocked(file_path, file_types):
