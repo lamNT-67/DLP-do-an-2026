@@ -1,2 +1,3 @@
 psutil
 requests
+pypdf>=4.0

@@ -3,3 +3,4 @@ agent/logs/
 __pycache__/
 *.pyc
 agent/service/nssm.exe
+agent/dev_tools/dlp_samples/

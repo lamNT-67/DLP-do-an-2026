@@ -3,13 +3,12 @@ from pathlib import Path
 import psutil
 from policy_client import PolicyClient
 from log_writer import write_log_event
-from content_inspection_stub import scan_content_with_rules
-from policy_utils import get_exit_point_status, file_always_blocked
+from content_inspection import inspect_file, to_log_inspection, to_report_fields
+from policy_utils import get_exit_point_status
 
 POLL_INTERVAL_SECONDS = 2
 POLICY_REFRESH_SECONDS = 60
 HEARTBEAT_INTERVAL_SECONDS = 45
-MAX_READ_BYTES = 200000
 SSH_SFTP_PROCESS_NAMES = {"ssh.exe", "scp.exe", "sftp.exe", "winscp.exe"}
 FTP_PROCESS_NAMES = {"ftp.exe", "filezilla.exe"}
 SKIP_EXTENSIONS = {".dll", ".exe", ".sys", ".log", ".tmp", ".ini", ".config"}
@@ -50,12 +49,9 @@ def _ensure_registered(cfg, path="config.ini"):
     return client
 
 
-def _read_file_snippet(fp):
-    try:
-        with open(fp, "rb") as f: raw = f.read(MAX_READ_BYTES)
-        return raw.decode("utf-8", errors="ignore")
-    except (PermissionError, FileNotFoundError, OSError):
-        return ""
+def _get_username(proc):
+    try: return proc.username()
+    except (psutil.NoSuchProcess, psutil.AccessDenied): return None
 
 
 def _detect_transferring_processes():
@@ -157,38 +153,36 @@ def run():
             for fp in _get_open_files(proc):
                 key = (pid, fp)
                 if key in already: continue
-                always = file_always_blocked(fp, status["file_types"])
-                if always:
-                    insp = {"matched_rule_ids": [], "matched_rule_names": [], "confidence_level": "CRITICAL"}
-                    should_act = True
-                else:
-                    content = _read_file_snippet(fp)
-                    insp = scan_content_with_rules(content, status["content_rules"])
-                    should_act = bool(insp["matched_rule_ids"])
+                ip, port = _get_remote_endpoint(proc)
+                dest = f"{ip}:{port}" if ip else None
 
-                if status["effective_action"] == "BLOCK" and should_act:
-                    ip, port = _get_remote_endpoint(proc)
-                    action = _block_process_and_connection(proc, ip, port)
-                elif should_act:
-                    action = "LOGGED"
-                else:
+                # Content Inspection Engine: loai file + noi dung + diem tin cay -> ALLOW/LOG/BLOCK
+                res = inspect_file(fp, status, destination=dest)
+                if res["verdict"] == "ALLOW":
                     already.add(key); continue
+                if res["verdict"] == "BLOCK":
+                    action = _block_process_and_connection(proc, ip, port)
+                else:
+                    action = "LOGGED"
 
+                fields = to_report_fields(res)
                 payload = {"hostname": cfg["agent"]["hostname"], "exit_point_type": ept,
                            "policy_id": status["policy_ids"][0] if status["policy_ids"] else None,
                            "action_taken": action, "occurred_at": _iso_now(), "file_path": fp,
-                           "file_hash_sha256": None, "matched_rule_ids": insp["matched_rule_ids"],
-                           "confidence_score": insp["confidence_level"], "destination_value": None,
+                           "file_hash_sha256": fields["file_hash_sha256"],
+                           "matched_rule_ids": fields["matched_rule_ids"],
+                           "confidence_score": fields["confidence_score"], "destination_value": dest,
                            "process_name": pname}
                 rep = client.send_report(payload)
                 write_log_event(cfg["agent"]["hostname"],
                                  "scp_sftp" if ept == "NETWORK_SCP_SFTP" else "ftp", ept,
                                  "violation" if action != "LOGGED" else "logged",
                                  status["effective_action"],
-                                 {"process_name": pname, "process_pid": pid, "user": None},
-                                 {"destination_ip": None, "destination_domain": None, "destination_port": None, "file_path": fp},
-                                 insp, action, rep)
-                print(f"[sftp_scp_agent] {action} - {pname} (PID {pid}) dang truyen file: {fp} (reported={rep})")
+                                 {"process_name": pname, "process_pid": pid, "user": _get_username(proc)},
+                                 {"destination_ip": ip, "destination_domain": None, "destination_port": port, "file_path": fp},
+                                 to_log_inspection(res), action, rep)
+                print(f"[sftp_scp_agent] {action} ({res['reason']}, {res['confidence_level']}) - "
+                      f"{pname} (PID {pid}) -> {dest}: {fp} (reported={rep})")
                 already.add(key)
 
         time.sleep(POLL_INTERVAL_SECONDS)

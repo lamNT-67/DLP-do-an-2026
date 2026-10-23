@@ -10,7 +10,7 @@ import psutil
 
 from policy_client import PolicyClient
 from log_writer import write_log_event
-from content_inspection_stub import scan_content_with_rules
+from content_inspection import scan_content_with_rules
 from policy_utils import get_exit_point_status
 from domain_blocker import DomainBlocker, DropLogTailer
 
