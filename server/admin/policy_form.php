@@ -9,9 +9,17 @@ $error = '';
 $exitPointLabels = [
     'USB'               => 'USB / Removable Media',
     'CLIPBOARD'         => 'Clipboard',
-    'NETWORK_WEB'       => 'Network - Web/Cloud',
-    'NETWORK_SCP_SFTP'  => 'Network - SCP/SFTP',
-    'NETWORK_FTP'       => 'Network - FTP',
+    'BROWSER_CHROME'    => 'Web Upload - Google Chrome',
+    'BROWSER_EDGE'      => 'Web Upload - Microsoft Edge',
+    'BROWSER_FIREFOX'   => 'Web Upload - Mozilla Firefox',
+    'CLIENT_SCP'        => 'CLI - SCP',
+    'CLIENT_SFTP'       => 'CLI - SFTP',
+    'CLIENT_FTP'        => 'CLI - FTP',
+    'CLIENT_WINSCP'     => 'Ứng dụng - WinSCP',
+    'CLIENT_FILEZILLA'  => 'Ứng dụng - FileZilla',
+    'NETWORK_WEB'       => '[Legacy] Network - Web/Cloud',
+    'NETWORK_SCP_SFTP'  => '[Legacy] Network - SCP/SFTP',
+    'NETWORK_FTP'       => '[Legacy] Network - FTP',
     'RDP'               => 'Remote Desktop (RDP)',
     'SCREEN_CAPTURE'    => 'Screen Capture (chặn chụp màn hình)',
 ];
@@ -231,7 +239,8 @@ require_once __DIR__ . '/../includes/layout_header.php';
     </div>
 
     <div class="form-section">
-        <h3>Bước 1 — Tick Exit Point cần kiểm soát</h3>
+        <h3>Bước 1 — Chọn ứng dụng / kênh truyền cần kiểm soát</h3>
+        <p class="hint">Chrome/Edge/Firefox: cần cài và bật browser extension của Agent; chặn theo File Type mới hỗ trợ một số luồng file-picker, kéo/thả. SCP/SFTP/FTP: hiện cần chạy qua guarded-upload.ps1. WinSCP/FileZilla: đang là kênh policy dự kiến, <strong>chưa có module chặn tự động</strong>. Không có kênh nào được đảm bảo chỉ bằng cách tick checkbox.</p>
         <div class="checkbox-list">
             <?php foreach ($exitPointLabels as $value => $label): ?>
             <label>
