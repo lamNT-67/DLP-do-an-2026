@@ -25,7 +25,7 @@ internal static class Program
                 using var response = await client.SendAsync(request);
                 response.EnsureSuccessStatusCode();
                 var policy = await response.Content.ReadAsStringAsync();
-                Console.WriteLine(JsonSerializer.Serialize(FileTypePolicyEngine.Check(policy, args[1], args[2])));
+                Console.WriteLine(JsonSerializer.Serialize(ContentInspectionEngine.Check(policy, args[1], args[2])));
                 return;
             }
             catch (Exception e)
