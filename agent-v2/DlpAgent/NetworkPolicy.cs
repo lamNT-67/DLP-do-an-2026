@@ -284,9 +284,13 @@ internal sealed class NetworkPolicy : IDisposable
                 pol.GetProperty("policy_id").GetInt32() == policyId &&
                 pol.GetProperty("action").GetString() == action &&
                 pol.GetProperty("exit_points").EnumerateArray().Any(ep => relevant.Contains(ep.GetString())) &&
-                pol.GetProperty("file_types").EnumerateArray().Any(ft =>
+                (pol.GetProperty("file_types").EnumerateArray().Any(ft =>
                     string.Equals(ft.GetProperty("extension").GetString()?.TrimStart('.'),
-                        Path.GetExtension(fileName).TrimStart('.'), StringComparison.OrdinalIgnoreCase)));
+                        Path.GetExtension(fileName).TrimStart('.'), StringComparison.OrdinalIgnoreCase)) ||
+                 (matchedIds.Length > 0 && pol.TryGetProperty("content_rules", out var contentRules) &&
+                  contentRules.ValueKind == JsonValueKind.Array &&
+                  matchedIds.All(id => contentRules.EnumerateArray().Any(cr =>
+                      cr.GetProperty("id").GetInt32() == id)))));
             if (!match) { response.StatusCode = 409; return; }
             await _transferReport(policyId, channel, action, fileName, destination, matchedIds, ct);
             response.StatusCode = 202;
