@@ -66,7 +66,7 @@ internal sealed class NetworkPolicy : IDisposable
             if (points.Contains("CLIENT_FTP")) buckets["ftp"].Add(rule);
             if (points.Contains("CLIENT_FILEZILLA")) buckets["filezilla"].Add(rule);
         }
-        // Publish only the fields needed for filename checks; exclude content rules and secrets.
+        // Local controlled-transfer inspection requires content rules; do not publish these on /rules.
         _inspectionPolicy = JsonSerializer.Serialize(new
         {
             applicable_policies = doc.RootElement.GetProperty("applicable_policies").EnumerateArray().Select(p => new
@@ -75,6 +75,12 @@ internal sealed class NetworkPolicy : IDisposable
                 action = p.GetProperty("action").GetString(),
                 exit_points = p.GetProperty("exit_points").EnumerateArray().Select(x => x.GetString()).ToArray(),
                 file_types = p.GetProperty("file_types").EnumerateArray().Select(x => new { extension = x.GetProperty("extension").GetString() }).ToArray(),
+                content_rules = p.TryGetProperty("content_rules", out var contentRules) && contentRules.ValueKind == JsonValueKind.Array
+                    ? contentRules.EnumerateArray().Select(cr => new {
+                        id = cr.GetProperty("id").GetInt32(),
+                        rule_type = cr.GetProperty("rule_type").GetString(),
+                        pattern = cr.GetProperty("pattern").GetString()
+                    }).ToArray() : Array.Empty<object>(),
                 allowed_files = p.TryGetProperty("allowed_files", out var allowedFiles) ? allowedFiles.EnumerateArray().Select(x => x.GetString()).ToArray() : Array.Empty<string>(),
                 allowed_locations = p.TryGetProperty("allowed_locations", out var allowedLocations) ? allowedLocations.EnumerateArray().Select(x => x.GetString()).ToArray() : Array.Empty<string>()
             }).ToArray()
