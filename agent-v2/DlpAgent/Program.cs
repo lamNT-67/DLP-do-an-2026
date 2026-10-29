@@ -281,7 +281,7 @@ internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundServi
         }
     }
 
-    private async Task ReportHttpAsync(int policyId, string fileName, string action, CancellationToken ct)
+    private async Task ReportHttpAsync(int policyId, string fileName, string action, string reason, int[] ruleIds, CancellationToken ct)
     {
         if (_token is null) return;
         try
@@ -293,6 +293,8 @@ internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundServi
                 policy_id = policyId,
                 exit_point_type = "NETWORK_WEB",
                 action_taken = action,
+                inspection_reason = reason,
+                matched_rule_ids = ruleIds,
                 file_path = fileName,
                 occurred_at = DateTimeOffset.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
             });
