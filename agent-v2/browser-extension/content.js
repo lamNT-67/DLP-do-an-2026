@@ -68,32 +68,111 @@
     report({name}, policyId);
   });
   function announce() { console.warn("[DLP] File Type blocked by NETWORK_WEB policy"); window.alert("DLP policy: file upload blocked"); }
-  // A file-picker change is cancellable only at DOM propagation level;
-  // clearing the input prevents ordinary forms and handlers from obtaining the file.
-  document.addEventListener("change", e => {
-    const el = e.target;
-    if (!(el instanceof HTMLInputElement) || el.type !== "file" || !el.files) return;
-    if (blocked(el.files)) {
-      e.preventDefault(); e.stopImmediatePropagation();
-      el.value = "";
-      announce();
+  // A file input must be cleared synchronously before page handlers run.
+  // After a positive verdict, reattach selected files and replay synthetic events.
+  // This is best-effort: some sites reject synthetic/untrusted events.
+  const replaying = new WeakSet();
+  const pending = new WeakSet();
+  const MAX_SCAN_BYTES = 2 * 1024 * 1024;
+  function inspectFile(file) {
+    return new Promise(resolve => {
+      if (file.size > MAX_SCAN_BYTES) {
+        resolve({decision: "BLOCK", reason: "FILE_TOO_LARGE"});
+        return;
+      }
+      const reader = new FileReader();
+      reader.onerror = () => resolve({decision: "BLOCK", reason: "READ_FAILED"});
+      reader.onload = () => {
+        const b64 = String(reader.result || "").split(",")[1];
+        if (!b64) return resolve({decision: "BLOCK", reason: "ENCODING_FAILED"});
+        try {
+          chrome.runtime.sendMessage({
+            type: "INSPECT_FILE_CONTENT",
+            name: file.name,
+            content_base64: b64
+          }, result => {
+            if (chrome.runtime.lastError || !result)
+              return resolve({decision: "BLOCK", reason: "AGENT_UNAVAILABLE"});
+            resolve(result);
+          });
+        } catch (_) { resolve({decision: "BLOCK", reason: "AGENT_UNAVAILABLE"}); }
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+  async function inspectAll(files) {
+    for (const file of files) {
+      const result = await inspectFile(file);
+      if (result.decision === "BLOCK" || !["ALLOW", "REPORT_ONLY"].includes(result.decision))
+        return {allowed: false, file, result};
     }
-  }, true);
-  document.addEventListener("input", e => {
+    return {allowed: true};
+  }
+  function announceContent(hit) {
+    console.warn("[DLP] File upload denied:", hit?.file?.name, hit?.result?.reason);
+    window.alert("DLP: file upload blocked (" + (hit?.result?.reason || "inspection failed") + ")");
+  }
+  function onFileSelection(e) {
     const el = e.target;
-    if (el instanceof HTMLInputElement && el.type === "file" && el.files && blocked(el.files)) {
-      e.preventDefault(); e.stopImmediatePropagation(); el.value = ""; announce();
-    }
-  }, true);
-  // Also block drop events with files before the website's drop handler.
-  document.addEventListener("drop", e => {
-    if (!e.dataTransfer?.files?.length || !blocked(e.dataTransfer.files)) return;
-    e.preventDefault(); e.stopImmediatePropagation(); announce();
-  }, true);
-  document.addEventListener("paste", e => {
-    if (!e.clipboardData?.files?.length || !blocked(e.clipboardData.files)) return;
-    e.preventDefault(); e.stopImmediatePropagation(); announce();
-  }, true);
+    if (!(el instanceof HTMLInputElement) || el.type !== "file" || !el.files?.length) return;
+    if (replaying.has(el)) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    if (pending.has(el)) { el.value = ""; return; }
+    const files = Array.from(el.files);
+    // Clear immediately, before any website listener can access the selected bytes.
+    el.value = "";
+    pending.add(el);
+    inspectAll(files).then(result => {
+      if (!el.isConnected) return;
+      if (!result.allowed) { announceContent(result); return; }
+      const dt = new DataTransfer();
+      for (const file of files) dt.items.add(file);
+      el.files = dt.files;
+      replaying.add(el);
+      try {
+        el.dispatchEvent(new Event("input", {bubbles: true}));
+        el.dispatchEvent(new Event("change", {bubbles: true}));
+      } finally { replaying.delete(el); }
+    }).catch(error => {
+      console.warn("[DLP] Content inspection error", error);
+      window.alert("DLP: file inspection unavailable; upload refused");
+    }).finally(() => pending.delete(el));
+  }
+  document.addEventListener("input", onFileSelection, true);
+  document.addEventListener("change", onFileSelection, true);
+
+  // Drop/paste file payloads are denied before page handlers. An allowed result
+  // is replayed as a synthetic event; complex sites may ignore untrusted events.
+  function onFileTransfer(e) {
+    const files = Array.from(e.dataTransfer?.files || e.clipboardData?.files || []);
+    if (!files.length) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    const target = e.target;
+    const type = e.type;
+    inspectAll(files).then(result => {
+      if (!result.allowed) return announceContent(result);
+      if (!target?.isConnected) return;
+      try {
+        const dt = new DataTransfer();
+        files.forEach(file => dt.items.add(file));
+        const event = type === "drop"
+          ? new DragEvent("drop", {bubbles: true, cancelable: true, dataTransfer: dt})
+          : new ClipboardEvent("paste", {bubbles: true, cancelable: true, clipboardData: dt});
+        // Synthetic events won't pass through this guard twice.
+        replayedEvents.add(event);
+        target.dispatchEvent(event);
+      } catch (error) { console.warn("[DLP] Cannot replay drop/paste after scan", error); }
+    });
+  }
+  const replayedEvents = new WeakSet();
+  for (const type of ["drop", "paste"]) {
+    document.addEventListener(type, e => {
+      if (replayedEvents.has(e)) return;
+      onFileTransfer(e);
+    }, true);
+  }
   // A final check for ordinary HTML form submit.
   document.addEventListener("submit", e => {
     const form = e.target;
