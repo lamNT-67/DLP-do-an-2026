@@ -128,12 +128,16 @@ internal sealed class NetworkPolicy : IDisposable
                 else if (request.HttpMethod == "GET" && request.Url?.AbsolutePath == "/inspection-policy" &&
                          request.Headers["X-DLP-Client"] == "ManagedTransfer")
                 {
-                    // Read-only local filename policy bridge, excludes regex and dictionary content.
+                    // Lab-only managed-transfer policy endpoint; includes content rule patterns.
                     // Header is not an authentication boundary; this is a lab integration.
                     response.ContentType = "application/json; charset=utf-8";
                     var data = Encoding.UTF8.GetBytes(_inspectionPolicy);
                     response.ContentLength64 = data.Length;
                     await response.OutputStream.WriteAsync(data, ct);
+                }
+                else if (request.HttpMethod == "POST" && request.Url?.AbsolutePath == "/inspect-content")
+                {
+                    await InspectBrowserContentAsync(context, ct);
                 }
                 else if (request.HttpMethod == "POST" && request.Url?.AbsolutePath == "/transfer-event")
                 {
@@ -147,6 +151,87 @@ internal sealed class NetworkPolicy : IDisposable
                 response.Close();
             }
             catch (Exception e) { _logger.LogDebug(e, "Policy bridge request failed"); }
+        }
+    }
+
+    // Lab-only endpoint. Origin/header restrictions are not an authentication boundary.
+    // Accepts up to 2 MiB of file bytes, base64 encoded in JSON.
+    private async Task InspectBrowserContentAsync(HttpListenerContext context, CancellationToken ct)
+    {
+        var request = context.Request;
+        var response = context.Response;
+        var origin = request.Headers["Origin"] ?? "";
+        if ((!origin.StartsWith("chrome-extension://", StringComparison.Ordinal) &&
+             !origin.StartsWith("moz-extension://", StringComparison.Ordinal)) ||
+            request.Headers["X-DLP-Client"] != "BrowserContent" ||
+            request.ContentType?.StartsWith("application/json", StringComparison.OrdinalIgnoreCase) != true)
+        {
+            response.StatusCode = 403;
+            return;
+        }
+        const int maxRequestBytes = 2_900_000;
+        if (request.ContentLength64 > maxRequestBytes)
+        {
+            response.StatusCode = 413;
+            return;
+        }
+        try
+        {
+            using var incoming = new MemoryStream();
+            var buffer = new byte[8192];
+            int count;
+            while ((count = await request.InputStream.ReadAsync(buffer.AsMemory(), ct)) > 0)
+            {
+                if (incoming.Length + count > maxRequestBytes)
+                {
+                    response.StatusCode = 413;
+                    return;
+                }
+                incoming.Write(buffer, 0, count);
+            }
+            using var doc = JsonDocument.Parse(incoming.ToArray());
+            var data = doc.RootElement;
+            var channel = data.GetProperty("channel").GetString() ?? "";
+            var fileName = data.GetProperty("file_name").GetString() ?? "";
+            var b64 = data.GetProperty("content_base64").GetString() ?? "";
+            if (channel is not ("chrome" or "edge" or "firefox") ||
+                b64.Length > 2_800_000 || b64.Length == 0)
+            {
+                response.StatusCode = 400;
+                return;
+            }
+            var bytes = Convert.FromBase64String(b64);
+            var result = ContentInspectionEngine.CheckBytes(_inspectionPolicy,
+                "BROWSER_" + channel.ToUpperInvariant(), fileName, bytes);
+            using var verdictDoc = JsonDocument.Parse(JsonSerializer.Serialize(result));
+            var verdict = verdictDoc.RootElement;
+            var decision = verdict.GetProperty("decision").GetString();
+            var policyId = verdict.GetProperty("policy_id");
+            if (decision == "BLOCK" && policyId.ValueKind == JsonValueKind.Number)
+            {
+                try {
+                    // A confirmed local inspection verdict; the page-side guard still needs to enforce it.
+                    await _report(policyId.GetInt32(), channel, fileName,
+                        request.Headers["X-DLP-Destination"] ?? "", ct);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException) {
+                    _logger.LogWarning(ex, "Content inspection block log not delivered");
+                }
+            }
+            var responseBytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(result));
+            response.ContentType = "application/json; charset=utf-8";
+            response.ContentLength64 = responseBytes.Length;
+            await response.OutputStream.WriteAsync(responseBytes, ct);
+        }
+        catch (Exception ex) when (ex is JsonException or InvalidDataException or ArgumentException or DecoderFallbackException)
+        {
+            _logger.LogWarning(ex, "Browser content inspection rejected");
+            response.StatusCode = 422; // Background treats errors as DENY.
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogWarning(ex, "Browser content inspection unavailable");
+            response.StatusCode = 503;
         }
     }
 
