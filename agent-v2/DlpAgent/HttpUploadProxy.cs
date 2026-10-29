@@ -3,7 +3,6 @@ using System.Net.Http.Headers;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
 
 namespace DlpAgent;
@@ -25,10 +24,6 @@ internal sealed class HttpUploadProxy : IDisposable
     private CancellationTokenSource? _shutdown;
     private Task? _loop;
     private volatile string _policy = "{\"applicable_policies\":[]}";
-    private static readonly Regex Filename = new(
-        "filename\\s*=\\s*(?:\\\"(?<name>[^\\\"]+)\\\"|(?<name>[^;\\r\\n]+))",
-        RegexOptions.IgnoreCase | RegexOptions.Compiled | RegexOptions.CultureInvariant);
-
     internal HttpUploadProxy(ILogger logger, Func<int, string, string, CancellationToken, Task> report)
     {
         _logger = logger;
@@ -143,19 +138,33 @@ internal sealed class HttpUploadProxy : IDisposable
         var contentType = headers.GetValueOrDefault("Content-Type") ?? "";
         var multipart = contentType.StartsWith("multipart/form-data", StringComparison.OrdinalIgnoreCase);
         if (multipart && (method is "POST" or "PUT" or "PATCH")) {
-            var text = Encoding.Latin1.GetString(body);
-            foreach (Match match in Filename.Matches(text)) {
-                var file = Path.GetFileName(match.Groups["name"].Value.Trim());
-                var extension = Path.GetExtension(file).TrimStart('.');
-                var hit = MatchPolicy(extension);
-                if (hit is null) continue;
-                if (hit.Value.Action == "BLOCK") {
-                    _logger.LogWarning("HTTP upload blocked by policy {Policy}: {Name}", hit.Value.Id, file);
-                    await _report(hit.Value.Id, file, "BLOCKED_PROXY", ct);
-                    await ReplyAsync(stream, 403, "DLP policy blocked file type", ct);
+            List<MultipartUploadInspector.Verdict> verdicts;
+            try {
+                verdicts = MultipartUploadInspector.Inspect(_policy, contentType, body);
+            }
+            catch (Exception ex) when (ex is InvalidDataException or DecoderFallbackException or JsonException or RegexMatchTimeoutException) {
+                _logger.LogWarning(ex, "HTTP upload inspection failed; request not forwarded");
+                await ReplyAsync(stream, 422, "DLP could not inspect multipart upload", ct);
+                return;
+            }
+            foreach (var verdict in verdicts) {
+                if (verdict.PolicyId is not int policyId) continue;
+                if (verdict.Decision == "BLOCK") {
+                    _logger.LogWarning("HTTP upload blocked by policy {Policy}: {File} ({Reason})",
+                        policyId, verdict.FileName, verdict.Reason);
+                    try { await _report(policyId, verdict.FileName, "BLOCKED_PROXY", ct); }
+                    catch (Exception ex) when (ex is not OperationCanceledException) {
+                        _logger.LogWarning(ex, "Failed to report HTTP block");
+                    }
+                    await ReplyAsync(stream, 403, "DLP policy blocked upload", ct);
                     return;
                 }
-                await _report(hit.Value.Id, file, "LOGGED", ct);
+                if (verdict.Decision == "REPORT_ONLY") {
+                    try { await _report(policyId, verdict.FileName, "LOGGED", ct); }
+                    catch (Exception ex) when (ex is not OperationCanceledException) {
+                        _logger.LogWarning(ex, "Failed to report HTTP inspection");
+                    }
+                }
             }
         }
 
@@ -191,26 +200,6 @@ internal sealed class HttpUploadProxy : IDisposable
         catch (Exception e) {
             _logger.LogWarning(e, "Upstream HTTP proxy request failed for {Target}", uri.Host);
         }
-    }
-
-    private (int Id, string Action)? MatchPolicy(string extension)
-    {
-        if (string.IsNullOrWhiteSpace(extension)) return null;
-        using var doc = JsonDocument.Parse(_policy);
-        (int Id, string Action)? reportOnly = null;
-        foreach (var p in doc.RootElement.GetProperty("applicable_policies").EnumerateArray()) {
-            if (!p.TryGetProperty("exit_points", out var exits) || exits.ValueKind != JsonValueKind.Array ||
-                !exits.EnumerateArray().Any(e => e.GetString() == "NETWORK_WEB")) continue;
-            if (!p.TryGetProperty("file_types", out var types) || types.ValueKind != JsonValueKind.Array ||
-                !types.EnumerateArray().Any(t =>
-                    t.TryGetProperty("extension", out var ext) &&
-                    string.Equals(ext.GetString()?.TrimStart('.'), extension, StringComparison.OrdinalIgnoreCase))) continue;
-            var action = p.GetProperty("action").GetString();
-            var id = p.GetProperty("policy_id").GetInt32();
-            if (action == "BLOCK") return (id, "BLOCK");
-            if (action == "REPORT_ONLY") reportOnly ??= (id, "REPORT_ONLY");
-        }
-        return reportOnly;
     }
 
     private static async Task ReplyAsync(Stream stream, int code, string message, CancellationToken ct)
