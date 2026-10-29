@@ -18,12 +18,38 @@ internal static class ContentInspectionEngine
     {
         if (!File.Exists(file)) throw new FileNotFoundException("Source file not found", file);
         var path = Path.GetFullPath(file);
+        return Evaluate(policyJson, channel, path, () => ReadBoundedText(path));
+    }
+
+    // Browser Extension supplies bytes directly; no temporary file is written to disk.
+    internal static object CheckBytes(string policyJson, string channel, string fileName, byte[] bytes)
+    {
+        if (string.IsNullOrWhiteSpace(fileName) || fileName.Length > 240 ||
+            Path.GetFileName(fileName) != fileName || fileName.Contains('\\') || fileName.Contains('/'))
+            throw new InvalidDataException("Invalid file name");
+        if (bytes.Length > MaxBytes) throw new InvalidDataException("File exceeds inspection limit");
+        return Evaluate(policyJson, channel, fileName, () => DecodeText(bytes));
+    }
+
+    private static string DecodeText(byte[] bytes)
+    {
+        var offset = bytes.AsSpan().StartsWith(new byte[] { 0xef, 0xbb, 0xbf }) ? 3 : 0;
+        var text = new UTF8Encoding(false, true).GetString(bytes, offset, bytes.Length - offset);
+        if (text.IndexOf('\0') >= 0) throw new InvalidDataException("Binary content unsupported");
+        return text;
+    }
+
+    private static object Evaluate(string policyJson, string channel, string path, Func<string> readText)
+    {
         var extension = Path.GetExtension(path);
         var points = channel.ToUpperInvariant() switch
         {
             "SCP" => new[] { "CLIENT_SCP", "NETWORK_SCP_SFTP" },
             "SFTP" => new[] { "CLIENT_SFTP", "NETWORK_SCP_SFTP" },
             "FTP" => new[] { "CLIENT_FTP", "NETWORK_FTP" },
+            "BROWSER_CHROME" => new[] { "BROWSER_CHROME", "NETWORK_WEB" },
+            "BROWSER_EDGE" => new[] { "BROWSER_EDGE", "NETWORK_WEB" },
+            "BROWSER_FIREFOX" => new[] { "BROWSER_FIREFOX", "NETWORK_WEB" },
             _ => throw new ArgumentException("Unsupported transfer protocol", nameof(channel))
         };
         using var document = JsonDocument.Parse(policyJson);
@@ -47,7 +73,7 @@ internal static class ContentInspectionEngine
                 // Do not silently allow files when a configured content rule cannot be inspected.
                 if (!TextExtensions.Contains(extension))
                     throw new InvalidDataException("Content inspection unsupported for file type " + extension);
-                if (content is null) content = ReadBoundedText(path);
+                if (content is null) content = readText();
                 ruleIds = MatchContentRules(rules, content);
             }
             if (!fileTypeMatch && ruleIds.Length == 0) continue;
