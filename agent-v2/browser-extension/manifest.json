@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "DLP Lab Upload Guard",
-  "version": "0.2.0",
-  "description": "Lab best-effort Chrome/Edge upload block by file type with DLP Agent policies.",
+  "version": "0.3.0",
+  "description": "Lab Chrome/Edge file picker content inspection through local DLP Agent (best effort).",
   "permissions": [
     "alarms",
     "storage"
