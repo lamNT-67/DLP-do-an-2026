@@ -20,11 +20,11 @@ internal sealed class HttpUploadProxy : IDisposable
         AutomaticDecompression = DecompressionMethods.None
     }) { Timeout = TimeSpan.FromSeconds(30) };
     private readonly TcpListener _listener = new(IPAddress.Loopback, 18766);
-    private readonly Func<int, string, string, CancellationToken, Task> _report;
+    private readonly Func<int, string, string, string, int[], CancellationToken, Task> _report;
     private CancellationTokenSource? _shutdown;
     private Task? _loop;
     private volatile string _policy = "{\"applicable_policies\":[]}";
-    internal HttpUploadProxy(ILogger logger, Func<int, string, string, CancellationToken, Task> report)
+    internal HttpUploadProxy(ILogger logger, Func<int, string, string, string, int[], CancellationToken, Task> report)
     {
         _logger = logger;
         _report = report;
@@ -152,7 +152,7 @@ internal sealed class HttpUploadProxy : IDisposable
                 if (verdict.Decision == "BLOCK") {
                     _logger.LogWarning("HTTP upload blocked by policy {Policy}: {File} ({Reason})",
                         policyId, verdict.FileName, verdict.Reason);
-                    try { await _report(policyId, verdict.FileName, "BLOCKED_PROXY", ct); }
+                    try { await _report(policyId, verdict.FileName, "BLOCKED_PROXY", verdict.Reason, verdict.RuleIds, ct); }
                     catch (Exception ex) when (ex is not OperationCanceledException) {
                         _logger.LogWarning(ex, "Failed to report HTTP block");
                     }
@@ -160,7 +160,7 @@ internal sealed class HttpUploadProxy : IDisposable
                     return;
                 }
                 if (verdict.Decision == "REPORT_ONLY") {
-                    try { await _report(policyId, verdict.FileName, "LOGGED", ct); }
+                    try { await _report(policyId, verdict.FileName, "LOGGED", verdict.Reason, verdict.RuleIds, ct); }
                     catch (Exception ex) when (ex is not OperationCanceledException) {
                         _logger.LogWarning(ex, "Failed to report HTTP inspection");
                     }
