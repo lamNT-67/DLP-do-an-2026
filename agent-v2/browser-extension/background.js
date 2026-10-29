@@ -22,6 +22,41 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     chrome.storage.local.get(["webRules", "lastSync"]).then(sendResponse);
     return true;
   }
+  if (msg?.type === "INSPECT_FILE_CONTENT") {
+    (async () => {
+      const url = sender?.url || "";
+      if ((!url.startsWith("http://") && !url.startsWith("https://")) ||
+          !sender.tab || typeof msg.name !== "string" || msg.name.length > 240 ||
+          typeof msg.content_base64 !== "string" || msg.content_base64.length > 2800000) {
+        sendResponse({decision: "BLOCK", reason: "INVALID_INSPECTION_REQUEST"});
+        return;
+      }
+      try {
+        const response = await fetch("http://127.0.0.1:18765/inspect-content", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-DLP-Client": "BrowserContent",
+            "X-DLP-Destination": new URL(url).origin.slice(0, 255)
+          },
+          body: JSON.stringify({
+            channel: browserChannel,
+            file_name: msg.name,
+            content_base64: msg.content_base64
+          })
+        });
+        if (!response.ok) throw new Error("Agent HTTP " + response.status);
+        const result = await response.json();
+        if (!["ALLOW", "BLOCK", "REPORT_ONLY"].includes(result.decision))
+          throw new Error("Unknown inspection verdict");
+        sendResponse(result);
+      } catch (error) {
+        console.warn("[DLP] Content inspection unavailable:", error);
+        sendResponse({decision: "BLOCK", reason: "INSPECTION_UNAVAILABLE"});
+      }
+    })().catch(error => sendResponse({decision: "BLOCK", reason: String(error)}));
+    return true;
+  }
   if (msg?.type === "REPORT_BROWSER_BLOCK") {
     (async () => {
       // Only relay from a content script injected by this extension in a web tab.
