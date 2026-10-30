@@ -32,9 +32,18 @@ def get_exit_point_status(applicable_policies, exit_point_type):
             "content_rules": merged_rules, "file_types": merged_ft, "policy_ids": policy_ids}
 
 
+def file_in_scope(file_path, file_types):
+    """True neu policy khong gioi han loai file, hoac file thuoc mot loai file cua policy."""
+    if not file_types:
+        return True
+    if not file_path or "." not in file_path:
+        return False
+    ext = file_path.rsplit(".", 1)[-1].lower()
+    return any(str(ft.get("extension", "")).lstrip(".").lower() == ext for ft in file_types)
+
 def file_always_blocked(file_path, file_types):
     if not file_path or "." not in file_path:
         return False
     ext = file_path.rsplit(".", 1)[-1].lower()
-    return any(ft.get("extension", "").lower() == ext and ft.get("always_block_regardless_content")
+    return any(str(ft.get("extension", "")).lstrip(".").lower() == ext and ft.get("always_block_regardless_content")
                for ft in file_types)
