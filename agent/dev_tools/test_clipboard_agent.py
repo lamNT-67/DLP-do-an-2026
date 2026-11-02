@@ -158,6 +158,68 @@ class TestRouting(Base):
         self.assertEqual(ca.route_clipboard(self.guard(policies()), self.data(), None), (False, None))
 
 
+class TestHotkeys(Base):
+    """Lớp chặn từ phím bấm: mô phỏng chuỗi sự kiện bàn phím như Windows gửi vào hook."""
+
+    DOWN, UP = ca.WM_KEYDOWN, ca.WM_KEYUP
+
+    def press(self, f, *vks):
+        """Nhấn lần lượt các phím rồi nhả theo thứ tự ngược lại. Trả về kết quả của từng sự kiện."""
+        out = [(vk, "down") + f.on_key(vk, self.DOWN) for vk in vks]
+        out += [(vk, "up") + f.on_key(vk, self.UP) for vk in reversed(vks)]
+        return {(vk, kind): (swallow, mask) for vk, kind, swallow, mask in out}
+
+    def flt(self, pols):
+        return ca.HotkeyFilter(self.guard(pols).on_screenshot_hotkey)
+
+    def test_printscreen_swallowed_down_and_up(self):
+        r = self.press(self.flt(policies()), ca.VK_SNAPSHOT)
+        self.assertEqual(r[(ca.VK_SNAPSHOT, "down")], (True, False))
+        self.assertEqual(r[(ca.VK_SNAPSHOT, "up")], (True, False))
+
+    def test_win_shift_s_swallowed_with_mask_key(self):
+        r = self.press(self.flt(policies()), ca.VK_LWIN, ca.VK_LSHIFT, ca.VK_S)
+        self.assertEqual(r[(ca.VK_S, "down")], (True, True))   # nuốt S + bấm phím mask
+        self.assertEqual(r[(ca.VK_S, "up")], (True, False))
+        self.assertEqual(r[(ca.VK_LWIN, "up")], (False, False))  # phím Win vẫn đi bình thường
+
+    def test_normal_typing_not_affected(self):
+        f = self.flt(policies())
+        self.assertEqual(self.press(f, ca.VK_S)[(ca.VK_S, "down")], (False, False))           # gõ s
+        self.assertEqual(self.press(f, ca.VK_LSHIFT, ca.VK_S)[(ca.VK_S, "down")], (False, False))  # S hoa
+        self.assertEqual(self.press(f, ca.VK_LWIN, ca.VK_S)[(ca.VK_S, "down")], (False, False))    # Win+S tìm kiếm
+
+    def test_other_capture_combos(self):
+        f = self.flt(policies())
+        self.assertTrue(self.press(f, ca.VK_LWIN, ca.VK_LSHIFT, ca.VK_R)[(ca.VK_R, "down")][0])
+        self.assertTrue(self.press(f, ca.VK_LWIN, ca.VK_LMENU, ca.VK_R)[(ca.VK_R, "down")][0])
+        self.assertTrue(self.press(f, ca.VK_LWIN, ca.VK_SNAPSHOT)[(ca.VK_SNAPSHOT, "down")][0])
+
+    def test_not_governed_passes_through(self):
+        r = self.press(self.flt(policies(exit_points=("CLIPBOARD",))), ca.VK_SNAPSHOT)
+        self.assertEqual(r[(ca.VK_SNAPSHOT, "down")], (False, False))
+
+    def test_report_only_passes_but_logs(self):
+        r = self.press(self.flt(policies("REPORT_ONLY")), ca.VK_SNAPSHOT)
+        self.assertEqual(r[(ca.VK_SNAPSHOT, "down")], (False, False))
+        self.wait_reports(1)
+        self.assertEqual(self.reports[0]["action_taken"], "LOGGED")
+
+    def test_block_logged_and_reported_once_for_repeats(self):
+        f = self.flt(policies())
+        for _ in range(5):
+            self.press(f, ca.VK_SNAPSHOT)
+        self.wait_reports(1)
+        import time
+        time.sleep(0.1)
+        self.assertEqual(len(self.reports), 1)   # bấm liên tục không spam log
+        self.assertEqual(self.reports[0]["exit_point_type"], "SCREEN_CAPTURE")
+
+    def test_injected_keys_ignored(self):
+        f = self.flt(policies())
+        self.assertEqual(f.on_key(ca.VK_SNAPSHOT, self.DOWN, injected=True), (False, False))
+
+
 class TestScreenshotFolder(Base):
     def test_new_screenshot_file_deleted_old_kept(self):
         shots = Path(self.dir) / "Screenshots"

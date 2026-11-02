@@ -7,8 +7,10 @@ Chặn 2 exit point dùng chung cơ chế theo dõi clipboard của Windows:
     * Copy chữ  -> Content Inspection Engine quét -> nhạy cảm thì xoá clipboard trước khi paste.
     * Copy file trong Explorer (Ctrl+C) -> inspect_file() từng file -> nhạy cảm thì xoá clipboard.
 
-  SCREEN_CAPTURE (chụp màn hình) - 3 lớp:
-    1. PrtSc / Win+Shift+S / Snipping Tool đều đẩy ẢNH vào clipboard -> xoá ngay.
+  SCREEN_CAPTURE (chụp màn hình) - 4 lớp:
+    0. Chặn NGAY TỪ PHÍM BẤM: nuốt phím PrtSc và tổ hợp Win+Shift+S / Win+Shift+R / Win+Alt+R
+       trước khi Windows kịp xử lý -> không có ảnh nào được tạo ra.
+    1. Ảnh lọt vào clipboard (VD: mở Snipping Tool bằng chuột) -> xoá ngay.
     2. Win+PrtSc và Snipping Tool (Win 11) tự lưu file vào Pictures\\Screenshots -> xoá file mới.
     3. Tắt các công cụ chụp màn hình (Snipping Tool, Snip & Sketch) khi policy đang BLOCK.
 
@@ -28,6 +30,7 @@ import configparser
 import datetime
 import getpass
 import os
+import signal
 import socket
 import sys
 import threading
@@ -49,6 +52,7 @@ NOTICE_TEXT = "[DLP] Nội dung đã bị chặn do chứa dữ liệu nhạy c�
 NOTICE_IMAGE = "[DLP] Ảnh chụp màn hình đã bị chặn theo chính sách bảo mật."
 NOTICE_FILES = "[DLP] Không được sao chép file nhạy cảm: {name}."
 ACTION_BLOCK = "BLOCKED_DELETE"   # server chưa có action riêng cho clipboard -> dùng BLOCKED_DELETE
+HOTKEY_LOG_GAP_SECONDS = 2        # giữ phím lâu / bấm liên tục: chỉ ghi log 1 lần mỗi 2 giây
 
 
 def _now_iso():
@@ -78,6 +82,7 @@ class ClipboardGuard:
         self.user = getpass.getuser()
         self._known_shots = {}             # thư mục Screenshots -> tập file đã thấy
         self._killed_pids = set()
+        self._last_hotkey_log = {}
 
     # -------------------------------------------------- tiện ích
     def _status(self, exit_point):
@@ -168,6 +173,25 @@ class ClipboardGuard:
         _say("%s anh trong clipboard (tu %s)" % ("CHAN" if block else "GHI NHAN", owner or "PrintScreen"))
         return block, NOTICE_IMAGE
 
+    # -------------------------------------------------- phím chụp màn hình
+    def on_screenshot_hotkey(self, combo):
+        """Gọi từ hook bàn phím, PHẢI trả lời thật nhanh (Windows gỡ hook nếu chậm quá ~300ms).
+        Trả về True = nuốt phím. Ghi log chạy ở luồng nền."""
+        status = self._status("SCREEN_CAPTURE")
+        if not status["is_governed"]:
+            return False
+        block = status["effective_action"] == "BLOCK"
+        now = time.monotonic()
+        if now - self._last_hotkey_log.get(combo, -1e9) >= HOTKEY_LOG_GAP_SECONDS:
+            self._last_hotkey_log[combo] = now
+            action = ACTION_BLOCK if block else "LOGGED"
+            threading.Thread(target=self._record, daemon=True, args=(
+                "SCREEN_CAPTURE", status, action, "Ban phim: " + combo,
+                {"destination_domain": "Phim chup man hinh", "file_path": None},
+                {"verdict": "BLOCK" if block else "LOG", "reason": "SCREENSHOT_HOTKEY"})).start()
+            _say("%s phim %s" % ("CHAN" if block else "GHI NHAN", combo))
+        return block
+
     # -------------------------------------------------- chạy mỗi giây
     def tick(self):
         status = self._status("SCREEN_CAPTURE")
@@ -244,6 +268,63 @@ def route_clipboard(guard, data, owner):
     return False, None
 
 
+# Mã phím ảo (virtual-key) của Windows
+VK_SNAPSHOT, VK_SHIFT, VK_LSHIFT, VK_RSHIFT = 0x2C, 0x10, 0xA0, 0xA1
+VK_MENU, VK_LMENU, VK_RMENU, VK_LWIN, VK_RWIN = 0x12, 0xA4, 0xA5, 0x5B, 0x5C
+VK_S, VK_R = 0x53, 0x52
+VK_MASK = 0xE8   # phím "trống", bấm giả để Windows không mở menu Start khi ta nuốt phím sau Win
+WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP = 0x0100, 0x0101, 0x0104, 0x0105
+LLKHF_INJECTED = 0x10
+
+
+class HotkeyFilter:
+    """Theo dõi phím bổ trợ (Win, Shift, Alt) và quyết định có nuốt phím hay không.
+
+    Nuốt:  PrtSc (mọi kiểu: PrtSc, Alt+PrtSc, Win+PrtSc, Win+Alt+PrtSc)
+           Win+Shift+S (chụp vùng), Win+Shift+R (quay màn hình bằng Snipping Tool),
+           Win+Alt+R (quay màn hình bằng Game Bar)
+    Phím nhả (key up) của phím đã nuốt cũng bị nuốt theo để Windows không thấy nửa vời.
+    """
+
+    def __init__(self, decide):
+        self.decide = decide        # hàm(tên_tổ_hợp) -> True nếu phải chặn
+        self.win = self.shift = self.alt = False
+        self.swallowed = set()      # phím đã nuốt lúc nhấn -> nuốt luôn lúc nhả
+
+    def _combo(self, vk):
+        if vk == VK_SNAPSHOT:
+            return "PrtSc"
+        if self.win and self.shift and vk == VK_S:
+            return "Win+Shift+S"
+        if self.win and self.shift and vk == VK_R:
+            return "Win+Shift+R"
+        if self.win and self.alt and vk == VK_R:
+            return "Win+Alt+R"
+        return None
+
+    def on_key(self, vk, msg, injected=False):
+        """Trả về (nuốt: bool, cần_bấm_phím_mask: bool)."""
+        down = msg in (WM_KEYDOWN, WM_SYSKEYDOWN)
+        if injected:
+            return False, False     # phím do chương trình gửi (kể cả phím mask của ta) -> bỏ qua
+        if vk in (VK_LWIN, VK_RWIN):
+            self.win = down
+        elif vk in (VK_SHIFT, VK_LSHIFT, VK_RSHIFT):
+            self.shift = down
+        elif vk in (VK_MENU, VK_LMENU, VK_RMENU):
+            self.alt = down
+        if not down:
+            if vk in self.swallowed:
+                self.swallowed.discard(vk)
+                return True, False
+            return False, False
+        combo = self._combo(vk)
+        if combo and self.decide(combo):
+            self.swallowed.add(vk)
+            return True, combo != "PrtSc"   # tổ hợp có Win -> bấm phím mask chống mở Start
+        return False, False
+
+
 # ============================================================================
 # 2. LỚP WINDOWS: lắng nghe clipboard qua Win32 API (ctypes)
 # ============================================================================
@@ -267,7 +348,17 @@ def _load_win32():
                     ("hCursor", w.HANDLE), ("hbrBackground", w.HANDLE), ("lpszMenuName", w.LPCWSTR),
                     ("lpszClassName", w.LPCWSTR)]
 
+    HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, w.WPARAM, w.LPARAM)
+
+    class KBDLLHOOKSTRUCT(ctypes.Structure):
+        _fields_ = [("vkCode", w.DWORD), ("scanCode", w.DWORD), ("flags", w.DWORD),
+                    ("time", w.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
     sig = {  # khai báo kiểu đầy đủ: thiếu restype là handle 64-bit bị cắt -> crash
+        (user32, "SetWindowsHookExW"): ([ctypes.c_int, HOOKPROC, w.HINSTANCE, w.DWORD], w.HANDLE),
+        (user32, "CallNextHookEx"): ([w.HANDLE, ctypes.c_int, w.WPARAM, w.LPARAM], LRESULT),
+        (user32, "UnhookWindowsHookEx"): ([w.HANDLE], w.BOOL),
+        (user32, "keybd_event"): ([w.BYTE, w.BYTE, w.DWORD, ctypes.c_size_t], None),
         (user32, "RegisterClassW"): ([ctypes.POINTER(WNDCLASSW)], w.ATOM),
         (user32, "CreateWindowExW"): ([w.DWORD, w.LPCWSTR, w.LPCWSTR, w.DWORD, ctypes.c_int, ctypes.c_int,
                                        ctypes.c_int, ctypes.c_int, w.HWND, w.HMENU, w.HINSTANCE,
@@ -301,7 +392,7 @@ def _load_win32():
     for (dll, name), (args, res) in sig.items():
         fn = getattr(dll, name)
         fn.argtypes, fn.restype = args, res
-    return ctypes, w, user32, kernel32, shell32, WNDPROC, WNDCLASSW
+    return ctypes, w, user32, kernel32, shell32, WNDPROC, WNDCLASSW, HOOKPROC, KBDLLHOOKSTRUCT
 
 
 class ClipboardWatcher:
@@ -309,7 +400,7 @@ class ClipboardWatcher:
 
     def __init__(self, guard):
         (self.ct, self.w, self.user32, self.kernel32, self.shell32,
-         WNDPROC, WNDCLASSW) = _load_win32()
+         WNDPROC, WNDCLASSW, HOOKPROC, self.KBD) = _load_win32()
         self.guard = guard
         self._own_seq = None
         self.cf_png = self.user32.RegisterClipboardFormatW("PNG")
@@ -326,16 +417,45 @@ class ClipboardWatcher:
         if not self.user32.AddClipboardFormatListener(self.hwnd):
             raise OSError("AddClipboardFormatListener that bai (loi %d)" % self.ct.get_last_error())
         self.user32.SetTimer(self.hwnd, 1, TICK_MS, None)
+        # Hook bàn phím mức thấp: chạy trên chính luồng có vòng lặp tin nhắn này
+        self.keys = HotkeyFilter(self.guard.on_screenshot_hotkey)
+        self._hook_proc = HOOKPROC(self._keyboard_hook)  # giữ tham chiếu, tránh bị thu hồi
+        self.hook = self.user32.SetWindowsHookExW(13, self._hook_proc, hinst, 0)  # 13 = WH_KEYBOARD_LL
+        if not self.hook:
+            _say("Canh bao: khong cai duoc hook ban phim (loi %d), chi con cac lop chan khac."
+                 % self.ct.get_last_error())
 
     # -------------------------------------------------- vòng lặp tin nhắn
     def run(self):
         msg = self.w.MSG()
+        # Ctrl+C: thay vì ném KeyboardInterrupt (hay rơi đúng vào giữa hook bàn phím và bị nuốt mất),
+        # ta xin Windows kết thúc vòng lặp tin nhắn một cách gọn gàng.
+        old_handler = signal.signal(signal.SIGINT, lambda *_: self.user32.PostQuitMessage(0))
         try:
             while self.user32.GetMessageW(self.ct.byref(msg), None, 0, 0) > 0:
                 self.user32.TranslateMessage(self.ct.byref(msg))
                 self.user32.DispatchMessageW(self.ct.byref(msg))
         finally:
+            signal.signal(signal.SIGINT, old_handler)
             self.user32.RemoveClipboardFormatListener(self.hwnd)
+            if self.hook:
+                self.user32.UnhookWindowsHookEx(self.hook)
+
+    def _keyboard_hook(self, code, wparam, lparam):
+        try:
+            if code == 0:  # HC_ACTION
+                kb = self.ct.cast(lparam, self.ct.POINTER(self.KBD)).contents
+                swallow, mask = self.keys.on_key(kb.vkCode, wparam, bool(kb.flags & LLKHF_INJECTED))
+                if mask:
+                    self.user32.keybd_event(VK_MASK, 0, 0, 0)
+                    self.user32.keybd_event(VK_MASK, 0, 2, 0)  # 2 = KEYEVENTF_KEYUP
+                if swallow:
+                    return 1  # trả về khác 0 = nuốt phím, Windows và các ứng dụng không nhận được
+        except KeyboardInterrupt:
+            self.user32.PostQuitMessage(0)  # dự phòng nếu Ctrl+C vẫn rơi vào đây
+        except Exception as e:
+            _say("Loi hook ban phim: %s: %s" % (type(e).__name__, e))
+        return self.user32.CallNextHookEx(None, code, wparam, lparam)
 
     def _wndproc(self, hwnd, msg, wparam, lparam):
         try:
