@@ -28,6 +28,39 @@ if (isset($_GET['delete'])) {
     exit;
 }
 
+
+// Wazuh integration configuration only: no logs are sent by this page.
+// Run sql/migrations/add_wazuh_settings.sql on existing installations first.
+$wazuhError = '';
+$wazuhSaved = false;
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'save_wazuh') {
+    $ip = trim((string)($_POST['wazuh_ip'] ?? ''));
+    $portRaw = trim((string)($_POST['wazuh_port'] ?? ''));
+    $validIp = filter_var($ip, FILTER_VALIDATE_IP) !== false;
+    $validPort = ctype_digit($portRaw) && (int)$portRaw >= 1 && (int)$portRaw <= 65535;
+    if (!$validIp || !$validPort) {
+        $wazuhError = 'IP SIEM hoac port khong hop le (port 1-65535).';
+    } else {
+        $stmt = $pdo->prepare("
+            INSERT INTO wazuh_settings (id, siem_ip, siem_port)
+            VALUES (1, ?, ?)
+            ON DUPLICATE KEY UPDATE siem_ip = VALUES(siem_ip), siem_port = VALUES(siem_port)
+        ");
+        $stmt->execute([$ip, (int)$portRaw]);
+        $wazuhSaved = true;
+        $message = 'Da luu cau hinh Wazuh SIEM. Chuc nang gui log chua duoc bat.';
+    }
+}
+
+$wazuh = $pdo->query("SELECT siem_ip, siem_port, updated_at FROM wazuh_settings WHERE id = 1")->fetch();
+if (!$wazuh) {
+    $wazuh = ['siem_ip' => '', 'siem_port' => '514', 'updated_at' => null];
+}
+if ($wazuhError !== '') {
+    $wazuh['siem_ip'] = trim((string)($_POST['wazuh_ip'] ?? ''));
+    $wazuh['siem_port'] = trim((string)($_POST['wazuh_port'] ?? ''));
+}
+
 $keys = $pdo->query("
     SELECT ek.*, (SELECT COUNT(*) FROM devices WHERE enrolled_via_key_id = ek.id) as devices_enrolled
     FROM enrollment_keys ek ORDER BY ek.created_at DESC
@@ -44,6 +77,38 @@ require __DIR__ . '/../includes/layout_header.php';
         <?php if ($newKey): ?><div class="token-box"><?= h($newKey) ?></div><?php endif; ?>
     </div>
 <?php endif; ?>
+
+<div class="card">
+    <h2>Wazuh SIEM Integration</h2>
+    <p style="font-size:13px; color:#616e7c; margin-bottom:14px;">
+        Luu dia chi Wazuh/SIEM de su dung khi tich hop gui log DLP sau nay.
+        Hien tai chi luu cau hinh, <strong>chua gui log hoac kiem tra ket noi</strong>.
+        Port phai khop voi dich vu nhan log duoc cau hinh tren Wazuh.
+    </p>
+    <?php if ($wazuhError): ?>
+        <div class="error-msg" role="alert" style="margin-bottom:14px; color:#b42318;"><?= h($wazuhError) ?></div>
+    <?php endif; ?>
+    <form method="POST">
+        <input type="hidden" name="action" value="save_wazuh">
+        <div class="form-group">
+            <label for="wazuh-ip">SIEM Server IP</label>
+            <input id="wazuh-ip" type="text" name="wazuh_ip" maxlength="45"
+                   placeholder="VD: 192.168.106.131"
+                   value="<?= h((string)$wazuh['siem_ip']) ?>" required>
+        </div>
+        <div class="form-group">
+            <label for="wazuh-port">SIEM Port</label>
+            <input id="wazuh-port" type="number" name="wazuh_port" min="1" max="65535"
+                   value="<?= h((string)$wazuh['siem_port']) ?>" required>
+        </div>
+        <button type="submit" class="btn btn-primary">Luu cau hinh Wazuh</button>
+        <?php if ($wazuh['updated_at']): ?>
+            <p style="font-size:12px; color:#616e7c; margin-top:10px;">
+                Cap nhat lan cuoi: <?= h(format_datetime($wazuh['updated_at'])) ?>
+            </p>
+        <?php endif; ?>
+    </form>
+</div>
 
 <div class="card">
     <h2>Tao Enrollment Key moi</h2>
