@@ -1,63 +1,84 @@
-# Wazuh SIEM integration for Agent V2 (TCP syslog, lab)
+# DLP Server -> Wazuh TCP Syslog integration
 
-## Data flow
+## Architecture
 
 ```
-DLP event (USB / Browser / HTTP / SCP-SFTP-FTP / Firewall)
-    -> Agent V2 -> HTTP POST agent_report.php -> DLP Server MySQL
-    -> [only after HTTP 2xx] Agent V2 -> TCP syslog -> Wazuh Manager 4.x
+Windows DLP Agent V2 --HTTP POST agent_report.php--> DLP Server (PHP / MySQL)
+                                                     | writes logs and outbox in one DB transaction
+                                                     v
+                                            TCP Syslog to Wazuh Manager
+                                                     ^
+                                      CLI retry worker for failed deliveries
 ```
 
-The Agent copies **metadata** from the accepted report (hostname, policy ID, exit point, action, file path, destination, process, rule IDs, UTC timestamp). File contents, server access tokens, and enrollment keys are not forwarded.
+**The Windows Agent never connects to Wazuh**, receives no Wazuh destination in its policy and needs no new binaries for this integration. The Server sends metadata only, not file contents or enrollment/API tokens. It forwards records **after the DLP Server accepts and stores them**. Failed Wazuh sends do not change Agent DLP verdicts. Duplicate events are possible if a network write succeeds but Server crashes before updating the outbox; each event contains a unique `log_id` for deduplication.
 
-The web configuration consists of **IP and port only** at Admin > Settings. Agent V2 downloads `wazuh: {ip, port}` through authenticated `agent_policy.php` on its regular policy refresh (~60 seconds). A null destination disables forwarding. The Agent continues to work if Wazuh is unreachable; there is no durable retry queue yet. TCP connect/send success **does not** confirm Wazuh indexed or alerted on the event.
+## Deployment (XAMPP / Windows DLP Server)
 
-### One-time SQL migration
+1. Deploy the changed Server code and run BOTH SQL migrations on existing `dlp_system` MySQL database:
+   - `server/sql/migrations/add_wazuh_settings.sql`
+   - `server/sql/migrations/add_wazuh_outbox.sql`
+   Fresh databases created with current `server/sql/schema.sql` already include both tables.
+2. Admin > Settings > Wazuh SIEM Integration: set Wazuh Manager IP and **TCP syslog** port (e.g. 514).
+3. For each accepted `POST /api/agent_report.php`, DLP Server writes its `logs` row and an outbox entry, then attempts a best-effort delivery of one due log immediately.
+4. Set up Windows Task Scheduler to retry pending events each minute. Example (adjust XAMPP and repo paths):
+   - Program: `C:\xampp\php\php.exe`
+   - Arguments: `C:\xampp\htdocs\dlp_server\cli\wazuh_flush.php`
+   - Trigger: Repeat every 1 minute indefinitely.
+   - Run as a dedicated restricted account that can read server PHP files and connect to MySQL.
+   Or run manually in CMD:
+   ```cmd
+   C:\xampp\php\php.exe C:\xampp\htdocs\dlp_server\cli\wazuh_flush.php
+   ```
+   Worker output is `{"sent":N,"failed":N,"skipped":N}`. It accepts **CLI only**, not HTTP.
+5. Inspect pending delivery status in phpMyAdmin:
+   ```sql
+   SELECT log_id, attempts, next_attempt_at, sent_at, last_error
+   FROM dlp_wazuh_outbox ORDER BY log_id DESC LIMIT 20;
+   ```
+   `sent_at` indicates successful TCP write, **not Wazuh ingestion or alerting**. Failed records are retried with exponential backoff up to 5 minutes.
 
-Existing MySQL installations must execute `server/sql/migrations/add_wazuh_settings.sql` using phpMyAdmin (DB: `dlp_system`). Fresh schema includes the table.
+## Wazuh Manager configuration (Ubuntu)
 
-### Wazuh manager 4.x receiver (Ubuntu)
-
-Configure a **separate TCP syslog receiver** in `/var/ossec/etc/ossec.conf`, inside `<ossec_config>`:
+Edit `/var/ossec/etc/ossec.conf`, add a separate block within `<ossec_config>` (keep existing 1514/TCP secure Agent service untouched):
 
 ```xml
 <remote>
   <connection>syslog</connection>
   <port>514</port>
   <protocol>tcp</protocol>
-  <allowed-ips>192.168.106.0/24</allowed-ips>
+  <allowed-ips>192.168.106.142</allowed-ips>
 </remote>
 ```
 
-Restrict `allowed-ips` to actual DLP endpoints instead of a broad subnet in production. Open the chosen TCP port in firewall if needed. Restart:
+**Set `allowed-ips` to the DLP Server's IP, not the Windows Agent VM IP.** If necessary, allow inbound TCP/514 through Wazuh Ubuntu firewall, then:
 
 ```bash
 sudo systemctl restart wazuh-manager
 sudo ss -lntp | grep ':514'
 ```
 
-Wazuh default **1514/TCP** is the secure Wazuh Agent protocol, NOT generic syslog; do not point the DLP emitter at 1514. This integration uses **TCP only**, not UDP or the Dashboard/API port.
-
-See https://documentation.wazuh.com/current/user-manual/capabilities/log-data-collection/syslog.html
-
-### Enable on DLP Server and Agent
-
-1. Deploy updated `server/admin/settings.php`, `server/api/agent_policy.php` and run SQL migration.
-2. Open DLP admin Settings -> Wazuh SIEM Integration. Enter Wazuh Manager IP and syslog TCP port (e.g. 514). Save.
-3. Verify DLP Agent's `C:\ProgramData\DLPAgent\policy.json` contains:
-```json
-"wazuh": {"ip":"192.168.106.131","port":514}
-```
-4. Publish Agent V2:
+On the DLP Server, verify network access to Wazuh TCP/514:
 ```powershell
-dotnet publish .\DlpAgent\DlpAgent.csproj -c Release -r win-x64 --self-contained true -o C:\DLPBuild
+Test-NetConnection <WAZUH-MANAGER-IP> -Port 514
 ```
-5. Stop DLPAgent service, copy published files into its actual installation directory, restart. Existing HTTP and browser enforcement settings remain unchanged.
-6. Trigger a **real controlled DLP event**. Inspect the Server Logs and the Agent service logs. On Ubuntu use `sudo tcpdump -n -A -i any 'tcp port 514'` for lab diagnosis (sensitive metadata may be visible); independently verify Wazuh ingestion and rule/alert creation. You may need Wazuh local decoder/rule configuration before events appear as Dashboard alerts.
 
-### Safety / limitations
+Official receiver reference: https://documentation.wazuh.com/current/user-manual/capabilities/log-data-collection/syslog.html
 
-- Plain TCP syslog **is unencrypted and unauthenticated**. Use only on a trusted isolated lab network. Production needs protected transport, an authenticated collector, or a Wazuh-supported secure Agent integration.
-- This forwards only events that the DLP Server accepted with HTTP 2xx. Local detections with failed primary reports are not forwarded.
-- No persistent queue, retry, transport selection, connection test button, delivery acknowledgment, or Wazuh custom decoder/rules. Dashboard visibility is not guaranteed by delivery alone.
-- If the Wazuh Settings table has not been migrated, the new policy endpoint returns a database error. Migrate before deployment.
+## Example event
+
+```text
+<134>Nov 03 22:30:00 PC-01 DLPServer: {"integration":"DLPServer","log_id":55,"hostname":"PC-01","policy_id":2,"exit_point_type":"BROWSER_CHROME","action_taken":"BLOCKED_BROWSER","file_path":"secret.txt","occurred_at":"2026-11-03 15:30:00Z"}
+```
+
+Forwarded event fields include log_id, hostname, policy_id, exit_point_type, action_taken, file_path, SHA256 hash, matched_rule_ids, confidence_score, destination_value, process_name and occurred_at. Wazuh may need a custom decoder/rule to display the metadata and trigger a DLP alert. Check `/var/ossec/logs/alerts/alerts.json` or use `wazuh-logtest`; reception itself does not necessarily create an alert.
+
+## Known limits
+
+- Syslog TCP is **unencrypted and unauthenticated**: use only in isolated lab networks, not untrusted/public networks.
+- Sender requires PHP streams (standard PHP) and MySQL. TCP connect timeout is 1.5 seconds, write timeout 2 seconds.
+- No delivery acknowledgment from Wazuh, only TCP write success. Retry may create duplicates; deduplicate using `log_id`.
+- If Wazuh IP/port is not configured, newly ingested logs are stored in DLP MySQL only, without outbox entries. Old logs are not retroactively enqueued.
+- Changing the destination IP/port updates the next send attempt; queue uses the current saved destination.
+- Server-admin IP/port validation prevents invalid targets but **is not an SSRF protection boundary against a malicious admin**. Restrict who can edit SIEM configuration.
+- Endpoint-side Wazuh forwarding was removed from Agent V2; do not publish or install old binaries with `WazuhSyslogForwarder.cs`.
