@@ -3,6 +3,7 @@ declare(strict_types=1);
 header('Content-Type: application/json; charset=utf-8');
 require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/../includes/api_common.php';
+require_once __DIR__ . '/../includes/wazuh_forwarder.php';
 api_method('POST');
 $token = api_token();
 $data = api_json();
@@ -39,8 +40,22 @@ try {
         $stmt->execute([$device['id'], $policyId, $device['group_id']]);
         if (!$stmt->fetchColumn()) api_error(400, 'policy_id is not assigned to this device');
     }
-    $stmt = $pdo->prepare('INSERT INTO logs (device_id,policy_id,exit_point_type,action_taken,file_path,file_hash_sha256,matched_rule_ids,confidence_score,destination_value,process_name,occurred_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)');
-    $stmt->execute([$device['id'], $policyId, $exit, $action, $file, $hash, $rules, $confidence, $dest, $process, $utc]);
+    // Store the event and its optional SIEM delivery task atomically.
+    // Agent acknowledgment is independent of the Wazuh receiver's availability.
+    $pdo->beginTransaction();
+    try {
+        $stmt = $pdo->prepare('INSERT INTO logs (device_id,policy_id,exit_point_type,action_taken,file_path,file_hash_sha256,matched_rule_ids,confidence_score,destination_value,process_name,occurred_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)');
+        $stmt->execute([$device['id'], $policyId, $exit, $action, $file, $hash, $rules, $confidence, $dest, $process, $utc]);
+        $logId = (int)$pdo->lastInsertId();
+        wazuh_enqueue($pdo, $logId);
+        $pdo->commit();
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        throw $e;
+    }
+    // Best-effort immediate delivery. Failures stay queued for the scheduled CLI worker.
+    try { wazuh_flush($pdo, 1); }
+    catch (Throwable $e) { error_log('[DLP Wazuh] immediate delivery failed: ' . $e->getMessage()); }
     http_response_code(201);
-    echo json_encode(['status'=>'ok', 'id'=>(int)$pdo->lastInsertId()]);
+    echo json_encode(['status'=>'ok', 'id'=>$logId]);
 } catch (PDOException $e) { api_db_error($e); }
