@@ -29,7 +29,7 @@ if (isset($_GET['delete'])) {
 }
 
 
-// Wazuh integration configuration only: no logs are sent by this page.
+// Destination used only by the Server-side Wazuh TCP syslog forwarder.
 // Run sql/migrations/add_wazuh_settings.sql on existing installations first.
 $wazuhError = '';
 $wazuhSaved = false;
@@ -48,7 +48,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'save_
         ");
         $stmt->execute([$ip, (int)$portRaw]);
         $wazuhSaved = true;
-        $message = 'Da luu cau hinh Wazuh SIEM. Chuc nang gui log chua duoc bat.';
+        $message = 'Da luu IP/port Wazuh. DLP Server se gui TCP Syslog khi nhan log moi.';
     }
 }
 
@@ -81,8 +81,9 @@ require __DIR__ . '/../includes/layout_header.php';
 <div class="card">
     <h2>Wazuh SIEM Integration</h2>
     <p style="font-size:13px; color:#616e7c; margin-bottom:14px;">
-        Luu dia chi Wazuh/SIEM de su dung khi tich hop gui log DLP sau nay.
-        Hien tai chi luu cau hinh, <strong>chua gui log hoac kiem tra ket noi</strong>.
+        DLP Server tu dong gui TCP Syslog sau khi luu log tu Agent vao MySQL.
+        Neu SIEM mat ket noi, log duoc giu trong hang doi va thu lai bang CLI worker.
+        <strong>Can cau hinh Syslog TCP receiver tren Wazuh va chay worker dinh ky.</strong>
         Port phai khop voi dich vu nhan log duoc cau hinh tren Wazuh.
     </p>
     <?php if ($wazuhError): ?>
