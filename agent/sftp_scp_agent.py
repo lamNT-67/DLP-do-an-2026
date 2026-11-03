@@ -3,9 +3,8 @@ from pathlib import Path
 import psutil
 from policy_client import PolicyClient
 from log_writer import write_log_event
-from content_inspection_stub import scan_content_with_rules
-from file_text import read_file_text
-from policy_utils import get_exit_point_status, file_always_blocked, file_in_scope
+from content_inspection import inspect_file, to_log_inspection, to_report_fields
+from policy_utils import get_exit_point_status, file_in_scope
 
 POLL_INTERVAL_SECONDS = 0.25
 POLICY_REFRESH_SECONDS = 60
@@ -54,8 +53,9 @@ def _ensure_registered(cfg, path="config.ini"):
     return client
 
 
-def _read_file_snippet(fp):
-    return read_file_text(fp)
+def _get_username(proc):
+    try: return proc.username()
+    except (psutil.NoSuchProcess, psutil.AccessDenied): return None
 
 
 def _ept_of(name):
@@ -181,6 +181,27 @@ def _get_remote_endpoint(procs):
     return None, None
 
 
+def _remote_from_cmdline(cmdline):
+    """Du phong khi chua co ket noi: lay host:port tu dong lenh (user@host:path)."""
+    import re, socket
+    args = list(cmdline or [])[1:]
+    port = 22
+    for i, a in enumerate(args):
+        if a == "-P" and i + 1 < len(args) and args[i + 1].isdigit():
+            port = int(args[i + 1])
+    for a in args:
+        if a.startswith("-"):
+            continue
+        m = re.match(r"^(?:[^@\s]+@)?([A-Za-z0-9._-]{2,}):", a)   # >= 2 ky tu: bo qua o dia 'C:'
+        if not m:
+            continue
+        try:
+            return socket.gethostbyname(m.group(1)), port
+        except OSError:
+            continue
+    return None, None
+
+
 def _ps(command):
     try:
         r = subprocess.run(["powershell", "-NoProfile", "-Command", command],
@@ -217,19 +238,13 @@ def _block_process_and_connection(procs, ip, port):
     return "BLOCKED_KILL" if killed else "LOGGED"
 
 
-def _inspect_file(fp, status):
-    """Tra ve (should_act, insp). Policy: duong ra -> loai file -> noi dung."""
-    none = {"matched_rule_ids": [], "matched_rule_names": [], "confidence_level": "LOW"}
+def _inspect_file(fp, status, dest=None):
+    """Tra ve ket qua cua Content Inspection Engine, hoac None neu file ngoai pham vi policy.
+    Policy: duong ra -> loai file (pham vi) -> engine (loai luon chan, noi dung, diem tin cay)."""
     if not file_in_scope(fp, status["file_types"]):
-        return False, none                      # khac loai file cua policy: khong quet, cho qua
-    if file_always_blocked(fp, status["file_types"]):
-        return True, dict(none, confidence_level="CRITICAL")
-    if status["content_rules"]:
-        insp = scan_content_with_rules(_read_file_snippet(fp), status["content_rules"])
-        return bool(insp["matched_rule_ids"]), insp
-    if status["file_types"]:                    # co loai file, khong co rule noi dung: chan theo loai file
-        return True, dict(none, confidence_level="HIGH")
-    return status["effective_action"] == "BLOCK", dict(none, confidence_level="HIGH")
+        return None                             # khac loai file cua policy: khong quet, cho qua
+    res = inspect_file(fp, status, destination=dest)
+    return None if res["verdict"] == "ALLOW" else res
 
 def _remove_rules(pattern):
     if platform.system() != "Windows":
@@ -253,7 +268,11 @@ def run():
     last_port_state = None
     reactive_clean = False
     print(f"[sftp_scp_agent] Bat dau giam sat tren {cfg['agent']['hostname']} ...")
+    import faulthandler
+    _hang = open(r"C:\ProgramData\DLP\logs\sftp_scp_hang.log", "a")
     while True:
+        faulthandler.cancel_dump_traceback_later()
+        faulthandler.dump_traceback_later(30, file=_hang)
         now = time.time()
 
         if now - last_heartbeat >= HEARTBEAT_INTERVAL_SECONDS:
@@ -323,30 +342,37 @@ def run():
                 key = (rkey, fp)
                 if key in already: continue
                 already.add(key)
-                should_act, insp = _inspect_file(fp, status)
-                if not should_act:
+                ip, port = _get_remote_endpoint(procs)
+                if not ip:
+                    try: ip, port = _remote_from_cmdline(root.cmdline())
+                    except (psutil.NoSuchProcess, psutil.AccessDenied): pass
+                dest = f"{ip}:{port}" if ip else None
+                res = _inspect_file(fp, status, dest)
+                if res is None:
                     continue
-                if blocking:
-                    ip, port = _get_remote_endpoint(procs)
+                user = _get_username(root)
+                if blocking and res["verdict"] == "BLOCK":
                     action = _block_process_and_connection(procs, ip, port)
                     killed_roots.add(rkey); killed = True
                 else:
                     action = "LOGGED"
+                fields = to_report_fields(res)
                 payload = {"hostname": hostname, "exit_point_type": ept,
                            "policy_id": status["policy_ids"][0] if status["policy_ids"] else None,
                            "action_taken": action, "occurred_at": _iso_now(), "file_path": fp,
-                           "file_hash_sha256": None, "matched_rule_ids": insp["matched_rule_ids"],
-                           "confidence_score": insp["confidence_level"], "destination_value": None,
-                           "process_name": rpname}
+                           "file_hash_sha256": fields["file_hash_sha256"],
+                           "matched_rule_ids": fields["matched_rule_ids"],
+                           "confidence_score": fields["confidence_score"], "destination_value": dest,
+                           "process_name": rpname, "username": user}
                 rep = client.send_report(payload)
                 write_log_event(hostname,
                                  "scp_sftp" if ept == "NETWORK_SCP_SFTP" else "ftp", ept,
                                  "violation" if action != "LOGGED" else "logged",
                                  status["effective_action"],
-                                 {"process_name": rpname, "process_pid": rpid, "user": None},
-                                 {"destination_ip": None, "destination_domain": None, "destination_port": None, "file_path": fp},
-                                 insp, action, rep)
-                print(f"[sftp_scp_agent] {action} - {rpname} (PID {rpid}) dang truyen file: {fp} (reported={rep})")
+                                 {"process_name": rpname, "process_pid": rpid, "user": user},
+                                 {"destination_ip": ip, "destination_domain": None, "destination_port": port, "file_path": fp},
+                                 to_log_inspection(res), action, rep)
+                print(f"[sftp_scp_agent] {action} - {rpname} (PID {rpid}) ({res['reason']}, {res['confidence_level']}) -> {dest}: {fp} (reported={rep})")
                 if killed: break
             if first and blocking and not killed:
                 _resume_tree(procs)   # file sach: cho di tiep
