@@ -10,7 +10,7 @@ function wazuh_enqueue(PDO $pdo, int $logId): void {
     $config = $pdo->query("SELECT siem_ip, siem_port FROM wazuh_settings WHERE id=1")->fetch(PDO::FETCH_ASSOC);
     if (!$config || filter_var($config['siem_ip'], FILTER_VALIDATE_IP) === false ||
         (int)$config['siem_port'] < 1 || (int)$config['siem_port'] > 65535) return;
-    $stmt = $pdo->prepare('INSERT IGNORE INTO dlp_wazuh_outbox (log_id) VALUES (?)');
+    $stmt = $pdo->prepare('INSERT IGNORE INTO dlp_wazuh_outbox (log_id, next_attempt_at) VALUES (?, UTC_TIMESTAMP())');
     $stmt->execute([$logId]);
 }
 
