@@ -71,7 +71,6 @@ internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundServi
     private HttpUploadProxy? _httpProxy;
     private ProtocolFirewall? _protocolFirewall;
     private ProtocolEventMonitor? _protocolEventMonitor;
-    private WazuhSyslogForwarder? _wazuh;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -111,7 +110,6 @@ internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundServi
             logger.LogWarning("USB monitor enabled. Actual deletion on BLOCK policies: {Enabled}", _settings.UsbEnforceBlock);
         }
 
-        _wazuh = new WazuhSyslogForwarder(logger);
         _networkPolicy = new NetworkPolicy(logger, ReportBrowserAsync, ReportTransferAsync);
         try { _networkPolicy.Start(); }
         catch (Exception ex) { logger.LogWarning(ex, "Browser policy bridge cannot start; USB/service can still run"); }
@@ -255,7 +253,6 @@ internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundServi
         _httpProxy?.UpdatePolicy(body);
         if (_protocolFirewall is not null) await _protocolFirewall.ApplyPolicyAsync(body, ct);
         _protocolEventMonitor?.UpdatePolicy(body);
-        _wazuh?.Configure(json.RootElement);
         logger.LogInformation("Policy refreshed: {Count} applicable policies", policies.GetArrayLength());
     }
 
@@ -274,7 +271,7 @@ internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundServi
                 file_path = decision.FilePath,
                 occurred_at = DateTimeOffset.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
             });
-            using var response = await SendAndForwardReportAsync(req, ct);
+            using var response = await _http.SendAsync(req, ct);
             if (!response.IsSuccessStatusCode)
                 logger.LogWarning("USB report HTTP {Status}: {File}", (int)response.StatusCode, decision.FilePath);
         }
@@ -301,7 +298,7 @@ internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundServi
                 file_path = fileName,
                 occurred_at = DateTimeOffset.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
             });
-            using var response = await SendAndForwardReportAsync(request, ct);
+            using var response = await _http.SendAsync(request, ct);
             if (!response.IsSuccessStatusCode)
                 logger.LogWarning("HTTP upload log rejected with status {Status}", (int)response.StatusCode);
         }
@@ -332,7 +329,7 @@ internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundServi
             process_name = channel == "edge" ? "msedge.exe" : channel == "chrome" ? "chrome.exe" : "firefox.exe",
             occurred_at = DateTimeOffset.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
         });
-        using var resp = await SendAndForwardReportAsync(req, ct);
+        using var resp = await _http.SendAsync(req, ct);
         if (!resp.IsSuccessStatusCode)
         {
             var reason = await resp.Content.ReadAsStringAsync(ct);
@@ -357,7 +354,7 @@ internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundServi
             process_name = processName,
             occurred_at = DateTimeOffset.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
         });
-        using var resp = await SendAndForwardReportAsync(request, ct);
+        using var resp = await _http.SendAsync(request, ct);
         if (!resp.IsSuccessStatusCode)
         {
             var reason = await resp.Content.ReadAsStringAsync(ct);
@@ -391,20 +388,9 @@ internal sealed class AgentWorker(ILogger<AgentWorker> logger) : BackgroundServi
             matched_rule_ids = matchedRuleIds,
             occurred_at = DateTimeOffset.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
         });
-        using var response = await SendAndForwardReportAsync(req, ct);
+        using var response = await _http.SendAsync(req, ct);
         if (!response.IsSuccessStatusCode)
             throw new HttpRequestException($"Transfer log HTTP {(int)response.StatusCode}: {await response.Content.ReadAsStringAsync(ct)}");
-    }
-
-    // Preserve the existing Server-first log flow. Syslog forwarding is best-effort
-    // and does not alter Server HTTP errors or policy-blocking decisions.
-    private async Task<HttpResponseMessage> SendAndForwardReportAsync(HttpRequestMessage request, CancellationToken ct)
-    {
-        var payload = request.Content is null ? null : await request.Content.ReadAsStringAsync(ct);
-        var response = await _http.SendAsync(request, ct);
-        if (response.IsSuccessStatusCode && !string.IsNullOrWhiteSpace(payload) && _wazuh is not null)
-            await _wazuh.ForwardAsync(payload, _settings.Hostname, ct);
-        return response;
     }
 
     private HttpRequestMessage Request(HttpMethod method, string relativeUrl)
