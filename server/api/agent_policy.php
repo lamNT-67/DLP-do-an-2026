@@ -102,6 +102,18 @@ $stmt = $pdo->query("
 ");
 $networkBlacklist = $stmt->fetchAll();
 
+// Wazuh destination is optional. An empty table disables forwarding.
+// Only Agent-authenticated requests can read this value.
+$wazuhRow = $pdo->query("SELECT siem_ip, siem_port FROM wazuh_settings WHERE id = 1")->fetch();
+$wazuhConfig = null;
+if ($wazuhRow && filter_var($wazuhRow['siem_ip'], FILTER_VALIDATE_IP) &&
+    (int)$wazuhRow['siem_port'] >= 1 && (int)$wazuhRow['siem_port'] <= 65535) {
+    $wazuhConfig = [
+        'ip' => $wazuhRow['siem_ip'],
+        'port' => (int)$wazuhRow['siem_port']
+    ];
+}
+
 // ---- 6. Tra ket qua ----
 echo json_encode([
     'hostname'            => $device['hostname'],
@@ -110,4 +122,5 @@ echo json_encode([
     'applicable_policies' => $applicablePolicies,
     'usb_whitelist'       => $usbWhitelist,
     'network_blacklist'   => $networkBlacklist,
+    'wazuh'               => $wazuhConfig,
 ], JSON_UNESCAPED_UNICODE);
