@@ -1,0 +1,1 @@
+ALTER TABLE logs ADD COLUMN username VARCHAR(100) NULL AFTER process_name;

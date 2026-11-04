@@ -8,6 +8,7 @@ import time
 
 RULE_PREFIX = "DLP_Pro_"
 STATIC_LABEL = "static-IPs"
+QUIC_SUFFIX = "_QUIC"
 MAX_IPS_PER_DOMAIN = 64
 FIREWALL_LOG = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
                             "System32", "LogFiles", "Firewall", "pfirewall.log")
@@ -44,6 +45,20 @@ def _clean_ip(value):
     except ValueError:
         return None
     return str(ip) if ip.is_global else None
+
+
+def split_target(value):
+    """'https://x.com' -> ('x.com', 'https'); 'x.com' -> ('x.com', None)."""
+    v = str(value).strip()
+    for scheme in ("https", "http"):
+        if v.lower().startswith(scheme + "://"):
+            host = v[len(scheme) + 3:].split("/")[0].split(":")[0]
+            return host, scheme
+    return v, None
+
+
+def scheme_port(scheme):
+    return {"https": 443, "http": 80}.get(scheme)
 
 
 def _rule_name(label):
@@ -83,7 +98,7 @@ class DomainBlocker:
         desired = {}
         if enabled:
             for d in domains:
-                for ip in self._resolve(d):
+                for ip in self._resolve(split_target(d)[0]):
                     self.learn_ip(d, ip)
                 if self.known.get(d):
                     desired[d] = set(self.known[d])
@@ -93,7 +108,9 @@ class DomainBlocker:
                 desired[STATIC_LABEL] = set(statics)
 
         changes = []
-        wanted_names = set(_rule_name(label) for label in desired)
+        wanted_names = set()
+        for label in desired:
+            wanted_names |= set(self._rule_names(label))
 
         if self._first_sync:
             self._first_sync = False
@@ -108,29 +125,47 @@ class DomainBlocker:
         for label, ips in desired.items():
             name = _rule_name(label)
             frozen = frozenset(ips)
+            ports = scheme_port(split_target(label)[1])
             if self.applied.get(name) == frozen:
                 continue
             existed = name in self.applied
-            if self._upsert(name, sorted(ips)):
+            if self._upsert(name, sorted(ips), ports):
                 self.applied[name] = frozen
                 changes.append(("UPDATED" if existed else "ADDED", label, set(ips)))
 
         for name in list(self.applied):
             if name not in wanted_names:
                 self._remove(name)
+                self._remove(name + QUIC_SUFFIX)
                 del self.applied[name]
                 changes.append(("REMOVED", name[len(RULE_PREFIX):], set()))
         return changes
 
-    def _upsert(self, name, ips):
+    def _rule_names(self, label):
+        name = _rule_name(label)
+        if split_target(label)[1] == "https":
+            return [name, name + QUIC_SUFFIX]
+        return [name]
+
+    def _upsert(self, name, ips, port=None):
         arr = ",".join("'%s'" % i for i in ips)
         cmd = ("try { $n='%s'; $a=@(%s); "
                "if (Get-NetFirewallRule -DisplayName $n -ErrorAction SilentlyContinue) "
                "{ Set-NetFirewallRule -DisplayName $n -RemoteAddress $a -ErrorAction Stop } "
                "else { New-NetFirewallRule -DisplayName $n -Direction Outbound "
-               "-RemoteAddress $a -Action Block -ErrorAction Stop | Out-Null }; "
+               "-RemoteAddress $a %s -Action Block -ErrorAction Stop | Out-Null }; "
+               "%s"
                "Write-Output 'DLP_OK' } "
-               "catch { Write-Output ('DLP_FAIL ' + $_.Exception.Message) }") % (name, arr)
+               "catch { Write-Output ('DLP_FAIL ' + $_.Exception.Message) }")
+        proto = ("-Protocol TCP -RemotePort %d" % port) if port else ""
+        quic = ""
+        if port == 443:   # chan them QUIC (UDP 443) de Chrome khong lach duong
+            q = name + QUIC_SUFFIX
+            quic = ("$q='%s'; if (Get-NetFirewallRule -DisplayName $q -ErrorAction SilentlyContinue) "
+                    "{ Set-NetFirewallRule -DisplayName $q -RemoteAddress $a -ErrorAction Stop } "
+                    "else { New-NetFirewallRule -DisplayName $q -Direction Outbound -RemoteAddress $a "
+                    "-Protocol UDP -RemotePort 443 -Action Block -ErrorAction Stop | Out-Null }; " % q)
+        cmd = cmd % (name, arr, proto, quic)
         out = self._run(cmd)
         if "DLP_OK" in out:
             return True

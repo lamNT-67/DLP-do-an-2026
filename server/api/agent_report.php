@@ -33,6 +33,7 @@ if ($rules !== null && strlen($rules) > 255) api_error(400, 'matched_rule_ids to
 $file = api_string($data, 'file_path', 500);
 $dest = api_string($data, 'destination_value', 255);
 $process = api_string($data, 'process_name', 100);
+$username = api_string($data, 'username', 100);
 try {
     $device = api_device($pdo, $token, $hostname);
     if ($policyId !== null) {
@@ -44,8 +45,8 @@ try {
     // Agent acknowledgment is independent of the Wazuh receiver's availability.
     $pdo->beginTransaction();
     try {
-        $stmt = $pdo->prepare('INSERT INTO logs (device_id,policy_id,exit_point_type,action_taken,file_path,file_hash_sha256,matched_rule_ids,confidence_score,destination_value,process_name,occurred_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)');
-        $stmt->execute([$device['id'], $policyId, $exit, $action, $file, $hash, $rules, $confidence, $dest, $process, $utc]);
+        $stmt = $pdo->prepare('INSERT INTO logs (device_id,policy_id,exit_point_type,action_taken,file_path,file_hash_sha256,matched_rule_ids,confidence_score,destination_value,process_name,username,occurred_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)');
+        $stmt->execute([$device['id'], $policyId, $exit, $action, $file, $hash, $rules, $confidence, $dest, $process, $username, $utc]);
         $logId = (int)$pdo->lastInsertId();
         wazuh_enqueue($pdo, $logId);
         $pdo->commit();

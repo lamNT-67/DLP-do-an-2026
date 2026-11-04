@@ -17,7 +17,7 @@ if ($filterHostname !== '')  { $where[] = 'd.hostname LIKE ?';     $params[] = '
 $whereSql = $where ? ('WHERE ' . implode(' AND ', $where)) : '';
 
 $stmt = $pdo->prepare("
-    SELECT l.*, d.hostname, d.username
+    SELECT l.*, d.hostname, d.username AS device_username
     FROM logs l
     JOIN devices d ON l.device_id = d.id
     $whereSql
@@ -86,7 +86,7 @@ require __DIR__ . '/../includes/layout_header.php';
         <?php foreach ($logs as $l): ?>
             <tr>
                 <td><?= h(format_log_datetime($l['occurred_at'])) ?></td>
-                <td><?= h($l['hostname']) ?> <?= $l['username'] ? '('.h($l['username']).')' : '' ?></td>
+                <td><?= h($l['hostname']) ?> <?= ($l['username'] ?: $l['device_username']) ? '('.h($l['username'] ?: $l['device_username']).')' : '' ?></td>
                 <td><?= h($l['exit_point_type']) ?></td>
                 <td><?= h($l['action_taken']) ?></td>
                 <td style="max-width:200px; word-break:break-all; font-size:12px;"><?= h($l['file_path'] ?? '-') ?></td>

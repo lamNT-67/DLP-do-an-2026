@@ -160,6 +160,7 @@ CREATE TABLE logs (
     confidence_score    ENUM('LOW','MEDIUM','HIGH','CRITICAL'),
     destination_value   VARCHAR(255),
     process_name        VARCHAR(100),
+    username            VARCHAR(100),
     occurred_at         DATETIME NOT NULL,
     FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE,
     FOREIGN KEY (policy_id) REFERENCES dlp_policies(id) ON DELETE SET NULL,
