@@ -34,3 +34,18 @@ function format_datetime(?string $dt): string {
     if (!$dt) return '-';
     return date('d/m/Y H:i:s', strtotime($dt));
 }
+/**
+ * Log timestamps are stored as UTC in a timezone-less MySQL DATETIME column.
+ * Parse them explicitly as UTC, then render in Vietnam local time (UTC+07).
+ * Do not modify stored values, otherwise exports/correlation would drift.
+ */
+function format_log_datetime(?string $dt): string {
+    if (!$dt) return '-';
+    try {
+        $utc = new DateTimeImmutable($dt, new DateTimeZone('UTC'));
+        return $utc->setTimezone(new DateTimeZone('Asia/Ho_Chi_Minh'))
+            ->format('d/m/Y H:i:s');
+    } catch (Throwable $e) {
+        return '-';
+    }
+}

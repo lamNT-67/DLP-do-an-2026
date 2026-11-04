@@ -3,6 +3,7 @@ import platform
 import subprocess
 import configparser
 import datetime
+import re
 import socket
 from pathlib import Path
 
@@ -12,7 +13,7 @@ from policy_client import PolicyClient
 from log_writer import write_log_event
 from content_inspection import scan_content_with_rules
 from policy_utils import get_exit_point_status
-from domain_blocker import DomainBlocker, DropLogTailer
+from domain_blocker import DomainBlocker, DropLogTailer, split_target, scheme_port
 
 POLL_INTERVAL_SECONDS = 10
 POLICY_REFRESH_SECONDS = 60
@@ -67,8 +68,12 @@ def _match_blacklist(remote_ip, remote_port, blacklist, blocker):
         if t == "PORT" and v == str(remote_port):
             return entry
         if t == "DOMAIN":
+            host, scheme = split_target(v)
+            sp = scheme_port(scheme)
+            if sp and int(remote_port) != sp:
+                continue
             try:
-                ips = set(i[4][0] for i in socket.getaddrinfo(v, None))
+                ips = set(i[4][0] for i in socket.getaddrinfo(host, None))
             except socket.gaierror:
                 ips = set()
             if remote_ip in ips or remote_ip in blocker.known.get(v, set()):
@@ -102,6 +107,30 @@ def _block_connection(pid, remote_ip, remote_port):
     except psutil.NoSuchProcess:
         return "LOGGED"
 
+
+def _prune_reactive_rules(blacklist, blocker, reactive_ips):
+    """Go cac rule DLP_Block_* khong con khop muc blacklist nao (vi du vua go http://example.com)."""
+    if platform.system() != "Windows":
+        return
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-Command",
+            "(Get-NetFirewallRule -DisplayName 'DLP_Block_*' -ErrorAction SilentlyContinue).DisplayName"],
+            capture_output=True, text=True, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        return
+    seen = set()
+    for name in out.split():
+        m = re.match(r"^DLP_Block_(.+)_(\d+)_(TCP|UDP)$", name.strip())
+        if not m:
+            continue
+        ip, port = m.group(1), int(m.group(2))
+        if (ip, port) in seen:
+            continue
+        seen.add((ip, port))
+        if _match_blacklist(ip, port, blacklist, blocker) is None:
+            _remove_rules("DLP_Block_%s_%d_*" % (ip, port))
+            reactive_ips.discard(ip)
+            print("[network_agent] Da go rule phan ung %s:%d (khong con trong blacklist)" % (ip, port))
 
 def _remove_rules(pattern):
     if platform.system() != "Windows":
@@ -200,6 +229,7 @@ def run():
                                          "destination_port": None, "file_path": None}, NO_INSPECTION)
             except Exception as e:
                 print("[network_agent] Loi khi dong bo firewall:", e)
+            _prune_reactive_rules(blacklist, blocker, reactive_ips)
 
         try:
             for d in tailer.read_new_drops(blocker.blocked_ips() | reactive_ips):

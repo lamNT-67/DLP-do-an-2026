@@ -93,7 +93,7 @@ CREATE TABLE dlp_policy_devices (
 -- 8. Exit point duoc tick trong Policy
 CREATE TABLE dlp_policy_exit_points (
     policy_id           INT NOT NULL,
-    exit_point_type     ENUM('USB','CLIPBOARD','NETWORK_WEB','NETWORK_SCP_SFTP','NETWORK_FTP','RDP','SCREEN_CAPTURE') NOT NULL,
+    exit_point_type     ENUM('USB','CLIPBOARD','NETWORK_WEB','NETWORK_SCP_SFTP','NETWORK_FTP','RDP','SCREEN_CAPTURE','BROWSER_CHROME','BROWSER_EDGE','BROWSER_FIREFOX','CLIENT_SCP','CLIENT_SFTP','CLIENT_FTP','CLIENT_WINSCP','CLIENT_FILEZILLA') NOT NULL,
     PRIMARY KEY (policy_id, exit_point_type),
     FOREIGN KEY (policy_id) REFERENCES dlp_policies(id) ON DELETE CASCADE
 );
@@ -152,14 +152,15 @@ CREATE TABLE logs (
     id                  INT PRIMARY KEY AUTO_INCREMENT,
     device_id           INT NOT NULL,
     policy_id           INT DEFAULT NULL,
-    exit_point_type     ENUM('USB','CLIPBOARD','NETWORK_WEB','NETWORK_SCP_SFTP','NETWORK_FTP','RDP','SCREEN_CAPTURE') NOT NULL,
-    action_taken        ENUM('ALLOWED','LOGGED','BLOCKED_DELETE','BLOCKED_FIREWALL','BLOCKED_KILL') NOT NULL,
+    exit_point_type     ENUM('USB','CLIPBOARD','NETWORK_WEB','NETWORK_SCP_SFTP','NETWORK_FTP','RDP','SCREEN_CAPTURE','BROWSER_CHROME','BROWSER_EDGE','BROWSER_FIREFOX','CLIENT_SCP','CLIENT_SFTP','CLIENT_FTP','CLIENT_WINSCP','CLIENT_FILEZILLA') NOT NULL,
+    action_taken        ENUM('ALLOWED','LOGGED','BLOCKED_DELETE','BLOCKED_FIREWALL','BLOCKED_KILL','BLOCKED_PROXY','BLOCKED_BROWSER','BLOCKED_TRANSFER') NOT NULL,
     file_path           VARCHAR(500),
     file_hash_sha256    VARCHAR(64),
     matched_rule_ids    VARCHAR(255),
     confidence_score    ENUM('LOW','MEDIUM','HIGH','CRITICAL'),
     destination_value   VARCHAR(255),
     process_name        VARCHAR(100),
+    username            VARCHAR(100),
     occurred_at         DATETIME NOT NULL,
     FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE,
     FOREIGN KEY (policy_id) REFERENCES dlp_policies(id) ON DELETE SET NULL,
@@ -178,6 +179,26 @@ CREATE TABLE admins (
     created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
     last_login      DATETIME
 );
+
+-- Wazuh SIEM destination for future DLP event forwarding (configuration only).
+CREATE TABLE IF NOT EXISTS wazuh_settings (
+    id TINYINT UNSIGNED NOT NULL PRIMARY KEY,
+    siem_ip VARCHAR(45) NOT NULL,
+    siem_port SMALLINT UNSIGNED NOT NULL DEFAULT 514,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Persistent delivery queue for DLP Server -> Wazuh TCP Syslog.
+CREATE TABLE IF NOT EXISTS dlp_wazuh_outbox (
+    log_id INT NOT NULL PRIMARY KEY,
+    attempts INT UNSIGNED NOT NULL DEFAULT 0,
+    next_attempt_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    locked_until DATETIME NULL,
+    sent_at DATETIME NULL,
+    last_error VARCHAR(255) NULL,
+    CONSTRAINT fk_dlp_wazuh_log FOREIGN KEY (log_id) REFERENCES logs(id) ON DELETE CASCADE,
+    INDEX idx_wazuh_outbox_due (sent_at, next_attempt_at, locked_until)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ========================================
 -- SEED DATA MAU
