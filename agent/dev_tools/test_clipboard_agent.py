@@ -73,6 +73,7 @@ class TestText(Base):
         self.assertEqual((r["exit_point_type"], r["action_taken"], r["process_name"]),
                          ("CLIPBOARD", "BLOCKED_DELETE", "notepad.exe"))
         self.assertEqual(r["confidence_score"], "HIGH")
+        self.assertTrue(r["username"])  # có gửi tên người dùng lên server
 
     def test_clean_text_allowed_no_log(self):
         block, _ = self.guard(policies()).on_text("Hop luc 3h chieu nhe", "zalo.exe")
@@ -156,6 +157,20 @@ class TestRouting(Base):
 
     def test_empty_clipboard_ignored(self):
         self.assertEqual(ca.route_clipboard(self.guard(policies()), self.data(), None), (False, None))
+
+
+class TestPolicySummary(unittest.TestCase):
+    def test_no_policy_warns_clearly(self):
+        self.assertIn("CHUA CO POLICY", ca.policy_summary([]))
+        self.assertIn("CHUA CO POLICY", ca.policy_summary(policies(exit_points=("USB",))))
+
+    def test_summary_lists_each_channel(self):
+        s = ca.policy_summary(policies())
+        self.assertIn("CLIPBOARD = BLOCK (5 rule)", s)
+        self.assertIn("SCREEN_CAPTURE = BLOCK", s)
+        s = ca.policy_summary(policies("REPORT_ONLY", exit_points=("CLIPBOARD",)))
+        self.assertIn("CLIPBOARD = REPORT_ONLY", s)
+        self.assertIn("SCREEN_CAPTURE = khong ap dung", s)
 
 
 class TestHotkeys(Base):

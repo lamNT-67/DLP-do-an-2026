@@ -63,6 +63,21 @@ def _say(msg):
     print("[clipboard_agent %s] %s" % (time.strftime("%H:%M:%S"), msg), flush=True)
 
 
+def policy_summary(policies):
+    """Mô tả ngắn policy agent đang nhận, để in ra khi khởi động và khi policy thay đổi."""
+    parts = []
+    for ep in ("CLIPBOARD", "SCREEN_CAPTURE"):
+        st = get_exit_point_status(policies, ep)
+        if st["is_governed"]:
+            parts.append("%s = %s (%d rule)" % (ep, st["effective_action"], len(st["content_rules"])))
+        else:
+            parts.append("%s = khong ap dung" % ep)
+    if all("khong ap dung" in x for x in parts):
+        return ("CHUA CO POLICY nao dang bat cho may nay -> agent chua chan gi. Kiem tra tren web: "
+                "policy da tick 'Kich hoat policy', chon kenh CLIPBOARD/SCREEN_CAPTURE va gan dung may chua.")
+    return "Policy: " + ", ".join(parts)
+
+
 def screenshot_folders():
     home = Path.home()
     candidates = [home / "Pictures" / "Screenshots", home / "OneDrive" / "Pictures" / "Screenshots"]
@@ -95,6 +110,7 @@ class ClipboardGuard:
             "action_taken": action, "occurred_at": _now_iso(), "file_path": None,
             "file_hash_sha256": None, "matched_rule_ids": [], "confidence_score": None,
             "destination_value": target.get("destination_domain"), "process_name": owner,
+            "username": self.user,  # server đã có cột username trong bảng logs (Long thêm 03/11)
         }
         if report_fields:
             payload.update(report_fields)
@@ -576,6 +592,7 @@ class ServerPolicy:
         from policy_client import PolicyClient
         self.config_path, self.PolicyClient = config_path, PolicyClient
         self.client, self.hostname, self.policies = None, None, []
+        self._last_summary = None
         self._lock = threading.Lock()
 
     def _connect(self):
@@ -598,9 +615,15 @@ class ServerPolicy:
 
     def _fetch(self):
         data = self.client.get_policy()
-        if data is not None:
-            with self._lock:
-                self.policies = data.get("applicable_policies", [])
+        if data is None:
+            _say("Khong lay duoc policy tu server, tam dung policy cu (lan sau thu lai).")
+            return
+        with self._lock:
+            self.policies = data.get("applicable_policies", [])
+        summary = policy_summary(self.policies)
+        if summary != self._last_summary:   # chỉ in khi policy thay đổi, tránh in lặp mỗi phút
+            self._last_summary = summary
+            _say(summary)
 
     def _loop(self):
         while True:
@@ -632,6 +655,7 @@ def main(argv=None):
         policies = demo_policies(args.monitor)
         guard = ClipboardGuard(socket.gethostname(), lambda: policies)
         _say("CHE DO DEMO (%s) - khong ket noi server." % ("chi ghi nhan" if args.monitor else "CHAN"))
+        _say(policy_summary(policies))
     else:
         sp = ServerPolicy(args.config)
         sp.start()
