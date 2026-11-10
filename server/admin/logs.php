@@ -27,6 +27,21 @@ $stmt = $pdo->prepare("
 $stmt->execute($params);
 $logs = $stmt->fetchAll();
 
+// Resolve stored rule IDs to their names in one query; retain ID as fallback for deleted rules.
+$ruleNames = $pdo->query("SELECT id, rule_name FROM content_rules")->fetchAll(PDO::FETCH_KEY_PAIR);
+function matched_rule_names(?string $ids, array $ruleNames): string {
+    if ($ids === null || trim($ids) === '') return '-';
+    $names = [];
+    foreach (explode(',', $ids) as $rawId) {
+        $rawId = trim($rawId);
+        if ($rawId === '' || !ctype_digit($rawId)) continue;
+        $id = (int)$rawId;
+        if ($id <= 0) continue;
+        $names[] = $ruleNames[$id] ?? ('#' . $id);
+    }
+    return $names ? implode(', ', $names) : '-';
+}
+
 $pageTitle = 'Logs';
 $activeMenu = 'logs';
 require __DIR__ . '/../includes/layout_header.php';
@@ -90,7 +105,7 @@ require __DIR__ . '/../includes/layout_header.php';
                 <td><?= h($l['exit_point_type']) ?></td>
                 <td><?= h($l['action_taken']) ?></td>
                 <td style="max-width:200px; word-break:break-all; font-size:12px;"><?= h($l['file_path'] ?? '-') ?></td>
-                <td style="font-size:12px;"><?= h($l['matched_rule_ids'] ?? '-') ?></td>
+                <td style="font-size:12px;"><?= h(matched_rule_names($l['matched_rule_ids'] ?? null, $ruleNames)) ?></td>
                 <td><?php if ($l['confidence_score']): ?>
                     <span class="badge <?= severity_badge_class($l['confidence_score']) ?>"><?= h($l['confidence_score']) ?></span>
                 <?php else: ?>-<?php endif; ?></td>
