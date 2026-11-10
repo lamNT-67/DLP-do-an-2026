@@ -202,8 +202,14 @@ require_once __DIR__ . '/../includes/layout_header.php';
                 <option value="REPORT_ONLY" <?= $policy['action'] === 'REPORT_ONLY' ? 'selected' : '' ?>>REPORT_ONLY (chỉ ghi log)</option>
             </select>
         </div>
-        <div class="form-group">
-            <label><input type="checkbox" name="is_active" <?= $policy['is_active'] ? 'checked' : '' ?>> Kích hoạt policy</label>
+        <div class="form-group" style="padding:14px 16px; background:#f1f5f9; border:1px solid #cbd5e1; border-radius:8px;">
+            <label for="policy_is_active" style="display:inline-flex; align-items:center; gap:10px; cursor:pointer; font-weight:600;">
+                <input type="checkbox" id="policy_is_active" name="is_active" value="1"
+                    style="width:18px; height:18px; margin:0; flex-shrink:0;"
+                    <?= $policy['is_active'] ? 'checked' : '' ?>>
+                <span>Kích hoạt policy</span>
+            </label>
+            <p class="hint" style="margin:8px 0 0;">Chỉ policy được kích hoạt mới được Server gửi cho Agent. Bỏ tick để tạm ngừng áp dụng.</p>
         </div>
     </div>
 
