@@ -11,7 +11,7 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 }
 
 $nssm = 'C:\DLP\tools\nssm.exe'
-foreach ($n in 'DLPNetworkAgent', 'DLPSftpScpAgent') {
+foreach ($n in 'DLPNetworkAgent', 'DLPSftpScpAgent', 'DLPBrowserAgent') {
     if (Get-Service $n -ErrorAction SilentlyContinue) {
         Stop-Service $n -Force -ErrorAction SilentlyContinue
         if (Test-Path $nssm) { & $nssm remove $n confirm 2>&1 | Out-Null }
@@ -21,7 +21,7 @@ foreach ($n in 'DLPNetworkAgent', 'DLPSftpScpAgent') {
 }
 
 Stop-ScheduledTask -TaskName 'DLPNotifier' -ErrorAction SilentlyContinue
-Unregister-ScheduledTask -TaskName 'DLPNotifier' -Confirm:$false -ErrorAction SilentlyContinue
+Stop-ScheduledTask -TaskName 'DLPClipboardAgent' -ErrorAction SilentlyContinue; Get-CimInstance Win32_Process -Filter "name='python.exe'" | Where-Object { $_.CommandLine -like '*clipboard_agent*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; Unregister-ScheduledTask -TaskName 'DLPClipboardAgent' -Confirm:$false -ErrorAction SilentlyContinue; Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' -Name WebCaptureEnabled -ErrorAction SilentlyContinue; Unregister-ScheduledTask -TaskName 'DLPNotifier' -Confirm:$false -ErrorAction SilentlyContinue
 Write-Host 'Da xoa tac vu thong bao DLPNotifier'
 Get-NetFirewallRule -DisplayName 'DLP_*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
 Write-Host 'Da xoa firewall rule DLP_*'

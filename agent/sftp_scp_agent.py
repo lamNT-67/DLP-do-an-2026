@@ -10,11 +10,12 @@ POLL_INTERVAL_SECONDS = 0.25
 POLICY_REFRESH_SECONDS = 60
 HEARTBEAT_INTERVAL_SECONDS = 45
 MAX_READ_BYTES = 200000
-SSH_SFTP_PROCESS_NAMES = {"ssh.exe", "scp.exe", "sftp.exe", "winscp.exe"}
+SSH_SFTP_PROCESS_NAMES = {"ssh.exe", "scp.exe", "sftp.exe", "winscp.exe", "winscp.com", "pscp.exe"}
 FTP_PROCESS_NAMES = {"ftp.exe", "filezilla.exe"}
 SKIP_EXTENSIONS = {".dll", ".exe", ".sys", ".log", ".tmp", ".ini", ".config"}
 MAX_FILES_PER_COMMAND = 200
 PORT_RULE_PREFIX = "DLP_BlockSftp_Port"
+BLOCK_BY_IP = False   # True: sau khi kill con chan luon IP:port dich (chan ca file sach)
 PROACTIVE_PORTS = {"NETWORK_SCP_SFTP": [22], "NETWORK_FTP": [21, 990]}
 
 
@@ -133,10 +134,55 @@ def _expand_path(path):
     return out
 
 
+SCRIPT_MAX_BYTES = 200000
+
+
+def _script_files_from_cmdline(cmdline, cwd=None):
+    """Doc file script cua sftp -b, ftp -s:, winscp /script= va lay file local trong lenh put/mput/send."""
+    import re
+    args = list(cmdline or [])[1:]
+    scripts = []
+    for i, arg in enumerate(args):
+        low = arg.lower()
+        if low == "-b" and i + 1 < len(args):
+            scripts.append(args[i + 1])
+        elif low.startswith("-s:"):
+            scripts.append(arg[3:])
+        elif low.startswith("/script="):
+            scripts.append(arg[8:])
+    out = []
+    for s in scripts:
+        s = s.strip().strip('"')
+        if cwd and not os.path.isabs(s):
+            s = os.path.join(cwd, s)
+        try:
+            with open(s, "rb") as fh:
+                text = fh.read(SCRIPT_MAX_BYTES).decode("utf-8-sig", errors="ignore")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            m = re.match(r"^\s*(?:put|mput|send|append)\s+(.+?)\s*$", line, re.IGNORECASE)
+            if not m:
+                continue
+            rest = m.group(1)
+            while rest.startswith("-"):
+                parts = rest.split(None, 1)
+                rest = parts[1] if len(parts) > 1 else ""
+            if not rest:
+                continue
+            if rest[0] in "\"'":
+                end = rest.find(rest[0], 1)
+                local = rest[1:end] if end > 0 else rest[1:]
+            else:
+                local = rest.split()[0]
+            out.append(local)
+    return out
+
+
 def _files_from_cmdline(cmdline, cwd=None):
     """Lay file local trong lenh scp/sftp/winscp/ftp (tham so la duong dan ton tai)."""
     found = []
-    for arg in (cmdline or [])[1:]:
+    for arg in list((cmdline or [])[1:]) + _script_files_from_cmdline(cmdline, cwd):
         cands = [arg]
         low = arg.lower()
         for prefix in ("put ", "mput ", "send ", "/upload "):
@@ -229,7 +275,7 @@ def _ensure_port_rules(ports_by_ept, enabled_epts):
 
 def _block_process_and_connection(procs, ip, port):
     killed = _kill_tree(procs)
-    if ip and port and platform.system() == "Windows":
+    if BLOCK_BY_IP and ip and port and platform.system() == "Windows":
         for proto in ("TCP", "UDP"):
             rn = f"DLP_BlockSftp_{ip}_{port}_{proto}"
             _ps(f"if (-not (Get-NetFirewallRule -DisplayName '{rn}' -ErrorAction SilentlyContinue)) "
@@ -268,6 +314,7 @@ def run():
     last_port_state = None
     reactive_clean = False
     print(f"[sftp_scp_agent] Bat dau giam sat tren {cfg['agent']['hostname']} ...")
+    if not BLOCK_BY_IP: _ps("Get-NetFirewallRule -DisplayName 'DLP_BlockSftp_*' -ErrorAction SilentlyContinue | Where-Object DisplayName -notlike '*Port*' | Remove-NetFirewallRule -ErrorAction SilentlyContinue")
     import faulthandler
     _hang = open(r"C:\ProgramData\DLP\logs\sftp_scp_hang.log", "a")
     while True:
