@@ -67,12 +67,16 @@ class PolicyState:
         filename = os.path.basename(filename.replace("\\", "/"))
         if filename in ("", ".", ".."):
             raise ValueError("Invalid basename")
-        try:
-            content = base64.b64decode(encoded, validate=True)
-        except (ValueError, binascii.Error):
-            raise ValueError("Invalid base64")
-        if len(content) > MAX_FILE_BYTES:
-            return {"decision": "BLOCK", "reason": "FILE_TOO_LARGE"}
+        too_large = data.get("too_large") is True
+        if not too_large:
+            try:
+                content = base64.b64decode(encoded, validate=True)
+            except (ValueError, binascii.Error):
+                raise ValueError("Invalid base64")
+            if len(content) > MAX_FILE_BYTES:
+                too_large = True
+        else:
+            content = b""
 
         policies = self.get_policies()
         if policies is None:
@@ -87,6 +91,8 @@ class PolicyState:
         matching = [p for p in matched if self.utils.file_in_scope(filename, p.get("file_types") or [])]
         if not matching:
             return {"decision": "ALLOW", "reason": "FILE_OUT_OF_SCOPE"}
+        if too_large:
+            return {"decision": "BLOCK", "reason": "FILE_TOO_LARGE", "reported": False}
 
         # Isolated temporary directory: safe basename and extension for real-type detection.
         with tempfile.TemporaryDirectory(prefix="dlp-browser-") as directory:
@@ -112,9 +118,9 @@ class PolicyState:
                 result = self.inspector.inspect_file(path, status, destination=destination)
                 verdict = result.get("verdict")
                 if verdict == "BLOCK":
-                    self.report(channel, policy, filename, destination, result, "BLOCKED_BROWSER")
+                    reported = self.report(channel, policy, filename, destination, result, "BLOCKED_BROWSER")
                     return {"decision": "BLOCK", "reason": result.get("reason", "CONTENT_MATCH"),
-                            "policy_id": policy.get("policy_id"), "reported": True}
+                            "policy_id": policy.get("policy_id"), "reported": reported}
                 if verdict == "LOG" and first_logged is None:
                     first_logged = (policy, result)
             if first_logged:
@@ -139,8 +145,10 @@ class PolicyState:
             "destination_value": destination,
             "process_name": "chrome.exe" if channel == "BROWSER_CHROME" else "msedge.exe",
         }
-        if not self.client.send_report(event):
+        sent = self.client.send_report(event)
+        if not sent:
             print("[DLP bridge] WARNING: failed to report", action, filename, flush=True)
+        return sent
 
 
 class Handler(BaseHTTPRequestHandler):
