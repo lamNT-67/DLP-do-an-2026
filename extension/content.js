@@ -13,9 +13,16 @@
   };
 
   function inspect(file) {
-    if (!file || file.size > MAX_BYTES) {
-      // Large file is not silently allowed without being scanned.
-      return Promise.resolve({decision: "BLOCK", reason: "FILE_TOO_LARGE"});
+    if (!file) return Promise.resolve({decision: "BLOCK", reason: "MISSING_FILE"});
+    if (file.size > MAX_BYTES) {
+      // Ask bridge if any browser policy covers this file before denying.
+      return new Promise(resolve => {
+        chrome.runtime.sendMessage({type: "DLP_INSPECT_FILE", name: file.name,
+          too_large: true, content_base64: ""}, reply => {
+          resolve(chrome.runtime.lastError || !reply
+            ? {decision: "BLOCK", reason: "BRIDGE_UNAVAILABLE"} : reply);
+        });
+      });
     }
     return new Promise(resolve => {
       const reader = new FileReader();
