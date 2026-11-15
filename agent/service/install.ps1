@@ -29,7 +29,8 @@ $LogDir     = 'C:\ProgramData\DLP\logs'
 $Source     = Split-Path $PSScriptRoot -Parent
 $Services   = @(
     @{ Name = 'DLPNetworkAgent'; Script = 'network_agent.py'  },
-    @{ Name = 'DLPSftpScpAgent'; Script = 'sftp_scp_agent.py' }
+    @{ Name = 'DLPSftpScpAgent'; Script = 'sftp_scp_agent.py' },
+    @{ Name = 'DLPBrowserAgent'; Script = 'browser_agent.py' }
 )
 
 function Step($m) { Write-Host ("`n==> " + $m) -ForegroundColor Cyan }
@@ -197,6 +198,26 @@ try {
         Write-Host '  khong thay notify.ps1, bo qua phan thong bao'
     }
 
+    # ---- 7c. Clipboard / chup man hinh (phai chay trong phien nguoi dung, khong chay duoc o Session 0) ----
+    Step 'Cai agent clipboard va chup man hinh'
+    if (Test-Path (Join-Path $AgentDir 'clipboard_agent.py')) {
+        icacls $LogDir /grant 'BUILTIN\Users:(OI)(CI)(W)' | Out-Null
+        Stop-ScheduledTask -TaskName 'DLPClipboardAgent' -ErrorAction SilentlyContinue
+        Get-CimInstance Win32_Process -Filter "name='python.exe'" | Where-Object { $_.CommandLine -like '*clipboard_agent*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        $act = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -Command "$env:DLP_LOG_DIR=''C:\ProgramData\DLP\logs''; Set-Location C:\DLP\agent; & C:\DLP\venv\Scripts\python.exe clipboard_agent.py"'
+        $trg = New-ScheduledTaskTrigger -AtLogOn
+        $pri = New-ScheduledTaskPrincipal -GroupId 'BUILTIN\Users' -RunLevel Limited
+        $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
+        Register-ScheduledTask -TaskName 'DLPClipboardAgent' -Action $act -Trigger $trg -Principal $pri -Settings $set -Force | Out-Null
+        Start-ScheduledTask -TaskName 'DLPClipboardAgent'
+        # Tat cong cu Screenshot rieng cua Edge (khong di qua phim/clipboard/thu muc ma agent theo doi)
+        New-Item -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' -Force | Out-Null
+        New-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' -Name WebCaptureEnabled -PropertyType DWord -Value 0 -Force | Out-Null
+        Write-Host '  da dat chinh sach Edge: tat Screenshot (WebCaptureEnabled=0), can mo lai Edge'
+        Write-Host '  da cai: DLPClipboardAgent (chan copy-paste va chup man hinh)'
+    } else {
+        Write-Host '  khong thay clipboard_agent.py, bo qua'
+    }
     # ---- 8. Kiem tra ----
     Step 'Ket qua'
     Start-Sleep 8
