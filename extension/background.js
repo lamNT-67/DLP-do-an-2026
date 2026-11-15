@@ -22,6 +22,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           channel,
           file_name: fileName,
           content_base64: payload,
+          too_large: message.too_large === true,
           destination: new URL(sender.url).origin
         })
       });
