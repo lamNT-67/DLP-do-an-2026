@@ -14,8 +14,11 @@ function wazuh_enqueue(PDO $pdo, int $logId): void {
     $stmt->execute([$logId]);
 }
 
-/** Send one bounded batch. Designed for CLI cron or a short post-insert attempt. */
-function wazuh_flush(PDO $pdo, int $limit = 10): array {
+/**
+ * Send one bounded batch, optionally prioritizing the freshly inserted log.
+ * The periodic CLI worker continues to drain older and retryable events.
+ */
+function wazuh_flush(PDO $pdo, int $limit = 10, ?int $priorityLogId = null): array {
     $stats = ['sent' => 0, 'failed' => 0, 'skipped' => 0];
     $config = $pdo->query("SELECT siem_ip, siem_port FROM wazuh_settings WHERE id=1")->fetch(PDO::FETCH_ASSOC);
     if (!$config || filter_var($config['siem_ip'], FILTER_VALIDATE_IP) === false ||
@@ -24,11 +27,14 @@ function wazuh_flush(PDO $pdo, int $limit = 10): array {
     $port = (int)$config['siem_port'];
 
     $limit = max(1, min($limit, 50));
-    $stmt = $pdo->query("SELECT q.log_id
+    // Prioritize the current event so old backlog cannot hide new alerts.
+    // Keep the atomic claim below to avoid duplicate delivery by concurrent workers.
+    $stmt = $pdo->prepare("SELECT q.log_id
         FROM dlp_wazuh_outbox q
         WHERE q.sent_at IS NULL AND q.next_attempt_at <= UTC_TIMESTAMP()
           AND (q.locked_until IS NULL OR q.locked_until < UTC_TIMESTAMP())
-        ORDER BY q.log_id ASC LIMIT " . $limit);
+        ORDER BY CASE WHEN q.log_id = ? THEN 0 ELSE 1 END, q.log_id ASC LIMIT " . $limit);
+    $stmt->execute([$priorityLogId ?? 0]);
     foreach ($stmt->fetchAll(PDO::FETCH_COLUMN) as $logId) {
         $logId = (int)$logId;
         // Atomic reservation: other PHP requests / scheduled workers skip this event.
