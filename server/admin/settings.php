@@ -83,7 +83,9 @@ require __DIR__ . '/../includes/layout_header.php';
     <p style="font-size:13px; color:#616e7c; margin-bottom:14px;">
         DLP Server tu dong gui TCP Syslog sau khi luu log tu Agent vao MySQL.
         Neu SIEM mat ket noi, log duoc giu trong hang doi va thu lai bang CLI worker.
-        <strong>Can cau hinh Syslog TCP receiver tren Wazuh va chay worker dinh ky.</strong>
+        <strong>Can cau hinh Syslog TCP receiver tren Wazuh va cai Scheduled Task tren Windows Server.</strong>
+        Chay PowerShell Administrator: <code>powershell -ExecutionPolicy Bypass -File server\cli\install_wazuh_task.ps1</code>
+        (chay tu thu muc chua source project; neu PHP khong o C:\xampp\php\php.exe, them tham so <code>-PhpExe</code>).
         Port phai khop voi dich vu nhan log duoc cau hinh tren Wazuh.
     </p>
     <?php if ($wazuhError): ?>
