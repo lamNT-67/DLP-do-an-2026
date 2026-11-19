@@ -54,8 +54,9 @@ try {
         if ($pdo->inTransaction()) $pdo->rollBack();
         throw $e;
     }
-    // Best-effort immediate delivery. Failures stay queued for the scheduled CLI worker.
-    try { wazuh_flush($pdo, 1); }
+    // Prioritize THIS new log. Old/retryable events are drained by the scheduled CLI worker.
+    // The Agent report succeeds even when Wazuh is unreachable.
+    try { wazuh_flush($pdo, 1, $logId); }
     catch (Throwable $e) { error_log('[DLP Wazuh] immediate delivery failed: ' . $e->getMessage()); }
     http_response_code(201);
     echo json_encode(['status'=>'ok', 'id'=>$logId]);
