@@ -12,7 +12,7 @@ import psutil
 from policy_client import PolicyClient
 from log_writer import write_log_event
 from content_inspection import scan_content_with_rules
-from policy_utils import get_exit_point_status
+from policy_utils import decision_status, evaluate_policies, get_exit_point_status, unconditional_block
 from domain_blocker import DomainBlocker, DropLogTailer, split_target, scheme_port
 
 POLL_INTERVAL_SECONDS = 10
@@ -22,6 +22,18 @@ PROACTIVE_SYNC_SECONDS = 60
 REPORT_COOLDOWN_SECONDS = 60
 
 NO_INSPECTION = {"matched_rule_ids": [], "matched_rule_names": [], "confidence_level": "LOW"}
+
+
+def _inspect_blacklist_match(value, status):
+    def evaluate(current):
+        rules = current["content_rules"]
+        inspection = scan_content_with_rules(value, rules)
+        verdict = "ALLOW"
+        if not rules or inspection["matched_rule_ids"]:
+            verdict = "BLOCK" if current["effective_action"] == "BLOCK" else "LOG"
+        return dict(inspection, verdict=verdict)
+
+    return evaluate_policies(status, evaluate)
 
 
 def _iso_now():
@@ -108,7 +120,7 @@ def _block_connection(pid, remote_ip, remote_port):
         return "LOGGED"
 
 
-def _prune_reactive_rules(blacklist, blocker, reactive_ips):
+def _prune_reactive_rules(blacklist, blocker, reactive_policies):
     """Go cac rule DLP_Block_* khong con khop muc blacklist nao (vi du vua go http://example.com)."""
     if platform.system() != "Windows":
         return
@@ -129,7 +141,7 @@ def _prune_reactive_rules(blacklist, blocker, reactive_ips):
         seen.add((ip, port))
         if _match_blacklist(ip, port, blacklist, blocker) is None:
             _remove_rules("DLP_Block_%s_%d_*" % (ip, port))
-            reactive_ips.discard(ip)
+            reactive_policies.pop((ip, str(port)), None)
             print("[network_agent] Da go rule phan ung %s:%d (khong con trong blacklist)" % (ip, port))
 
 def _remove_rules(pattern):
@@ -178,7 +190,7 @@ def run():
 
     policy_cache, last_fetch, last_sync = None, 0.0, 0.0
     last_heartbeat = 0.0
-    reactive_ips = set()
+    reactive_policies = {}
     recent = {}
     reactive_clean = False
 
@@ -202,16 +214,16 @@ def run():
 
         status = get_exit_point_status(policy_cache.get("applicable_policies", []), "NETWORK_WEB")
         blacklist = policy_cache.get("network_blacklist", [])
-        policy_id = status["policy_ids"][0] if status["policy_ids"] else None
         state = status["effective_action"]
 
-        unconditional = status["is_governed"] and state == "BLOCK" and not status["content_rules"]
+        blanket = unconditional_block(status, file_conditions=False)
+        blanket_id = blanket["policy_ids"][0] if blanket else None
         blocking = status["is_governed"] and state == "BLOCK"
         if blocking:
             reactive_clean = False
         elif not reactive_clean:
             _remove_rules("DLP_Block_*")
-            reactive_ips.clear()
+            reactive_policies.clear()
             recent.clear()
             reactive_clean = True
             print("[network_agent] Khong con policy chan web, da go cac rule DLP_Block_*")
@@ -220,23 +232,28 @@ def run():
             domains = [e["value"] for e in blacklist if e.get("target_type", "").upper() == "DOMAIN"]
             ips = [e["value"] for e in blacklist if e.get("target_type", "").upper() == "IP"]
             try:
-                for kind, label, addrs in blocker.sync(domains, ips, unconditional):
+                for kind, label, addrs in blocker.sync(domains, ips, blanket is not None):
                     print("[network_agent] Proactive %s: %s (%d IP)" % (kind, label, len(addrs)))
                     if kind in ("ADDED", "UPDATED"):
-                        _report_and_log(client, hostname, policy_id, state, "BLOCKED_FIREWALL",
+                        _report_and_log(client, hostname, blanket_id, "BLOCK", "BLOCKED_FIREWALL",
                                         "%s (%d IP)" % (label, len(addrs)), "dlp-agent", None,
                                         {"destination_ip": None, "destination_domain": label,
                                          "destination_port": None, "file_path": None}, NO_INSPECTION)
             except Exception as e:
                 print("[network_agent] Loi khi dong bo firewall:", e)
-            _prune_reactive_rules(blacklist, blocker, reactive_ips)
+            _prune_reactive_rules(blacklist, blocker, reactive_policies)
 
         try:
-            for d in tailer.read_new_drops(blocker.blocked_ips() | reactive_ips):
+            proactive_ips = blocker.blocked_ips()
+            watched_ips = proactive_ips | {ip for ip, _ in reactive_policies}
+            for d in tailer.read_new_drops(watched_ips):
                 label = blocker.ip_owner(d["dst_ip"]) or d["dst_ip"]
                 print("[network_agent] Firewall da chan %d goi toi %s (%s:%s)"
                       % (d["count"], label, d["dst_ip"], d["dst_port"]))
-                _report_and_log(client, hostname, policy_id, state, "BLOCKED_FIREWALL",
+                policy_id = blanket_id if d["dst_ip"] in proactive_ips else None
+                if policy_id is None:
+                    policy_id = reactive_policies.get((d["dst_ip"], str(d["dst_port"])))
+                _report_and_log(client, hostname, policy_id, "BLOCK", "BLOCKED_FIREWALL",
                                 "%s %s:%s x%d" % (label, d["dst_ip"], d["dst_port"], d["count"]),
                                 "windows-firewall", None,
                                 {"destination_ip": d["dst_ip"], "destination_domain": None,
@@ -264,12 +281,15 @@ def run():
                 recent[(ip, port)] = now
 
                 pname = _get_process_name(c.pid) if c.pid else "unknown"
-                insp = scan_content_with_rules(m.get("value", ""), status["content_rules"])
-                should_block = state == "BLOCK" and (not status["content_rules"] or insp["matched_rule_ids"])
+                insp = _inspect_blacklist_match(m.get("value", ""), status)
+                responsible = decision_status(status, insp)
+                policy_id = responsible["policy_ids"][0]
+                should_block = insp["verdict"] == "BLOCK"
                 action = _block_connection(c.pid, ip, port) if should_block else "LOGGED"
                 if action == "BLOCKED_FIREWALL":
-                    reactive_ips.add(ip)
-                rep = _report_and_log(client, hostname, policy_id, state, action, "%s:%s" % (ip, port),
+                    reactive_policies[(ip, str(port))] = policy_id
+                rep = _report_and_log(client, hostname, policy_id, responsible["effective_action"],
+                                      action, "%s:%s" % (ip, port),
                                       pname, c.pid,
                                       {"destination_ip": ip, "destination_domain": None,
                                        "destination_port": port, "file_path": None}, insp)
