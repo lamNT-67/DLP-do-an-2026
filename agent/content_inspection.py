@@ -34,6 +34,11 @@ import unicodedata
 import zipfile
 from functools import lru_cache
 
+if __package__:
+    from .policy_utils import evaluate_policies, file_in_scope
+else:
+    from policy_utils import evaluate_policies, file_in_scope
+
 # ============================================================================
 # 1. CẤU HÌNH
 # ============================================================================
@@ -648,8 +653,9 @@ def _norm_path(p):
     return os.path.normcase(os.path.normpath(str(p))) if p else ""
 
 
-def _is_exception(path, destination, allowed_files, allowed_locations):
-    p, name = _norm_path(path), os.path.basename(path).lower()
+def _is_exception(path, destination, allowed_files, allowed_locations, file_name=None):
+    p = _norm_path(path)
+    name = (file_name or os.path.basename(path)).lower()
     for f in allowed_files or []:
         if _norm_path(f) == p or str(f).strip().lower() == name:
             return "ALLOWED_FILE"
@@ -670,7 +676,8 @@ def _verdict_for_violation(action):
     return "BLOCK" if action == "BLOCK" else "LOG"
 
 
-def inspect_file(path, status=None, rules=None, file_types=None, destination=None):
+def inspect_file(path, status=None, rules=None, file_types=None, destination=None, *,
+                 enforce_file_scope=False, file_name=None):
     """Kiểm tra 1 file trước khi cho phép nó đi qua exit point.
 
     path        : đường dẫn file cần kiểm tra
@@ -678,6 +685,8 @@ def inspect_file(path, status=None, rules=None, file_types=None, destination=Non
                   Nếu None -> dùng DEFAULT_RULES/DEFAULT_FILE_TYPES, action = BLOCK (chế độ test).
     rules, file_types : ghi đè rule/loại file (tuỳ chọn)
     destination : đích đến (IP:port, ổ USB...) - dùng cho kiểm tra allowed_locations
+    enforce_file_scope : bật bộ lọc đuôi file cho kênh yêu cầu
+    file_name : tên file gốc nếu path trỏ đến bản sao tạm
 
     Trả về dict, trong đó 'verdict' là ALLOW | LOG | BLOCK.
     Agent tự đổi verdict BLOCK thành action_taken của kênh mình
@@ -687,15 +696,26 @@ def inspect_file(path, status=None, rules=None, file_types=None, destination=Non
     if status is None:
         status = {"is_governed": True, "effective_action": "BLOCK",
                   "content_rules": DEFAULT_RULES, "file_types": DEFAULT_FILE_TYPES}
+    path = str(path)
+
+    @lru_cache(maxsize=1)
+    def read():
+        size = os.path.getsize(path)
+        return size, _read_file(path, size), sha256_file(path)
+
+    return evaluate_policies(status, lambda current: _inspect_file_policy(
+        path, current, rules, file_types, destination, enforce_file_scope, file_name, started, read))
+
+
+def _inspect_file_policy(path, status, rules, file_types, destination, scoped, file_name, started, read):
     action = status.get("effective_action", "OPEN") if status.get("is_governed") else "OPEN"
     rules = status.get("content_rules") if rules is None else rules
     file_types = status.get("file_types") if file_types is None else file_types
 
-    path = str(path)
     declared_ext = os.path.splitext(path)[1].lower().lstrip(".")
     result = {
         "verdict": "ALLOW", "reason": "CLEAN", "reasons": [], "notes": [],
-        "file_path": path, "file_name": os.path.basename(path), "file_size": None,
+        "file_path": path, "file_name": file_name or os.path.basename(path), "file_size": None,
         "file_hash_sha256": None, "declared_ext": declared_ext, "real_type": None,
         "category": None, "extension_mismatch": False, "encrypted": False, "inspected": False,
         "policy_action": action, "matched_rule_ids": [], "matched_rule_names": [],
@@ -714,20 +734,26 @@ def inspect_file(path, status=None, rules=None, file_types=None, destination=Non
     if action == "OPEN":
         return done("ALLOW", "NOT_GOVERNED")
 
-    exc = _is_exception(path, destination, status.get("allowed_files"), status.get("allowed_locations"))
+    in_scope = not scoped or file_in_scope(file_name or path, file_types)
+    blocked = _blocked_types(file_types)
+    # An always-block type can match by signature even outside declared extension scope.
+    if not in_scope and not blocked:
+        return done("ALLOW", "OUT_OF_SCOPE")
+
+    exc = _is_exception(path, destination, status.get("allowed_files"),
+                        status.get("allowed_locations"), file_name)
     if exc:
         return done("ALLOW", exc, extra_reason="Nam trong danh sach ngoai le cua policy")
 
     try:
-        size = os.path.getsize(path)
-        data = _read_file(path, size)
+        size, data, digest = read()
     except OSError as e:
         result["notes"].append("READ_ERROR:" + type(e).__name__)
         # Không đọc được file thì không chứng minh được là sạch -> fail-closed khi BLOCK
         return done(_verdict_for_violation(action), "UNREADABLE", "MEDIUM",
                     "Khong doc duoc file (%s)" % type(e).__name__)
     result["file_size"] = size
-    result["file_hash_sha256"] = sha256_file(path)
+    result["file_hash_sha256"] = digest
 
     real_type = detect_file_type(data, declared_ext)
     result["real_type"] = real_type
@@ -741,11 +767,13 @@ def inspect_file(path, status=None, rules=None, file_types=None, destination=Non
         result["reasons"].append("Duoi file '.%s' nhung noi dung that la '%s'" % (declared_ext, real_type))
 
     # --- File Type Control ---
-    blocked = _blocked_types(file_types)
     hit_type = declared_ext if declared_ext in blocked else (real_type if real_type in blocked else None)
     if hit_type:
         return done(_verdict_for_violation(action), "FILE_TYPE_BLOCKED", "HIGH",
                     "Loai file '%s' nam trong danh sach luon chan" % hit_type)
+
+    if not in_scope:
+        return done("ALLOW", "OUT_OF_SCOPE")
 
     # --- Không có content rule: chặn hoàn toàn (BLOCKED) hoặc chỉ giám sát (MONITORED) ---
     if not rules:

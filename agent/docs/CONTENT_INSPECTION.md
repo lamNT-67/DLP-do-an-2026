@@ -26,6 +26,21 @@ Chạy thử bằng dòng lệnh: `python content_inspection.py <file1> <file2> 
 
 ## 2. Pipeline xử lý một file
 
+Khi nhiều policy áp dụng cho cùng một exit point, Agent đánh giá lần lượt từng
+policy với action, phạm vi loại file, content rules và ngoại lệ của policy đó.
+Policy có ngoại lệ trùng khớp sẽ cho qua phần kiểm tra của chính nó. Agent chọn
+kết quả theo thứ tự `BLOCK > LOG > ALLOW` và dùng ID, action, rule và bằng chứng
+của policy được chọn để lập báo cáo. Nếu cùng kết quả, thứ tự ID dạng chuỗi
+quyết định policy được chọn. Kết quả ngoài phạm vi có ưu tiên thấp nhất.
+
+Browser và SCP/SFTP/FTP lọc theo đuôi file trong phạm vi từng policy.
+Với file trên CLIPBOARD và USB, danh sách loại file dùng cho kiểm soát loại file;
+content rules vẫn áp dụng với mọi đuôi file dù có thêm policy khác.
+Danh sách luôn chặn của từng policy cũng áp dụng theo loại thật khi đuôi file
+nằm ngoài phạm vi. Nếu không đọc được file để xác minh loại thật, áp dụng
+`UNREADABLE` theo action của policy.
+CLIPBOARD dạng văn bản và NETWORK_WEB dạng kết nối không có điều kiện loại file.
+
 | Bước | Xử lý | Kết quả nếu dừng tại bước này |
 |---|---|---|
 | 1 | Kênh không có policy | `ALLOW / NOT_GOVERNED` |

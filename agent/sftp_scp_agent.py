@@ -4,7 +4,7 @@ import psutil
 from policy_client import PolicyClient
 from log_writer import write_log_event
 from content_inspection import inspect_file, to_log_inspection, to_report_fields
-from policy_utils import get_exit_point_status, file_in_scope
+from policy_utils import decision_status, get_exit_point_status, unconditional_block
 
 POLL_INTERVAL_SECONDS = 0.25
 POLICY_REFRESH_SECONDS = 60
@@ -287,9 +287,7 @@ def _block_process_and_connection(procs, ip, port):
 def _inspect_file(fp, status, dest=None):
     """Tra ve ket qua cua Content Inspection Engine, hoac None neu file ngoai pham vi policy.
     Policy: duong ra -> loai file (pham vi) -> engine (loai luon chan, noi dung, diem tin cay)."""
-    if not file_in_scope(fp, status["file_types"]):
-        return None                             # khac loai file cua policy: khong quet, cho qua
-    res = inspect_file(fp, status, destination=dest)
+    res = inspect_file(fp, status, destination=dest, enforce_file_scope=True)
     return None if res["verdict"] == "ALLOW" else res
 
 def _remove_rules(pattern):
@@ -347,8 +345,7 @@ def run():
         unconditional = set()
         for e in ("NETWORK_SCP_SFTP", "NETWORK_FTP"):
             st = get_exit_point_status(aps, e)
-            if st["is_governed"] and st["effective_action"] == "BLOCK" \
-                    and not st["content_rules"] and not st["file_types"]:
+            if unconditional_block(st, file_conditions=True):
                 unconditional.add(e)
         if unconditional != last_port_state:
             _ensure_port_rules(PROACTIVE_PORTS, unconditional)
@@ -398,14 +395,15 @@ def run():
                 if res is None:
                     continue
                 user = _get_username(root)
-                if blocking and res["verdict"] == "BLOCK":
+                if res["verdict"] == "BLOCK":
                     action = _block_process_and_connection(procs, ip, port)
                     killed_roots.add(rkey); killed = True
                 else:
                     action = "LOGGED"
                 fields = to_report_fields(res)
+                responsible = decision_status(status, res)
                 payload = {"hostname": hostname, "exit_point_type": ept,
-                           "policy_id": status["policy_ids"][0] if status["policy_ids"] else None,
+                           "policy_id": responsible["policy_ids"][0] if responsible["policy_ids"] else None,
                            "action_taken": action, "occurred_at": _iso_now(), "file_path": fp,
                            "file_hash_sha256": fields["file_hash_sha256"],
                            "matched_rule_ids": fields["matched_rule_ids"],
@@ -415,7 +413,7 @@ def run():
                 write_log_event(hostname,
                                  "scp_sftp" if ept == "NETWORK_SCP_SFTP" else "ftp", ept,
                                  "violation" if action != "LOGGED" else "logged",
-                                 status["effective_action"],
+                                 responsible["effective_action"],
                                  {"process_name": rpname, "process_pid": rpid, "user": user},
                                  {"destination_ip": ip, "destination_domain": None, "destination_port": port, "file_path": fp},
                                  to_log_inspection(res), action, rep)

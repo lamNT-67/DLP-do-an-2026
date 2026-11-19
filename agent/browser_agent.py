@@ -25,7 +25,7 @@ import psutil
 from content_inspection import inspect_file, to_log_inspection, to_report_fields
 from log_writer import write_log_event
 from policy_client import PolicyClient
-from policy_utils import file_in_scope, get_exit_point_status
+from policy_utils import decision_status, get_exit_point_status
 
 BIND_HOST, BIND_PORT = "127.0.0.1", 18765
 HOSTS = {"127.0.0.1:%d" % BIND_PORT, "localhost:%d" % BIND_PORT}
@@ -159,22 +159,20 @@ class BrowserGuard:
             return 400, {"decision": "BLOCK", "reason": "INVALID_BASE64"}
         if len(data) > MAX_FILE_BYTES:
             return 200, {"decision": "BLOCK", "reason": "FILE_TOO_LARGE"}
-        if not file_in_scope(name, status["file_types"]):
-            return 200, {"decision": "ALLOW", "reason": "OUT_OF_SCOPE"}
-
         m = re.search(r"\.([A-Za-z0-9]{1,10})$", name)
         tmpdir = tempfile.mkdtemp(prefix="dlpbrowser_")
         try:
             path = str(Path(tmpdir) / ("upload" + ("." + m.group(1) if m else "")))
             Path(path).write_bytes(data)
-            res = inspect_file(path, status, destination=dest)
+            res = inspect_file(path, status, destination=dest, enforce_file_scope=True, file_name=name)
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
         res["file_path"], res["file_name"] = name, name   # khong lo duong dan tam
 
         if res["verdict"] == "ALLOW":
             return 200, {"decision": "ALLOW", "reason": res["reason"]}
-        blocking = status["effective_action"] == "BLOCK" and res["verdict"] == "BLOCK"
+        status = decision_status(status, res)
+        blocking = res["verdict"] == "BLOCK"
         action = "BLOCKED_BROWSER" if blocking else "LOGGED"
         peer = _peer_process(peer_port)
         threading.Thread(target=self._record, args=(channel, status, res, action, dest, peer),

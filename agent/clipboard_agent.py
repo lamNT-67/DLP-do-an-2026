@@ -42,7 +42,7 @@ import psutil
 from content_inspection import (BLOCK_MIN_LEVEL, DEFAULT_FILE_TYPES, DEFAULT_RULES, _LEVEL_IDX,
                                 inspect_file, scan_text, to_log_inspection, to_report_fields)
 from log_writer import write_log_event
-from policy_utils import get_exit_point_status
+from policy_utils import decision_status, evaluate_policies, get_exit_point_status
 
 POLICY_REFRESH_SECONDS = 60
 TICK_MS = 1000                 # mỗi giây: kiểm tra thư mục Screenshots + công cụ chụp màn hình
@@ -101,7 +101,14 @@ class ClipboardGuard:
 
     # -------------------------------------------------- tiện ích
     def _status(self, exit_point):
-        return get_exit_point_status(self.get_policies(), exit_point)
+        status = get_exit_point_status(self.get_policies(), exit_point)
+        if exit_point == "SCREEN_CAPTURE" and status["is_governed"]:
+            # Screen capture is governed by policy action alone.
+            result = evaluate_policies(status, lambda current: {
+                "verdict": "BLOCK" if current["effective_action"] == "BLOCK" else "LOG",
+            })
+            status.update(decision_status(status, result))
+        return status
 
     def _record(self, exit_point, status, action, owner, target, inspection, report_fields=None):
         payload = {
@@ -129,29 +136,37 @@ class ClipboardGuard:
         status = self._status("CLIPBOARD")
         if not status["is_governed"] or not text.strip():
             return False, None
-        rules = status["content_rules"]
-        if not rules:  # policy không có content rule: BLOCK = chặn mọi copy, REPORT_ONLY = ghi hết
-            action = ACTION_BLOCK if status["effective_action"] == "BLOCK" else "LOGGED"
+
+        def evaluate(current):
+            rules = current["content_rules"]
+            blocking = current["effective_action"] == "BLOCK"
+            if not rules:
+                return {"verdict": "BLOCK" if blocking else "LOG",
+                        "reason": "EXIT_POINT_BLOCKED" if blocking else "EXIT_POINT_MONITORED"}
+            scan = scan_text(text, rules)
+            if not scan["matched_rule_ids"]:
+                return {"verdict": "ALLOW", "reason": "CLEAN"}
+            block = blocking and _LEVEL_IDX[scan["confidence_level"]] >= _LEVEL_IDX[BLOCK_MIN_LEVEL]
+            return dict(scan, verdict="BLOCK" if block else "LOG", reason="CONTENT_MATCH", real_type="text")
+
+        result = evaluate_policies(status, evaluate)
+        if result["verdict"] == "ALLOW":
+            return False, None
+        block = result["verdict"] == "BLOCK"
+        action = ACTION_BLOCK if block else "LOGGED"
+        status = decision_status(status, result)
+        if result["reason"] != "CONTENT_MATCH":
             self._record("CLIPBOARD", status, action, owner,
                          {"destination_domain": "Clipboard", "file_path": None},
-                         {"verdict": "BLOCK" if action != "LOGGED" else "LOG",
-                          "reason": "EXIT_POINT_BLOCKED" if action != "LOGGED" else "EXIT_POINT_MONITORED"})
-            return action != "LOGGED", NOTICE_TEXT.format(rules="kênh bị khoá")
-        scan = scan_text(text, rules)
-        if not scan["matched_rule_ids"]:
-            return False, None
-        block = (status["effective_action"] == "BLOCK"
-                 and _LEVEL_IDX[scan["confidence_level"]] >= _LEVEL_IDX[BLOCK_MIN_LEVEL])
-        action = ACTION_BLOCK if block else "LOGGED"
-        inspection = to_log_inspection(dict(scan, verdict="BLOCK" if block else "LOG",
-                                            reason="CONTENT_MATCH", real_type="text"))
+                         {"verdict": result["verdict"], "reason": result["reason"]})
+            return block, NOTICE_TEXT.format(rules="kênh bị khoá")
         self._record("CLIPBOARD", status, action, owner,
-                     {"destination_domain": "Clipboard", "file_path": None}, inspection,
-                     {"matched_rule_ids": scan["matched_rule_ids"],
-                      "confidence_score": scan["confidence_level"]})
-        names = ", ".join(scan["matched_rule_names"])
+                     {"destination_domain": "Clipboard", "file_path": None}, to_log_inspection(result),
+                     {"matched_rule_ids": result["matched_rule_ids"],
+                      "confidence_score": result["confidence_level"]})
+        names = ", ".join(result["matched_rule_names"])
         _say("%s chu (%s, %s) tu %s" % ("CHAN" if block else "GHI NHAN", names,
-                                         scan["confidence_level"], owner or "?"))
+                                         result["confidence_level"], owner or "?"))
         return block, NOTICE_TEXT.format(rules=names)
 
     # -------------------------------------------------- file copy trong Explorer
@@ -165,7 +180,7 @@ class ClipboardGuard:
             if res["verdict"] == "ALLOW":
                 continue
             action = ACTION_BLOCK if res["verdict"] == "BLOCK" else "LOGGED"
-            self._record("CLIPBOARD", status, action, owner,
+            self._record("CLIPBOARD", decision_status(status, res), action, owner,
                          {"destination_domain": "Clipboard (copy file)", "file_path": path},
                          to_log_inspection(res), to_report_fields(res))
             _say("%s file %s (%s, %s)" % ("CHAN" if action != "LOGGED" else "GHI NHAN",
