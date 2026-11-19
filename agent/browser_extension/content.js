@@ -80,11 +80,7 @@
         resolve({decision: "BLOCK", reason: "FILE_TOO_LARGE"});
         return;
       }
-      const reader = new FileReader();
-      reader.onerror = () => resolve({decision: "BLOCK", reason: "READ_FAILED"});
-      reader.onload = () => {
-        const b64 = String(reader.result || "").split(",")[1];
-        if (!b64) return resolve({decision: "BLOCK", reason: "ENCODING_FAILED"});
+      function sendForInspection(b64) {
         try {
           chrome.runtime.sendMessage({
             type: "INSPECT_FILE_CONTENT",
@@ -96,6 +92,17 @@
             resolve(result);
           });
         } catch (_) { resolve({decision: "BLOCK", reason: "AGENT_UNAVAILABLE"}); }
+      }
+      if (file.size === 0) {
+        sendForInspection("");
+        return;
+      }
+      const reader = new FileReader();
+      reader.onerror = () => resolve({decision: "BLOCK", reason: "READ_FAILED"});
+      reader.onload = () => {
+        const b64 = String(reader.result || "").split(",")[1];
+        if (!b64) return resolve({decision: "BLOCK", reason: "ENCODING_FAILED"});
+        sendForInspection(b64);
       };
       reader.readAsDataURL(file);
     });
