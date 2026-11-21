@@ -30,7 +30,7 @@ Windows DLP Agent V2 --HTTP POST agent_report.php--> DLP Server (PHP / MySQL)
    ```cmd
    C:\xampp\php\php.exe C:\xampp\htdocs\dlp_server\cli\wazuh_flush.php
    ```
-   Worker output is `{"sent":N,"failed":N,"skipped":N}`. It accepts **CLI only**, not HTTP.
+   Worker output is `{"sent":N,"failed":N,"skipped":N,"expired":N}`. It accepts **CLI only**, not HTTP.
 5. Inspect pending delivery status in phpMyAdmin:
    ```sql
    SELECT log_id, attempts, next_attempt_at, sent_at, last_error
@@ -72,6 +72,17 @@ Official receiver reference: https://documentation.wazuh.com/current/user-manual
 ```
 
 Forwarded event fields include log_id, hostname, policy_id, exit_point_type, action_taken, file_path, SHA256 hash, matched_rule_ids, confidence_score, destination_value, process_name and occurred_at. Wazuh may need a custom decoder/rule to display the metadata and trigger a DLP alert. Check `/var/ossec/logs/alerts/alerts.json` or use `wazuh-logtest`; reception itself does not necessarily create an alert.
+
+## Backlog while Wazuh is down (replayed events)
+
+DLP always stores the log first; Wazuh being off never loses or delays the DLP record.
+
+- A new event is sent to Wazuh **immediately and first** (live). It does not wait for the backlog.
+- Events that could not be delivered stay in `dlp_wazuh_outbox` and are retried by `cli/wazuh_flush.php` (25 per run, oldest first). They are sent as **replayed**:
+  - the JSON has `"replayed": true` and `"delivered_at"` (UTC time of the late delivery); live events have `"replayed": false` and no `delivered_at`;
+  - the syslog header time is the event's real time (`occurred_at`), not the delivery time.
+- An unsent event whose `occurred_at` is older than **24 hours** (`WAZUH_OUTBOX_TTL_HOURS` in `includes/wazuh_forwarder.php`) is removed from the queue and never sent. It stays in the DLP `logs` table / Logs page. Dropped counts are shown as `expired` in the worker output and written to the PHP error log.
+- In Wazuh, match on the `replayed` JSON field to separate backlog from fresh events, for example to avoid high-level alerts for old events.
 
 ## Known limits
 
