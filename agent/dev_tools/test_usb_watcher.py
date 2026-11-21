@@ -3,7 +3,9 @@
 from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
+import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tempfile
@@ -287,6 +289,265 @@ class UsbObserverTests(unittest.TestCase):
         folder.assert_not_called()
         inspect.assert_not_called()
         client.assert_not_called()
+
+
+class UsbDryRunTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.policies = [
+            {"policy_id": pid, "action": action, "exit_points": ["USB"],
+             "content_rules": [{"id": rid, "rule_name": marker, "pattern": marker,
+                                "rule_type": "REGEX", "severity": "HIGH", "category": "INTERNAL_DOC"}]}
+            for pid, rid, marker, action in (
+                (11, 111, "ALPHA", "BLOCK"), (22, 222, "BETA", "REPORT_ONLY"),
+            )
+        ]
+        self.watcher = usb_watcher.DryRunFolderWatcher(self.root, self.policies)
+
+    def write(self, name, content):
+        path = self.root / name
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    def test_new_files_keep_independent_decisions_and_policy_evidence(self):
+        self.watcher = usb_watcher.DryRunFolderWatcher(self.root, self.policies[::-1])
+        self.write("clean.txt", "ordinary")
+        self.write("mixed.txt", "ALPHA BETA")
+        self.write("monitor.txt", "BETA")
+        self.assertEqual(self.watcher.poll(), [])
+        events = self.watcher.poll()
+        self.assertEqual([(e["file_name"], e["verdict"], e["action_taken"]) for e in events],
+                         [("clean.txt", "ALLOW", "ALLOW"), ("mixed.txt", "BLOCK", "WOULD_BLOCK"),
+                          ("monitor.txt", "LOG", "LOGGED")])
+        self.assertEqual([(e["policy_id"], e["matched_rule_ids"], e["confidence_level"])
+                          for e in events[1:]], [(11, [111], "MEDIUM"), (22, [222], "MEDIUM")])
+        self.assertEqual(self.watcher.poll(), [])
+
+    def test_partial_writes_need_two_matching_snapshots(self):
+        self.write("copy.txt", "AL")
+        self.assertEqual(self.watcher.poll(), [])
+        self.write("copy.txt", "ALPHA")
+        self.assertEqual(self.watcher.poll(), [])
+        self.assertEqual([e["action_taken"] for e in self.watcher.poll()], ["WOULD_BLOCK"])
+
+    def test_startup_baseline_ignores_existing_file_but_detects_same_size_overwrite(self):
+        path = self.write("existing.txt", "BETA ")
+        original = path.stat()
+        watcher = usb_watcher.DryRunFolderWatcher(self.root, self.policies)
+        self.assertEqual(watcher.poll(), [])
+        self.write("existing.txt", "ALPHA")
+        os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns + 2_000_000_000))
+        self.assertEqual(watcher.poll(), [])
+        self.assertEqual([e["action_taken"] for e in watcher.poll()], ["WOULD_BLOCK"])
+        self.assertEqual(watcher.poll(), [])
+
+    def test_delete_and_recreate_emits_a_new_event(self):
+        path = self.write("reused.txt", "ALPHA")
+        self.watcher.poll()
+        self.assertEqual(len(self.watcher.poll()), 1)
+        path.unlink()
+        self.assertEqual(self.watcher.poll(), [])
+        self.write("reused.txt", "ALPHA")
+        self.assertEqual(self.watcher.poll(), [])
+        self.assertEqual([e["action_taken"] for e in self.watcher.poll()], ["WOULD_BLOCK"])
+
+    def test_replacement_at_same_path_is_detected(self):
+        path = self.write("replaced.txt", "ALPHA")
+        self.watcher.poll()
+        self.assertEqual(len(self.watcher.poll()), 1)
+        original = path.stat()
+        replacement = self.write("replacement.tmp", "ALPHA")
+        os.utime(replacement, ns=(original.st_atime_ns, original.st_mtime_ns))
+        replacement.replace(path)
+        self.assertEqual(self.watcher.poll(), [])
+        self.assertEqual([e["action_taken"] for e in self.watcher.poll()], ["WOULD_BLOCK"])
+
+    def test_file_changed_during_inspection_is_retried_when_stable(self):
+        path = self.write("changing.txt", "ALPHA")
+        self.watcher.poll()
+        inspect = usb_watcher.inspect_file
+
+        def change_after_inspection(file_path, *args, **kwargs):
+            result = inspect(file_path, *args, **kwargs)
+            self.write(path.name, "BETA")
+            return result
+
+        with patch.object(usb_watcher, "inspect_file", side_effect=change_after_inspection):
+            self.assertEqual(self.watcher.poll(), [])
+        self.assertEqual(self.watcher.poll(), [])
+        events = self.watcher.poll()
+        self.assertEqual([(e["action_taken"], e["policy_id"]) for e in events], [("LOGGED", 22)])
+
+    def test_preinspection_metadata_change_defers_the_read(self):
+        path = self.write("before-read.txt", "ALPHA")
+        self.watcher.poll()
+        version = usb_watcher._dry_run_version(path)
+        changed = (*version[:2], version[2] + 1, *version[3:])
+        with patch.object(usb_watcher, "_dry_run_version", side_effect=[version, changed]), \
+                patch.object(usb_watcher, "inspect_file") as inspect:
+            self.assertEqual(self.watcher.poll(), [])
+        inspect.assert_not_called()
+
+    def test_disappearance_during_inspection_does_not_stop_other_files(self):
+        disappearing = self.write("a-disappears.txt", "ALPHA")
+        self.write("b-clean.txt", "ordinary")
+        self.watcher.poll()
+        inspect = usb_watcher.inspect_file
+
+        def remove_after_inspection(path, *args, **kwargs):
+            result = inspect(path, *args, **kwargs)
+            if path == disappearing:
+                path.unlink()
+            return result
+
+        with patch.object(usb_watcher, "inspect_file", side_effect=remove_after_inspection):
+            events = self.watcher.poll()
+        self.assertEqual([(e["file_name"], e["action_taken"]) for e in events], [("b-clean.txt", "ALLOW")])
+
+    def test_inaccessible_metadata_does_not_stop_other_files_and_recovers(self):
+        blocked = self.write("blocked.txt", "ALPHA")
+        self.write("clean.txt", "ordinary")
+        self.watcher.poll()
+        file_version = usb_watcher._dry_run_version
+
+        def fail_one(path):
+            if path == blocked:
+                raise PermissionError("temporarily inaccessible")
+            return file_version(path)
+
+        with patch.object(usb_watcher, "_dry_run_version", side_effect=fail_one):
+            self.assertEqual([e["file_name"] for e in self.watcher.poll()], ["clean.txt"])
+            self.assertEqual(self.watcher.poll(), [])
+        self.assertEqual(self.watcher.poll(), [])
+        self.assertEqual([e["action_taken"] for e in self.watcher.poll()], ["WOULD_BLOCK"])
+
+    def test_unreadable_verdict_is_preserved_once_and_retried(self):
+        self.write("read-error.txt", "BETA")
+        self.watcher.poll()
+        with patch("content_inspection._read_file", side_effect=PermissionError("locked")):
+            events = self.watcher.poll()
+            self.assertEqual([(e["reason"], e["policy_id"], e["action_taken"]) for e in events],
+                             [("UNREADABLE", 11, "WOULD_BLOCK")])
+            self.assertEqual(self.watcher.poll(), [])
+        self.assertEqual([(e["policy_id"], e["action_taken"]) for e in self.watcher.poll()],
+                         [(22, "LOGGED")])
+        self.assertEqual(self.watcher.poll(), [])
+
+    def test_history_limit_and_failed_scan_preserve_duplicate_suppression(self):
+        watcher = usb_watcher.DryRunFolderWatcher(self.root, self.policies, max_files=1)
+        self.write("tracked.txt", "ALPHA")
+        watcher.poll()
+        self.assertEqual(len(watcher.poll()), 1)
+        overflow = self.write("overflow.txt", "BETA")
+        self.assertEqual(watcher.poll(), [])
+        overflow.unlink()
+        with patch.object(watcher, "_snapshot", side_effect=PermissionError("directory unavailable")):
+            with self.assertRaisesRegex(PermissionError, "directory unavailable"):
+                watcher.poll()
+        self.assertEqual(watcher.poll(), [])
+        self.assertEqual(watcher.poll(), [])
+        self.write("tracked.txt", "unrelated")
+        self.assertEqual(watcher.poll(), [])
+        self.assertEqual([e["action_taken"] for e in watcher.poll()], ["ALLOW"])
+
+    def test_dry_run_never_invokes_enforcement_usb_discovery_or_server(self):
+        path = self.write("protected.txt", "ALPHA")
+        before = usb_watcher._dry_run_version(path)
+        with patch.object(usb_watcher, "FolderWatcher") as enforcing_watcher, \
+                patch.object(usb_watcher, "scan_windows_usb") as scanner, \
+                patch("policy_client.PolicyClient") as client, \
+                patch.object(Path, "unlink") as unlink, patch.object(Path, "rename") as rename, \
+                patch.object(Path, "replace") as replace, patch.object(Path, "write_bytes") as write_bytes, \
+                patch.object(Path, "write_text") as write_text:
+            self.watcher.poll()
+            self.assertEqual([e["action_taken"] for e in self.watcher.poll()], ["WOULD_BLOCK"])
+            for operation in (enforcing_watcher, scanner, client, unlink, rename, replace, write_bytes, write_text):
+                operation.assert_not_called()
+        self.assertEqual(path.read_bytes(), b"ALPHA")
+        self.assertEqual(usb_watcher._dry_run_version(path), before)
+
+    def test_drive_root_is_rejected_without_reading_it(self):
+        with patch.object(Path, "lstat") as lstat:
+            with self.assertRaisesRegex(ValueError, "under the system temporary directory"):
+                usb_watcher.DryRunFolderWatcher(self.root.anchor, self.policies)
+            lstat.assert_not_called()
+
+    def test_missing_root_raises_instead_of_reporting_an_empty_scan(self):
+        self.root.rmdir()
+        with self.assertRaises(FileNotFoundError):
+            self.watcher.poll()
+        self.root.mkdir()
+        self.assertEqual(self.watcher.poll(), [])
+
+    def test_reparse_points_are_not_inspected_or_used_as_watcher_roots(self):
+        child = self.write("reparse.txt", "ALPHA")
+        original = Path.lstat
+
+        def metadata(path):
+            if path in (child, self.root):
+                mode = stat.S_IFDIR if path == self.root else stat.S_IFREG
+                return Mock(st_mode=mode, st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT)
+            return original(path)
+
+        with patch.object(Path, "lstat", autospec=True, side_effect=metadata):
+            with self.assertRaisesRegex(ValueError, "links or reparse points"):
+                usb_watcher.DryRunFolderWatcher(self.root, self.policies)
+            with self.assertRaisesRegex(ValueError, "links or reparse points"):
+                self.watcher.poll()
+        with patch.object(Path, "lstat", autospec=True,
+                          side_effect=lambda path: metadata(path) if path == child else original(path)), \
+                patch.object(usb_watcher, "inspect_file") as inspect:
+            self.assertEqual(self.watcher.poll(), [])
+            self.assertEqual(self.watcher.poll(), [])
+            inspect.assert_not_called()
+
+    # These security assertions remain expected failures until reads and enumeration
+    # are bound to validated handles. The mocks model redirection without actual links.
+    @unittest.expectedFailure
+    def test_file_open_remains_confined_when_child_is_swapped_after_precheck(self):
+        candidate = self.write("candidate.txt", "clean")
+        self.assertEqual(self.watcher.poll(), [])
+        original_version = usb_watcher._dry_run_version
+        opened_outside = []
+        with tempfile.TemporaryDirectory() as sibling:
+            outside = Path(sibling) / "synthetic-target.txt"
+            outside.write_text("ALPHA", encoding="utf-8")
+
+            def redirect_open(path, *args, **kwargs):
+                if isinstance(path, (str, bytes, os.PathLike)) and Path(os.fsdecode(path)) == candidate:
+                    opened_outside.append(outside)
+                    path = outside
+                return open(path, *args, **kwargs)
+
+            def version_after_swap(path):
+                if path == candidate and opened_outside:
+                    return None
+                return original_version(path)
+
+            with patch("content_inspection.open", create=True, side_effect=redirect_open), \
+                    patch.object(usb_watcher, "_dry_run_version", side_effect=version_after_swap):
+                self.watcher.poll()
+        self.assertEqual(len(opened_outside), 0, "inspection opened the outside synthetic target")
+
+    @unittest.expectedFailure
+    def test_directory_scan_remains_confined_when_root_is_swapped_after_validation(self):
+        original_scandir = os.scandir
+        enumerated_outside = []
+        with tempfile.TemporaryDirectory() as sibling:
+            outside = Path(sibling)
+            (outside / "synthetic-target.txt").write_text("ALPHA", encoding="utf-8")
+
+            def redirect_scandir(directory):
+                if isinstance(directory, (str, bytes, os.PathLike)) and Path(os.fsdecode(directory)) == self.root:
+                    enumerated_outside.append(outside)
+                    directory = outside
+                return original_scandir(directory)
+
+            with patch.object(usb_watcher.os, "scandir", side_effect=redirect_scandir):
+                self.watcher.poll()
+        self.assertEqual(len(enumerated_outside), 0, "scan traversed the outside synthetic directory")
 
 
 class UsbWatcherManagerTests(unittest.TestCase):

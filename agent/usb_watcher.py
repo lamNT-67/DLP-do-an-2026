@@ -4,6 +4,7 @@ import configparser
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import os
 import re
 import stat
 import subprocess
@@ -233,6 +234,115 @@ class FolderWatcher:
             self.handled[path] = version
         self.handled = {p: v for p, v in self.handled.items() if p in current}
         self.previous = current
+
+
+_DRY_RUN_ACTIONS = {"ALLOW": "ALLOW", "LOG": "LOGGED", "BLOCK": "WOULD_BLOCK"}
+
+
+def _is_reparse_point(info):
+    return bool(getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _dry_run_version(path):
+    info = path.lstat()
+    if stat.S_ISREG(info.st_mode) and not _is_reparse_point(info):
+        return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
+class DryRunFolderWatcher:
+    """Return local inspection events from a trusted synthetic scratch directory.
+
+    The caller must control the directory and its ancestors. Path-based checks
+    detect some changes but cannot confine reads if another process can swap
+    directory or file entries between operations.
+
+    Existing files form the baseline. Each poll checks direct children only.
+    Root scan failures propagate to the caller. Failed or over-limit scans
+    reset stability tracking and retain the reported history.
+    Device discovery and the CLI do not use this class.
+    """
+
+    def __init__(self, directory, policies, *, max_files=1024):
+        if not isinstance(max_files, int) or max_files < 1:
+            raise ValueError("max_files must be a positive integer")
+        self.directory = Path(os.path.abspath(directory))
+        self._temp_root = Path(os.path.abspath(tempfile.gettempdir()))
+        if self.directory == self._temp_root or not self.directory.is_relative_to(self._temp_root):
+            raise ValueError("Dry-run requires a synthetic directory under the system temporary directory")
+        self._max_files = max_files
+        self._status = get_exit_point_status(policies, "USB")
+        self._previous = self._snapshot() or {}
+        self._reported = {path: (version, False) for path, version in self._previous.items()
+                          if version is not None}
+
+    def _snapshot(self):
+        directory = self._temp_root
+        for part in (".", *self.directory.relative_to(directory).parts):
+            directory /= part
+            info = directory.lstat()
+            if not stat.S_ISDIR(info.st_mode) or _is_reparse_point(info):
+                raise ValueError("Dry-run directory must not traverse links or reparse points")
+
+        current = {}
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                path = directory / entry.name
+                try:
+                    version = _dry_run_version(path)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    # Keep the entry present, but require fresh observations before inspecting.
+                    current[path] = None
+                else:
+                    if version is None:
+                        continue
+                    current[path] = version
+                if len(current) > self._max_files:
+                    return None
+        return current
+
+    def _inspect_version(self, path, version):
+        if _dry_run_version(path) != version:
+            return None
+        result = inspect_file(path, self._status, destination=str(self.directory))
+        return result if _dry_run_version(path) == version else None
+
+    def poll(self):
+        try:
+            current = self._snapshot()
+        except (OSError, ValueError):
+            self._previous = {}
+            raise
+        if current is None:
+            self._previous = {}
+            return []
+
+        events = []
+        for path, version in sorted(current.items()):
+            reported = self._reported.get(path)
+            if version is None or self._previous.get(path) != version or reported == (version, False):
+                continue
+            try:
+                result = self._inspect_version(path, version)
+            except FileNotFoundError:
+                del current[path]
+                continue
+            except OSError:
+                result = None
+            if result is None:
+                current[path] = None
+                continue
+
+            # Preserve the engine's unreadable verdict once, then retry the read.
+            observed = (version, result["reason"] == "UNREADABLE")
+            if observed != reported:
+                events.append({**result, "action_taken": _DRY_RUN_ACTIONS[result["verdict"]]})
+                self._reported[path] = observed
+
+        self._reported = {path: state for path, state in self._reported.items() if path in current}
+        self._previous = current
+        return events
 
 
 def demo():
