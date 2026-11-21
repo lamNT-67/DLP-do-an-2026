@@ -170,6 +170,80 @@ class UsbCommandTests(unittest.TestCase):
             offline.assert_called_once_with()
 
 
+class UsbDryRunDemoTests(unittest.TestCase):
+    def test_dry_run_demo_uses_real_inspection_without_usb_or_server(self):
+        output = io.StringIO()
+        with patch.object(usb_watcher, "inspect_file", wraps=usb_watcher.inspect_file) as inspect, \
+                patch.object(usb_watcher, "FolderWatcher") as folder, \
+                patch.object(usb_watcher, "scan_windows_usb") as scan, \
+                patch("policy_client.PolicyClient") as client, redirect_stdout(output):
+            usb_watcher.main(["--dry-run-demo"])
+        self.assertEqual(inspect.call_count, 3)
+        folder.assert_not_called()
+        scan.assert_not_called()
+        client.assert_not_called()
+        text = output.getvalue()
+        self.assertIn("USB DRY-RUN / SIMULATION", text)
+        self.assertRegex(text, r"(?m)^clean\.txt\s+ALLOW\s+ALLOW\s+11$")
+        self.assertRegex(text, r"(?m)^monitor\.txt\s+LOG\s+LOGGED\s+22$")
+        self.assertRegex(text, r"(?m)^sensitive\.txt\s+BLOCK\s+WOULD_BLOCK\s+11$")
+        self.assertIn("All 3 files unchanged. No duplicate events after 2 extra polls.", text)
+
+    def test_dry_run_demo_rejects_external_directories_and_incompatible_options(self):
+        with patch.object(usb_watcher, "dry_run_demo") as demo:
+            for options in (
+                ["synthetic-folder"], ["--directory", "synthetic-folder"], ["--config", "synthetic.ini"],
+                ["--demo"], ["--list-usb"], ["--observe-usb"], ["--iterations", "2"],
+            ):
+                with self.subTest(options=options), redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as raised:
+                        usb_watcher.main(["--dry-run-demo", *options])
+                    self.assertEqual(raised.exception.code, 2)
+        demo.assert_not_called()
+
+    def test_dry_run_demo_exits_nonzero_if_results_are_missing(self):
+        with patch.object(usb_watcher.DryRunFolderWatcher, "poll", return_value=[]):
+            self.assert_demo_failure("Unexpected inspection results")
+
+    def test_dry_run_demo_exits_nonzero_for_duplicate_events(self):
+        original_poll = usb_watcher.DryRunFolderWatcher.poll
+        reported = []
+
+        def repeated_poll(watcher):
+            if reported:
+                return reported
+            reported.extend(original_poll(watcher))
+            return reported
+
+        with patch.object(usb_watcher.DryRunFolderWatcher, "poll", autospec=True, side_effect=repeated_poll):
+            self.assert_demo_failure("Extra polls produced unexpected events")
+
+    def test_dry_run_demo_exits_nonzero_if_fixture_changes(self):
+        original_poll = usb_watcher.DryRunFolderWatcher.poll
+        polls = 0
+
+        def poll_with_fixture_change(watcher):
+            nonlocal polls
+            polls += 1
+            events = original_poll(watcher)
+            if polls == 4:
+                (watcher.directory / "clean.txt").write_bytes(b"changed during synthetic test")
+            return events
+
+        with patch.object(usb_watcher.DryRunFolderWatcher, "poll", autospec=True,
+                          side_effect=poll_with_fixture_change):
+            self.assert_demo_failure("Synthetic file changed: clean.txt")
+
+    def assert_demo_failure(self, message):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
+            usb_watcher.main(["--dry-run-demo"])
+        self.assertEqual(raised.exception.code, 1)
+        self.assertIn("USB DRY-RUN / SIMULATION", stdout.getvalue())
+        self.assertIn(message, stderr.getvalue())
+        self.assertNotIn("PASS:", stdout.getvalue())
+
+
 class UsbObserverTests(unittest.TestCase):
     device = r"\synthetic\USBSTOR\serial-test"
 

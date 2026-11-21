@@ -259,7 +259,7 @@ class DryRunFolderWatcher:
     Existing files form the baseline. Each poll checks direct children only.
     Root scan failures propagate to the caller. Failed or over-limit scans
     reset stability tracking and retain the reported history.
-    Device discovery and the CLI do not use this class.
+    The dry-run demo uses this class only with its own temporary fixtures.
     """
 
     def __init__(self, directory, policies, *, max_files=1024):
@@ -345,7 +345,7 @@ class DryRunFolderWatcher:
         return events
 
 
-def demo():
+def _demo_policies():
     policies = []
     for pid, marker, action in [(11, "ALPHA", "BLOCK"), (22, "BETA", "REPORT_ONLY")]:
         policies.append({
@@ -353,10 +353,14 @@ def demo():
             "content_rules": [{"id": pid, "rule_name": marker, "rule_type": "REGEX",
                                "pattern": marker, "severity": "HIGH", "category": "INTERNAL_DOC"}],
         })
+    return policies
+
+
+def demo():
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         events = []
-        watcher = FolderWatcher(root, policies, events.append)
+        watcher = FolderWatcher(root, _demo_policies(), events.append)
         for name, content in [("clean.txt", "hello"), ("monitor.txt", "BETA"), ("blocked.txt", "ALPHA")]:
             (root / name).write_text(content, encoding="utf-8")
         for _ in range(4):
@@ -367,6 +371,52 @@ def demo():
             raise RuntimeError(f"Unexpected demo outcome: {actual}, {remaining}")
         print(json.dumps({"events": actual, "remaining": remaining}, indent=2))
         print("PASS: ALLOW, LOG and post-copy BLOCK")
+
+
+def dry_run_demo():
+    """Demonstrate inspection using only internally generated synthetic files."""
+    fixtures = {"clean.txt": b"hello", "monitor.txt": b"BETA", "sensitive.txt": b"ALPHA"}
+    expected = [
+        ("clean.txt", "ALLOW", "ALLOW", 11),
+        ("monitor.txt", "LOG", "LOGGED", 22),
+        ("sensitive.txt", "BLOCK", "WOULD_BLOCK", 11),
+    ]
+
+    print("USB DRY-RUN / SIMULATION")
+    with tempfile.TemporaryDirectory(prefix="dlp-usb-dry-run-") as directory:
+        root = Path(directory)
+        watcher = DryRunFolderWatcher(root, _demo_policies())
+        versions = {}
+        for name, content in fixtures.items():
+            path = root / name
+            with path.open("xb") as stream:
+                stream.write(content)
+            version = _dry_run_version(path)
+            if version is None:
+                raise RuntimeError(f"Synthetic fixture is not a regular file: {name}")
+            versions[name] = version
+
+        if watcher.poll():
+            raise RuntimeError("Files were reported before their metadata stabilized.")
+        rows = [(event["file_name"], event["verdict"], event["action_taken"], event["policy_id"])
+                for event in watcher.poll()]
+        if rows != expected:
+            raise RuntimeError(f"Unexpected inspection results: {rows}")
+        for _ in range(2):
+            if watcher.poll():
+                raise RuntimeError("Extra polls produced unexpected events.")
+
+        if {path.name for path in root.iterdir()} != fixtures.keys():
+            raise RuntimeError("The set of synthetic files changed.")
+        for name, content in fixtures.items():
+            path = root / name
+            if _dry_run_version(path) != versions[name] or path.read_bytes() != content:
+                raise RuntimeError(f"Synthetic file changed: {name}")
+
+        print(f"{'FILE':<16} {'VERDICT':<8} {'ACTION':<12} POLICY ID")
+        for name, verdict, action, policy_id in rows:
+            print(f"{name:<16} {verdict:<8} {action:<12} {policy_id}")
+        print("PASS: All 3 files unchanged. No duplicate events after 2 extra polls.")
 
 
 def server_demo(config_path):
@@ -415,6 +465,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--demo", action="store_true", help="Run the isolated folder simulation")
+    mode.add_argument("--dry-run-demo", action="store_true",
+                      help="Demonstrate USB inspection on internally generated files without enforcement")
     mode.add_argument("--list-usb", action="store_true", help="List Windows USB data disks with drive letters")
     mode.add_argument("--observe-usb", action="store_true",
                       help="Print volume events from bounded Windows storage scans")
@@ -448,6 +500,11 @@ def main(argv=None):
             list_usb()
         except RuntimeError as error:
             parser.exit(1, f"{error}\n")
+    elif args.dry_run_demo:
+        try:
+            dry_run_demo()
+        except (OSError, RuntimeError, ValueError) as error:
+            parser.exit(1, f"USB dry-run demo failed: {error}\n")
     elif args.config:
         server_demo(args.config)
     else:
