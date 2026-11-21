@@ -1,4 +1,4 @@
-"""Synthetic tests for USB device detection and the command modes."""
+"""Synthetic tests for USB discovery, watcher lifecycle, and the command modes."""
 
 from contextlib import redirect_stderr, redirect_stdout
 import io
@@ -6,8 +6,9 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -48,6 +49,78 @@ class UsbLifecycleTests(unittest.TestCase):
             self.assertEqual(usb_watcher.usb_changes(previous, current), expected)
             previous = current
         self.assertEqual(scan(), {})
+
+
+class UsbFailureRegressionTests(unittest.TestCase):
+    def test_factory_failure_does_not_keep_a_partial_batch(self):
+        retained, obsolete, first_attempt, replacement, additional = [Mock() for _ in range(5)]
+        previous = {"usb-a": usb_watcher.UsbDisk(3, ("F", "H"))}
+        current = {"usb-a": usb_watcher.UsbDisk(3, ("H",)),
+                   "usb-b": usb_watcher.UsbDisk(4, ("F", "G"))}
+        provider = Mock(side_effect=[previous, current, current])
+        factory = Mock(side_effect=[
+            obsolete, retained, first_attempt, RuntimeError("factory failed"), replacement, additional,
+        ])
+        manager = usb_watcher.UsbWatcherManager(provider, factory)
+        manager.tick()
+
+        with self.assertRaisesRegex(RuntimeError, "factory failed"):
+            manager.tick()
+        self.assertEqual(manager._watchers, {("usb-a", "H"): retained})
+        retained.poll.assert_called_once_with()
+        first_attempt.poll.assert_not_called()
+
+        self.assertEqual(manager.tick(), [
+            ("removed", "usb-a", "F"), ("inserted", "usb-b", "F"), ("inserted", "usb-b", "G"),
+        ])
+        self.assertEqual(factory.call_args_list, [
+            call("usb-a", "F"), call("usb-a", "H"), call("usb-b", "F"), call("usb-b", "G"),
+            call("usb-b", "F"), call("usb-b", "G"),
+        ])
+        obsolete.poll.assert_called_once_with()
+        first_attempt.poll.assert_not_called()
+        replacement.poll.assert_called_once_with()
+        additional.poll.assert_called_once_with()
+        self.assertEqual(retained.poll.call_count, 2)
+
+    def test_poll_failure_keeps_insertion_pending_until_successful_tick(self):
+        watcher = Mock()
+        watcher.poll.side_effect = [RuntimeError("poll failed"), None, None]
+        factory = Mock(return_value=watcher)
+        snapshot = {"usb-a": usb_watcher.UsbDisk(3, ("F",))}
+        manager = usb_watcher.UsbWatcherManager(Mock(return_value=snapshot), factory)
+
+        with self.assertRaisesRegex(RuntimeError, "poll failed"):
+            manager.tick()
+        self.assertEqual(manager.tick(), [("inserted", "usb-a", "F")])
+        self.assertEqual(manager.tick(), [])
+        factory.assert_called_once_with("usb-a", "F")
+
+    def test_duplicate_physical_paths_are_rejected_case_insensitively(self):
+        disk = {"Number": 3, "Path": "USB-DISK", "BusType": "USB",
+                "IsBoot": False, "IsSystem": False}
+        disks = [disk, {**disk, "Number": 4, "Path": "usb-disk"}]
+        partitions = [{"DiskNumber": 3, "DriveLetter": "F"}, {"DiskNumber": 4, "DriveLetter": "G"}]
+        with self.assertRaisesRegex(ValueError, "Duplicate physical disk path"):
+            usb_watcher.usb_disks_from_storage(disks, partitions)
+
+    def test_poll_error_is_raised_after_healthy_volume_has_polled(self):
+        failing, healthy = Mock(), Mock()
+        failing.poll.side_effect = OSError("first volume failed")
+        snapshot = {"usb-a": usb_watcher.UsbDisk(3, ("G", "F"))}
+        manager = usb_watcher.UsbWatcherManager(
+            Mock(return_value=snapshot), Mock(side_effect=[failing, healthy]))
+
+        with self.assertRaisesRegex(OSError, "first volume failed"):
+            manager.tick()
+        failing.poll.assert_called_once_with()
+        healthy.poll.assert_called_once_with()
+
+        healthy.poll.side_effect = ValueError("second volume failed")
+        with self.assertRaisesRegex(RuntimeError, "first volume failed.*second volume failed"):
+            manager.tick()
+        self.assertEqual(failing.poll.call_count, 2)
+        self.assertEqual(healthy.poll.call_count, 2)
 
 
 class UsbCommandTests(unittest.TestCase):
@@ -93,3 +166,127 @@ class UsbCommandTests(unittest.TestCase):
             usb_watcher.main(["--demo", "--config", "synthetic.ini"])
             configured.assert_called_once_with("synthetic.ini")
             offline.assert_called_once_with()
+
+
+class UsbWatcherManagerTests(unittest.TestCase):
+    def setUp(self):
+        self.provider = Mock()
+        self.factory = Mock(side_effect=lambda device, letter: Mock(name=f"{device}/{letter}"))
+        self.manager = usb_watcher.UsbWatcherManager(self.provider, self.factory)
+
+    def tick(self, devices):
+        self.provider.return_value = devices
+        return self.manager.tick()
+
+    def test_initial_detection_creates_once_and_stable_scan_reuses_watcher(self):
+        watcher = Mock()
+        self.factory.side_effect = None
+        self.factory.return_value = watcher
+        self.assertEqual(self.tick({"usb-a": usb_watcher.UsbDisk(3, ("F",))}),
+                         [("inserted", "usb-a", "F")])
+        self.assertEqual(self.tick({"usb-a": usb_watcher.UsbDisk(8, ("F",))}), [])
+        self.factory.assert_called_once_with("usb-a", "F")
+        self.assertEqual(watcher.poll.call_count, 2)
+
+    def test_removal_stops_polling_and_reinsertion_creates_new_watcher(self):
+        first, second = Mock(), Mock()
+        self.factory.side_effect = [first, second]
+        self.tick({"usb-a": usb_watcher.UsbDisk(3, ("F",))})
+        self.assertEqual(self.tick({}), [("removed", "usb-a", "F")])
+        self.assertEqual(self.tick({}), [])
+        self.assertEqual(self.tick({"usb-a": usb_watcher.UsbDisk(7, ("J",))}),
+                         [("inserted", "usb-a", "J")])
+        self.assertEqual(self.factory.call_args_list, [call("usb-a", "F"), call("usb-a", "J")])
+        first.poll.assert_called_once_with()
+        second.poll.assert_called_once_with()
+
+    def test_drive_letter_reassignment_replaces_watcher_without_unplugging(self):
+        first, second = Mock(), Mock()
+        self.factory.side_effect = [first, second]
+        self.tick({"usb-a": usb_watcher.UsbDisk(3, ("F",))})
+        self.assertEqual(self.tick({"usb-a": usb_watcher.UsbDisk(3, ("J",))}),
+                         [("removed", "usb-a", "F"), ("inserted", "usb-a", "J")])
+        self.assertEqual(self.tick({"usb-a": usb_watcher.UsbDisk(3, ("J",))}), [])
+        first.poll.assert_called_once_with()
+        self.assertEqual(second.poll.call_count, 2)
+        self.assertEqual(self.factory.call_args_list, [call("usb-a", "F"), call("usb-a", "J")])
+
+    def test_multiple_volumes_have_deterministic_events_and_independent_watchers(self):
+        f, g, j = Mock(), Mock(), Mock()
+        self.factory.side_effect = [f, g, j]
+        self.assertEqual(self.tick({"usb-a": usb_watcher.UsbDisk(3, ("G", "F", "f"))}),
+                         [("inserted", "usb-a", "F"), ("inserted", "usb-a", "G")])
+        self.assertEqual(self.tick({"usb-a": usb_watcher.UsbDisk(3, ("J", "g"))}),
+                         [("removed", "usb-a", "F"), ("inserted", "usb-a", "J")])
+        self.assertEqual(self.factory.call_args_list,
+                         [call("usb-a", "F"), call("usb-a", "G"), call("usb-a", "J")])
+        f.poll.assert_called_once_with()
+        self.assertEqual(g.poll.call_count, 2)
+        j.poll.assert_called_once_with()
+
+    def test_reused_letter_removes_old_watcher_before_creating_replacement(self):
+        previous, replacement = Mock(), Mock()
+        self.factory.side_effect = [previous]
+        self.tick({"usb-a": usb_watcher.UsbDisk(3, ("F",))})
+
+        def replace(device, letter):
+            self.assertNotIn(("usb-a", "F"), self.manager._watchers)
+            return replacement
+
+        self.factory.side_effect = replace
+        self.assertEqual(self.tick({"usb-b": usb_watcher.UsbDisk(3, ("F",))}),
+                         [("removed", "usb-a", "F"), ("inserted", "usb-b", "F")])
+        self.factory.assert_called_with("usb-b", "F")
+        previous.poll.assert_called_once_with()
+        replacement.poll.assert_called_once_with()
+
+    def test_scan_failure_preserves_watchers_and_skips_polling(self):
+        watcher = Mock()
+        self.factory.side_effect = [watcher]
+        snapshot = {"usb-a": usb_watcher.UsbDisk(3, ("F",))}
+        self.tick(snapshot)
+        self.provider.side_effect = RuntimeError("Storage query failed")
+        with self.assertRaisesRegex(RuntimeError, "Storage query failed"):
+            self.manager.tick()
+        watcher.poll.assert_called_once_with()
+        self.provider.side_effect = None
+        self.assertEqual(self.tick(snapshot), [])
+        self.factory.assert_called_once_with("usb-a", "F")
+        self.assertEqual(watcher.poll.call_count, 2)
+
+    def test_missing_identity_and_conflicting_volume_owners_do_not_create_watchers(self):
+        disk = usb_watcher.UsbDisk(3, ("F",))
+        for snapshot, error in (
+            ({"disk:3": disk}, "physical device identity"),
+            ({"usb-a": disk, "usb-b": usb_watcher.UsbDisk(4, ("F",))}, "multiple owners"),
+        ):
+            with self.subTest(snapshot=snapshot), self.assertRaisesRegex(ValueError, error):
+                self.tick(snapshot)
+        self.factory.assert_not_called()
+
+    def test_folder_watcher_integration_uses_an_isolated_temporary_root(self):
+        policies = [
+            {"policy_id": pid, "action": action, "exit_points": ["USB"],
+             "content_rules": [{"id": pid, "rule_name": marker, "pattern": marker,
+                                "rule_type": "REGEX", "severity": "HIGH", "category": "INTERNAL_DOC"}]}
+            for pid, marker, action in ((11, "ALPHA", "BLOCK"), (22, "BETA", "REPORT_ONLY"))
+        ]
+        snapshot = {"usb-test": usb_watcher.UsbDisk(3, ("F",))}
+        events = []
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.factory.side_effect = lambda device, letter: usb_watcher.FolderWatcher(
+                root, policies, events.append)
+            self.tick(snapshot)
+            files = {"clean.txt": "hello", "monitor.txt": "BETA", "blocked.txt": "ALPHA"}
+            for name, text in files.items():
+                (root / name).write_text(text, encoding="utf-8")
+            self.tick(snapshot)
+            self.assertEqual(events, [])
+            self.tick(snapshot)
+            self.tick(snapshot)
+            self.assertEqual(sorted(path.name for path in root.iterdir()), ["clean.txt", "monitor.txt"])
+        self.factory.assert_called_once_with("usb-test", "F")
+        self.assertEqual(sorted((event["file_name"], event["action_taken"], event["policy_id"])
+                                for event in events),
+                         [("blocked.txt", "BLOCKED_DELETE", 11), ("monitor.txt", "LOGGED", 22)])

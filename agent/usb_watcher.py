@@ -41,13 +41,21 @@ def usb_disks_from_storage(disks, partitions):
             letters_by_number.setdefault(partition["DiskNumber"], set()).add(letter.upper())
 
     usb_disks = {}
+    numbers_by_path = {}
     for disk in disks:
+        path = disk.get("Path")
+        if path:
+            key = path.casefold()
+            number = disk["Number"]
+            previous_number = numbers_by_path.setdefault(key, number)
+            if previous_number != number:
+                raise ValueError(f"Duplicate physical disk path for disks {previous_number} and {number}")
         if disk["BusType"].upper() != "USB" or disk["IsBoot"] or disk["IsSystem"]:
             continue
         number = disk["Number"]
         letters = letters_by_number.get(number)
         if letters:
-            device = disk["Path"] or f"disk:{number}"
+            device = path or f"disk:{number}"
             usb_disks[device.casefold()] = UsbDisk(number, tuple(sorted(letters)))
     return usb_disks
 
@@ -76,6 +84,72 @@ def usb_changes(previous, current):
         [("removed", previous[device]) for device in sorted(previous.keys() - current.keys())]
         + [("inserted", current[device]) for device in sorted(current.keys() - previous.keys())]
     )
+
+
+def _usb_volume_keys(snapshot):
+    volumes = {}
+    for device, disk in snapshot.items():
+        # The listing adapter may fall back to a disk number, which Windows can reuse.
+        if not device or device.startswith("disk:"):
+            raise ValueError("USB snapshot requires a physical device identity")
+        for letter in disk.drive_letters:
+            if not re.fullmatch(r"[A-Za-z]", letter):
+                raise ValueError(f"Invalid USB drive letter: {letter!r}")
+            letter = letter.upper()
+            if volumes.setdefault(letter, device) != device:
+                raise ValueError(f"USB snapshot has multiple owners for {letter}:")
+    return {(device, letter) for letter, device in volumes.items()}
+
+
+class UsbWatcherManager:
+    """Drive synthetic volume watchers from snapshots keyed like scan_windows_usb().
+
+    The required factory receives (device_id, drive_letter) and returns a watcher
+    with poll(). The caller supplies the isolated test roots.
+    """
+
+    def __init__(self, snapshot_provider, watcher_factory):
+        self._snapshot_provider = snapshot_provider
+        self._watcher_factory = watcher_factory
+        self._watchers = {}
+        self._reported_volumes = set()
+
+    def tick(self):
+        """Poll current watchers and return (event, device_id, drive_letter) tuples.
+
+        Snapshot errors propagate before any watcher is changed or polled.
+        Events describe the net change since the last successful tick.
+        """
+        current = _usb_volume_keys(self._snapshot_provider())
+        for volume in sorted(self._watchers.keys() - current):
+            del self._watchers[volume]
+        new_watchers = {
+            volume: self._watcher_factory(*volume)
+            for volume in sorted(current - self._watchers.keys())
+        }
+        self._watchers.update(new_watchers)
+
+        failures = []
+        for volume in sorted(current):
+            try:
+                self._watchers[volume].poll()
+            except Exception as error:
+                failures.append((volume, error))
+        if len(failures) == 1:
+            raise failures[0][1]
+        if failures:
+            details = ", ".join(
+                f"{device} {letter}: {type(error).__name__}: {error}"
+                for (device, letter), error in failures
+            )
+            raise RuntimeError(f"Multiple USB watcher polls failed ({details})") from failures[0][1]
+
+        removed = sorted(self._reported_volumes - current)
+        added = sorted(current - self._reported_volumes)
+        self._reported_volumes = current
+        return [("removed", *volume) for volume in removed] + [
+            ("inserted", *volume) for volume in added
+        ]
 
 
 def list_usb():
