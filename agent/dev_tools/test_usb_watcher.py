@@ -1,6 +1,7 @@
 """Synthetic tests for USB discovery, watcher lifecycle, and the command modes."""
 
 from contextlib import redirect_stderr, redirect_stdout
+import hashlib
 import io
 import json
 import os
@@ -15,6 +16,11 @@ from unittest.mock import Mock, call, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import usb_watcher
+
+if sys.platform == "win32":
+    import _winapi
+    import _windows_dry_run
+    import content_inspection
 
 
 class UsbLifecycleTests(unittest.TestCase):
@@ -170,14 +176,30 @@ class UsbCommandTests(unittest.TestCase):
             offline.assert_called_once_with()
 
 
+@unittest.skipUnless(sys.platform == "win32", "Windows dry-run handle access required")
 class UsbDryRunDemoTests(unittest.TestCase):
     def test_dry_run_demo_uses_real_inspection_without_usb_or_server(self):
         output = io.StringIO()
-        with patch.object(usb_watcher, "inspect_file", wraps=usb_watcher.inspect_file) as inspect, \
+        retained = []
+        original_poll = usb_watcher.DryRunFolderWatcher.poll
+
+        def retain_watcher(watcher):
+            retained.append(watcher)
+            return original_poll(watcher)
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(usb_watcher.tempfile, "gettempdir", return_value=directory), \
+                patch.object(usb_watcher.DryRunFolderWatcher, "poll", autospec=True,
+                             side_effect=retain_watcher), \
+                patch.object(usb_watcher, "inspect_file", wraps=usb_watcher.inspect_file) as inspect, \
                 patch.object(usb_watcher, "FolderWatcher") as folder, \
                 patch.object(usb_watcher, "scan_windows_usb") as scan, \
                 patch("policy_client.PolicyClient") as client, redirect_stdout(output):
             usb_watcher.main(["--dry-run-demo"])
+            self.assertEqual(len(retained), 4)
+            self.assertEqual(list(Path(directory).iterdir()), [])
+            with self.assertRaisesRegex(ValueError, "fixture root is closed"):
+                retained[0].poll()
         self.assertEqual(inspect.call_count, 3)
         folder.assert_not_called()
         scan.assert_not_called()
@@ -227,17 +249,95 @@ class UsbDryRunDemoTests(unittest.TestCase):
             polls += 1
             events = original_poll(watcher)
             if polls == 4:
-                (watcher.directory / "clean.txt").write_bytes(b"changed during synthetic test")
+                with watcher._fixture.scan() as scan:
+                    handle = _windows_dry_run._open_relative(
+                        scan._handle, "clean.txt", _windows_dry_run._FILE_WRITE_DATA,
+                        _windows_dry_run._SHARE_ALL, directory=False)
+                    with _windows_dry_run._binary_stream(handle, "wb") as stream:
+                        stream.write(b"changed during synthetic test")
             return events
 
         with patch.object(usb_watcher.DryRunFolderWatcher, "poll", autospec=True,
                           side_effect=poll_with_fixture_change):
             self.assert_demo_failure("Synthetic file changed: clean.txt")
 
+    def test_demo_cleanup_targets_only_its_owned_fixture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            with _windows_dry_run.temporary_fixture(parent) as fixture:
+                clean_root = fixture.path
+                fixture.write_new("created.txt", b"test fixture")
+            self.assertFalse(clean_root.exists())
+
+            with _windows_dry_run.temporary_fixture(parent) as fixture:
+                fixture.write_new("created.txt", b"test fixture")
+                unrelated = fixture.path / "unrelated.txt"
+                unrelated.write_bytes(b"preserve")
+                with self.assertRaises(FileExistsError):
+                    fixture.write_new(unrelated.name, b"replacement")
+
+                replacement = parent / "replacement"
+                replacement.mkdir()
+                with patch.object(_windows_dry_run.DirectoryScan, "names") as names:
+                    with self.assertRaisesRegex(ValueError, "fixture directory was replaced"):
+                        usb_watcher.DryRunFolderWatcher(
+                            replacement, [], _expected_identity=fixture.identity)
+                names.assert_not_called()
+            self.assertEqual(unrelated.read_bytes(), b"preserve")
+            self.assertFalse((unrelated.parent / "created.txt").exists())
+
+    def test_demo_preserves_preexisting_directory_on_name_collision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            collision = parent / "dlp-usb-dry-run-collision"
+            collision.mkdir()
+            unrelated = collision / "unrelated.txt"
+            unrelated.write_bytes(b"preserve")
+            with patch.object(_windows_dry_run.uuid, "uuid4", return_value=Mock(hex="collision")):
+                with self.assertRaises(FileExistsError):
+                    with _windows_dry_run.temporary_fixture(parent):
+                        self.fail("expected exclusive directory creation to fail")
+            self.assertEqual(unrelated.read_bytes(), b"preserve")
+
+    def test_demo_releases_handles_while_setup_or_poll_exception_is_retained(self):
+        for step in ("_snapshot", "_poll_scan"):
+            failure = RuntimeError(f"synthetic failure in {step}")
+            with self.subTest(step=step), tempfile.TemporaryDirectory() as directory, \
+                    patch.object(usb_watcher.tempfile, "gettempdir", return_value=directory), \
+                    patch.object(usb_watcher.DryRunFolderWatcher, step, autospec=True,
+                                 side_effect=failure) as fail, redirect_stdout(io.StringIO()):
+                try:
+                    usb_watcher.dry_run_demo()
+                except RuntimeError as caught:
+                    self.assertIs(caught, failure)
+                    self.assertIsNotNone(caught.__traceback__)
+                    self.assertEqual(list(Path(directory).iterdir()), [])
+                    watcher, scan = fail.call_args.args
+                    self.assertFalse(watcher._fixture._release.alive)
+                    with self.assertRaisesRegex(ValueError, "directory scan is closed"):
+                        next(scan.names())
+                else:
+                    self.fail(f"Expected failure in {step}")
+
+    def test_demo_removes_partially_created_fixture_if_writer_cannot_open(self):
+        open_relative = _windows_dry_run._open_relative
+
+        def fail_writer(parent, name, access, share, **kwargs):
+            if name == "monitor.txt" and access & _windows_dry_run._FILE_WRITE_DATA:
+                raise PermissionError("synthetic writer open failed")
+            return open_relative(parent, name, access, share, **kwargs)
+
+        with patch.object(_windows_dry_run, "_open_relative", side_effect=fail_writer):
+            self.assert_demo_failure("synthetic writer open failed")
+
     def assert_demo_failure(self, message):
         stdout, stderr = io.StringIO(), io.StringIO()
-        with redirect_stdout(stdout), redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
-            usb_watcher.main(["--dry-run-demo"])
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(usb_watcher.tempfile, "gettempdir", return_value=directory), \
+                redirect_stdout(stdout), redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as raised:
+                usb_watcher.main(["--dry-run-demo"])
+            self.assertEqual(list(Path(directory).iterdir()), [])
         self.assertEqual(raised.exception.code, 1)
         self.assertIn("USB DRY-RUN / SIMULATION", stdout.getvalue())
         self.assertIn(message, stderr.getvalue())
@@ -365,11 +465,13 @@ class UsbObserverTests(unittest.TestCase):
         client.assert_not_called()
 
 
+@unittest.skipUnless(sys.platform == "win32", "Windows dry-run handle access required")
 class UsbDryRunTests(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
-        self.root = Path(directory.name)
+        self.root = Path(directory.name) / "watched"
+        self.root.mkdir()
         self.policies = [
             {"policy_id": pid, "action": action, "exit_points": ["USB"],
              "content_rules": [{"id": rid, "rule_name": marker, "pattern": marker,
@@ -379,6 +481,7 @@ class UsbDryRunTests(unittest.TestCase):
             )
         ]
         self.watcher = usb_watcher.DryRunFolderWatcher(self.root, self.policies)
+        self.addCleanup(self.watcher.close)
 
     def write(self, name, content):
         path = self.root / name
@@ -387,6 +490,7 @@ class UsbDryRunTests(unittest.TestCase):
 
     def test_new_files_keep_independent_decisions_and_policy_evidence(self):
         self.watcher = usb_watcher.DryRunFolderWatcher(self.root, self.policies[::-1])
+        self.addCleanup(self.watcher.close)
         self.write("clean.txt", "ordinary")
         self.write("mixed.txt", "ALPHA BETA")
         self.write("monitor.txt", "BETA")
@@ -410,6 +514,7 @@ class UsbDryRunTests(unittest.TestCase):
         path = self.write("existing.txt", "BETA ")
         original = path.stat()
         watcher = usb_watcher.DryRunFolderWatcher(self.root, self.policies)
+        self.addCleanup(watcher.close)
         self.assertEqual(watcher.poll(), [])
         self.write("existing.txt", "ALPHA")
         os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns + 2_000_000_000))
@@ -457,9 +562,9 @@ class UsbDryRunTests(unittest.TestCase):
     def test_preinspection_metadata_change_defers_the_read(self):
         path = self.write("before-read.txt", "ALPHA")
         self.watcher.poll()
-        version = usb_watcher._dry_run_version(path)
+        version = self.watcher._previous[path]
         changed = (*version[:2], version[2] + 1, *version[3:])
-        with patch.object(usb_watcher, "_dry_run_version", side_effect=[version, changed]), \
+        with patch.object(_windows_dry_run.DirectoryScan, "version", side_effect=[version, changed]), \
                 patch.object(usb_watcher, "inspect_file") as inspect:
             self.assertEqual(self.watcher.poll(), [])
         inspect.assert_not_called()
@@ -484,14 +589,14 @@ class UsbDryRunTests(unittest.TestCase):
         blocked = self.write("blocked.txt", "ALPHA")
         self.write("clean.txt", "ordinary")
         self.watcher.poll()
-        file_version = usb_watcher._dry_run_version
+        file_version = _windows_dry_run.DirectoryScan.version
 
-        def fail_one(path):
-            if path == blocked:
+        def fail_one(scan, name):
+            if name == blocked.name:
                 raise PermissionError("temporarily inaccessible")
-            return file_version(path)
+            return file_version(scan, name)
 
-        with patch.object(usb_watcher, "_dry_run_version", side_effect=fail_one):
+        with patch.object(_windows_dry_run.DirectoryScan, "version", autospec=True, side_effect=fail_one):
             self.assertEqual([e["file_name"] for e in self.watcher.poll()], ["clean.txt"])
             self.assertEqual(self.watcher.poll(), [])
         self.assertEqual(self.watcher.poll(), [])
@@ -500,7 +605,7 @@ class UsbDryRunTests(unittest.TestCase):
     def test_unreadable_verdict_is_preserved_once_and_retried(self):
         self.write("read-error.txt", "BETA")
         self.watcher.poll()
-        with patch("content_inspection._read_file", side_effect=PermissionError("locked")):
+        with patch("content_inspection._read_stream", side_effect=PermissionError("locked")):
             events = self.watcher.poll()
             self.assertEqual([(e["reason"], e["policy_id"], e["action_taken"]) for e in events],
                              [("UNREADABLE", 11, "WOULD_BLOCK")])
@@ -511,6 +616,7 @@ class UsbDryRunTests(unittest.TestCase):
 
     def test_history_limit_and_failed_scan_preserve_duplicate_suppression(self):
         watcher = usb_watcher.DryRunFolderWatcher(self.root, self.policies, max_files=1)
+        self.addCleanup(watcher.close)
         self.write("tracked.txt", "ALPHA")
         watcher.poll()
         self.assertEqual(len(watcher.poll()), 1)
@@ -528,7 +634,7 @@ class UsbDryRunTests(unittest.TestCase):
 
     def test_dry_run_never_invokes_enforcement_usb_discovery_or_server(self):
         path = self.write("protected.txt", "ALPHA")
-        before = usb_watcher._dry_run_version(path)
+        before = path.stat()
         with patch.object(usb_watcher, "FolderWatcher") as enforcing_watcher, \
                 patch.object(usb_watcher, "scan_windows_usb") as scanner, \
                 patch("policy_client.PolicyClient") as client, \
@@ -540,88 +646,215 @@ class UsbDryRunTests(unittest.TestCase):
             for operation in (enforcing_watcher, scanner, client, unlink, rename, replace, write_bytes, write_text):
                 operation.assert_not_called()
         self.assertEqual(path.read_bytes(), b"ALPHA")
-        self.assertEqual(usb_watcher._dry_run_version(path), before)
+        after = path.stat()
+        self.assertEqual((after.st_ino, after.st_size, after.st_mtime_ns),
+                         (before.st_ino, before.st_size, before.st_mtime_ns))
 
     def test_drive_root_is_rejected_without_reading_it(self):
-        with patch.object(Path, "lstat") as lstat:
+        with patch.object(_windows_dry_run, "local_fixture_volume") as volume:
             with self.assertRaisesRegex(ValueError, "under the system temporary directory"):
                 usb_watcher.DryRunFolderWatcher(self.root.anchor, self.policies)
-            lstat.assert_not_called()
+            volume.assert_not_called()
+
+    def test_fixed_drive_reporting_usb_is_rejected_before_directory_access(self):
+        def usb_descriptor(handle, control, query, query_size, response, size, returned, overlapped):
+            response[28] = b"\x07"
+            returned._obj.value = 32
+            return True
+
+        with patch.object(_windows_dry_run, "_device_control", side_effect=usb_descriptor), \
+                patch.object(_windows_dry_run, "FixtureRoot") as opened:
+            with self.assertRaisesRegex(ValueError, "known non-USB fixture volume"):
+                usb_watcher.DryRunFolderWatcher(self.root, self.policies)
+        opened.assert_not_called()
 
     def test_missing_root_raises_instead_of_reporting_an_empty_scan(self):
-        self.root.rmdir()
+        original = self.root.with_name("original")
+        self.root.rename(original)
         with self.assertRaises(FileNotFoundError):
             self.watcher.poll()
         self.root.mkdir()
+        self.write("replacement.txt", "ALPHA")
+        with patch.object(_windows_dry_run.DirectoryScan, "names", autospec=True) as names:
+            with self.assertRaisesRegex(ValueError, "fixture directory was replaced"):
+                self.watcher.poll()
+        names.assert_not_called()
+        self.root.rename(self.root.with_name("replacement"))
+        original.rename(self.root)
         self.assertEqual(self.watcher.poll(), [])
 
     def test_reparse_points_are_not_inspected_or_used_as_watcher_roots(self):
         child = self.write("reparse.txt", "ALPHA")
-        original = Path.lstat
+        junction = self.root.with_name("junction")
+        _winapi.CreateJunction(str(self.root), str(junction))
+        for path in (junction, junction / "nested"):
+            with self.subTest(path=path), self.assertRaisesRegex(ValueError, "links or reparse points"):
+                usb_watcher.DryRunFolderWatcher(path, self.policies)
 
-        def metadata(path):
-            if path in (child, self.root):
-                mode = stat.S_IFDIR if path == self.root else stat.S_IFREG
-                return Mock(st_mode=mode, st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT)
-            return original(path)
+        identity = child.stat().st_ino
+        original_query = _windows_dry_run._query
 
-        with patch.object(Path, "lstat", autospec=True, side_effect=metadata):
-            with self.assertRaisesRegex(ValueError, "links or reparse points"):
-                usb_watcher.DryRunFolderWatcher(self.root, self.policies)
-            with self.assertRaisesRegex(ValueError, "links or reparse points"):
-                self.watcher.poll()
-        with patch.object(Path, "lstat", autospec=True,
-                          side_effect=lambda path: metadata(path) if path == child else original(path)), \
+        def metadata(handle, info_type, structure):
+            info = original_query(handle, info_type, structure)
+            if structure is _windows_dry_run._BasicInfo:
+                _, file_id = _windows_dry_run._identity(handle)
+                if int.from_bytes(file_id, "little") == identity:
+                    info.attributes |= stat.FILE_ATTRIBUTE_REPARSE_POINT
+            return info
+
+        with patch.object(_windows_dry_run, "_query", side_effect=metadata), \
+                patch.object(_windows_dry_run, "_file_version", wraps=_windows_dry_run._file_version) as version, \
                 patch.object(usb_watcher, "inspect_file") as inspect:
             self.assertEqual(self.watcher.poll(), [])
             self.assertEqual(self.watcher.poll(), [])
+            self.assertGreaterEqual(version.call_count, 2)
             inspect.assert_not_called()
 
-    # These security assertions remain expected failures until reads and enumeration
-    # are bound to validated handles. The mocks model redirection without actual links.
-    @unittest.expectedFailure
+    def test_hard_link_to_sibling_fixture_is_not_inspected(self):
+        sibling = self.root.with_name("sibling.txt")
+        sibling.write_text("ALPHA", encoding="utf-8")
+        os.link(sibling, self.root / "alias.txt")
+        with patch.object(usb_watcher, "inspect_file") as inspect:
+            self.assertEqual(self.watcher.poll(), [])
+            self.assertEqual(self.watcher.poll(), [])
+        inspect.assert_not_called()
+
     def test_file_open_remains_confined_when_child_is_swapped_after_precheck(self):
         candidate = self.write("candidate.txt", "clean")
+        staging = self.root / "staging"
+        staging.mkdir()
+        replacement = staging / "replacement.txt"
+        replacement.write_text("ALPHA", encoding="utf-8")
         self.assertEqual(self.watcher.poll(), [])
-        original_version = usb_watcher._dry_run_version
-        opened_outside = []
-        with tempfile.TemporaryDirectory() as sibling:
-            outside = Path(sibling) / "synthetic-target.txt"
-            outside.write_text("ALPHA", encoding="utf-8")
+        inspect = usb_watcher.inspect_file
 
-            def redirect_open(path, *args, **kwargs):
-                if isinstance(path, (str, bytes, os.PathLike)) and Path(os.fsdecode(path)) == candidate:
-                    opened_outside.append(outside)
-                    path = outside
-                return open(path, *args, **kwargs)
+        def replace_after_precheck(path, *args, **kwargs):
+            self.assertEqual(path, candidate)
+            candidate.rename(staging / "original.txt")
+            replacement.rename(candidate)
+            return inspect(path, *args, **kwargs)
 
-            def version_after_swap(path):
-                if path == candidate and opened_outside:
-                    return None
-                return original_version(path)
+        with patch.object(usb_watcher, "inspect_file", side_effect=replace_after_precheck) as inspecting, \
+                patch.object(content_inspection, "_read_stream") as read, \
+                patch("content_inspection.open", create=True) as path_open:
+            self.assertEqual(self.watcher.poll(), [])
+        inspecting.assert_called_once()
+        read.assert_not_called()
+        path_open.assert_not_called()
+        self.assertEqual(self.watcher.poll(), [])
+        with patch("content_inspection.open", create=True) as path_open:
+            events = self.watcher.poll()
+        path_open.assert_not_called()
+        self.assertEqual([(e["file_name"], e["action_taken"], e["policy_id"], e["file_hash_sha256"])
+                          for e in events],
+                         [(candidate.name, "WOULD_BLOCK", 11, hashlib.sha256(b"ALPHA").hexdigest())])
 
-            with patch("content_inspection.open", create=True, side_effect=redirect_open), \
-                    patch.object(usb_watcher, "_dry_run_version", side_effect=version_after_swap):
-                self.watcher.poll()
-        self.assertEqual(len(opened_outside), 0, "inspection opened the outside synthetic target")
-
-    @unittest.expectedFailure
     def test_directory_scan_remains_confined_when_root_is_swapped_after_validation(self):
-        original_scandir = os.scandir
-        enumerated_outside = []
-        with tempfile.TemporaryDirectory() as sibling:
-            outside = Path(sibling)
-            (outside / "synthetic-target.txt").write_text("ALPHA", encoding="utf-8")
+        self.write("candidate.txt", "BETA")
+        sibling = self.root.with_name("sibling")
+        sibling.mkdir()
+        (sibling / "synthetic-target.txt").write_text("ALPHA", encoding="utf-8")
+        parked = self.root.with_name("parked")
+        self.assertEqual(self.watcher.poll(), [])
+        original_names = _windows_dry_run.DirectoryScan.names
 
-            def redirect_scandir(directory):
-                if isinstance(directory, (str, bytes, os.PathLike)) and Path(os.fsdecode(directory)) == self.root:
-                    enumerated_outside.append(outside)
-                    directory = outside
-                return original_scandir(directory)
+        def replace_root_after_validation(scan):
+            self.root.rename(parked)
+            sibling.rename(self.root)
+            yield from original_names(scan)
 
-            with patch.object(usb_watcher.os, "scandir", side_effect=redirect_scandir):
+        with patch.object(_windows_dry_run.DirectoryScan, "names", autospec=True,
+                          side_effect=replace_root_after_validation) as names, \
+                patch.object(usb_watcher.os, "scandir") as scandir:
+            events = self.watcher.poll()
+        names.assert_called_once()
+        scandir.assert_not_called()
+        self.assertEqual([(e["file_name"], e["action_taken"], e["policy_id"]) for e in events],
+                         [("candidate.txt", "LOGGED", 22)])
+        with self.assertRaisesRegex(ValueError, "fixture directory was replaced"):
+            self.watcher.poll()
+
+    def test_content_and_hash_use_open_handle_after_child_rename(self):
+        candidate = self.write("candidate.txt", "BETA")
+        parked = self.root / "parked.txt"
+        self.assertEqual(self.watcher.poll(), [])
+        read_stream = content_inspection._read_stream
+        hash_stream = content_inspection._sha256_stream
+
+        def rename_before_read(stream, size):
+            candidate.rename(parked)
+            candidate.write_text("ALPHA", encoding="utf-8")
+            data = read_stream(stream, size)
+            self.assertEqual(data, b"BETA")
+            return data
+
+        def check_hash_source(stream):
+            digest = hash_stream(stream)
+            self.assertEqual(digest, hashlib.sha256(b"BETA").hexdigest())
+            return digest
+
+        with patch.object(content_inspection, "_read_stream", side_effect=rename_before_read) as read, \
+                patch.object(content_inspection, "_sha256_stream", side_effect=check_hash_source) as digest:
+            self.assertEqual(self.watcher.poll(), [])
+        read.assert_called_once()
+        digest.assert_called_once()
+
+    def test_close_is_idempotent_and_active_scan_keeps_its_own_handle(self):
+        path = self.write("candidate.txt", "BETA")
+        self.write("second.txt", "ALPHA")
+        root = self.watcher._fixture
+        pin = root._release.peek()[2][0]
+        with root.scan() as scan:
+            scan_handle = scan._handle
+            names = scan.names()
+            self.assertIn(next(names), {path.name, "second.txt"})
+            self.watcher.close()
+            self.watcher.close()
+            self.assert_native_handle_closed(pin)
+            self.assertIsNotNone(scan.version(path.name))
+            with self.assertRaisesRegex(ValueError, "fixture root is closed"):
                 self.watcher.poll()
-        self.assertEqual(len(enumerated_outside), 0, "scan traversed the outside synthetic directory")
+        self.assert_native_handle_closed(scan_handle)
+        with self.assertRaisesRegex(ValueError, "directory scan is closed"):
+            next(names)
+        with self.assertRaisesRegex(ValueError, "directory scan is closed"):
+            scan.version(path.name)
+
+    def test_binary_stream_closes_the_native_handle_on_setup_or_body_error(self):
+        path = self.write("candidate.txt", "BETA")
+        with self.watcher._fixture.scan() as scan:
+            for phase in ("open_osfhandle", "fdopen", "body"):
+                with self.subTest(phase=phase):
+                    handle = _windows_dry_run._open_relative(
+                        scan._handle, path.name, _windows_dry_run._FILE_READ_DATA,
+                        _windows_dry_run._SHARE_ALL, directory=False)
+                    with self.assertRaisesRegex(OSError, "synthetic stream failure"):
+                        if phase == "body":
+                            with _windows_dry_run._binary_stream(handle) as stream:
+                                self.assertEqual(stream.read(), b"BETA")
+                                raise OSError("synthetic stream failure")
+                        else:
+                            module = _windows_dry_run.msvcrt if phase == "open_osfhandle" else os
+                            with patch.object(module, phase, side_effect=OSError("synthetic stream failure")):
+                                with _windows_dry_run._binary_stream(handle):
+                                    self.fail("stream setup should fail")
+                    self.assert_native_handle_closed(handle)
+
+    def test_demo_fixture_cannot_open_handles_after_exit(self):
+        with _windows_dry_run.temporary_fixture(self.root) as fixture:
+            handle = fixture._handle
+            fixture.write_new("candidate.txt", b"BETA")
+        self.assert_native_handle_closed(handle)
+        self.assertEqual(list(self.root.iterdir()), [])
+        with self.assertRaisesRegex(ValueError, "demo fixture is closed"):
+            fixture.identity
+        with self.assertRaisesRegex(ValueError, "demo fixture is closed"):
+            fixture.write_new("later.txt", b"no")
+
+    def assert_native_handle_closed(self, handle):
+        with self.assertRaises(OSError) as invalid:
+            _windows_dry_run._identity(handle)
+        self.assertEqual(invalid.exception.winerror, 6)  # ERROR_INVALID_HANDLE
 
 
 class UsbWatcherManagerTests(unittest.TestCase):

@@ -1,8 +1,10 @@
 """List or observe Windows USB volumes, or run the isolated folder simulation."""
 import argparse
 import configparser
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import partial
 import json
 import os
 import re
@@ -239,81 +241,86 @@ class FolderWatcher:
 _DRY_RUN_ACTIONS = {"ALLOW": "ALLOW", "LOG": "LOGGED", "BLOCK": "WOULD_BLOCK"}
 
 
-def _is_reparse_point(info):
-    return bool(getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
-
-
-def _dry_run_version(path):
-    info = path.lstat()
-    if stat.S_ISREG(info.st_mode) and not _is_reparse_point(info):
-        return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+def _dry_run_filesystem():
+    if sys.platform != "win32":
+        raise ValueError("USB dry-run requires Windows handle-relative filesystem access")
+    import _windows_dry_run
+    return _windows_dry_run
 
 
 class DryRunFolderWatcher:
     """Return local inspection events from a trusted synthetic scratch directory.
 
-    The caller must control the directory and its ancestors. Path-based checks
-    detect some changes but cannot confine reads if another process can swap
-    directory or file entries between operations.
-
+    The caller supplies an owned fixture on a local NTFS volume. Windows handles
+    bind enumeration to that directory and content reads to validated files.
     Existing files form the baseline. Each poll checks direct children only.
     Root scan failures propagate to the caller. Failed or over-limit scans
     reset stability tracking and retain the reported history.
-    The dry-run demo uses this class only with its own temporary fixtures.
+    Call close() when finished to release the fixture's identity pin.
     """
 
-    def __init__(self, directory, policies, *, max_files=1024):
+    def __init__(self, directory, policies, *, max_files=1024, _expected_identity=None):
         if not isinstance(max_files, int) or max_files < 1:
             raise ValueError("max_files must be a positive integer")
         self.directory = Path(os.path.abspath(directory))
-        self._temp_root = Path(os.path.abspath(tempfile.gettempdir()))
-        if self.directory == self._temp_root or not self.directory.is_relative_to(self._temp_root):
+        temp_root = Path(os.path.abspath(tempfile.gettempdir()))
+        if self.directory == temp_root or not self.directory.is_relative_to(temp_root):
             raise ValueError("Dry-run requires a synthetic directory under the system temporary directory")
+        self.directory = temp_root / self.directory.relative_to(temp_root)
         self._max_files = max_files
         self._status = get_exit_point_status(policies, "USB")
-        self._previous = self._snapshot() or {}
-        self._reported = {path: (version, False) for path, version in self._previous.items()
-                          if version is not None}
+        self._filesystem = _dry_run_filesystem()
+        volume = self._filesystem.local_fixture_volume(self.directory.anchor)
+        self._fixture = self._filesystem.FixtureRoot(self.directory, volume, _expected_identity)
+        try:
+            with self._fixture.scan() as scan:
+                self._previous = self._snapshot(scan) or {}
+            self._reported = {path: (version, False) for path, version in self._previous.items()
+                              if version is not None}
+        except BaseException:
+            self._fixture.close()
+            raise
 
-    def _snapshot(self):
-        directory = self._temp_root
-        for part in (".", *self.directory.relative_to(directory).parts):
-            directory /= part
-            info = directory.lstat()
-            if not stat.S_ISDIR(info.st_mode) or _is_reparse_point(info):
-                raise ValueError("Dry-run directory must not traverse links or reparse points")
+    def close(self):
+        """Release the fixture's identity pin when polling is finished."""
+        self._fixture.close()
 
+    def _snapshot(self, scan):
         current = {}
-        with os.scandir(directory) as entries:
-            for entry in entries:
-                path = directory / entry.name
-                try:
-                    version = _dry_run_version(path)
-                except FileNotFoundError:
+        for name in scan.names():
+            path = self.directory / name
+            try:
+                version = scan.version(name)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                # Keep the entry present, but require fresh observations before inspecting.
+                current[path] = None
+            else:
+                if version is None:
                     continue
-                except OSError:
-                    # Keep the entry present, but require fresh observations before inspecting.
-                    current[path] = None
-                else:
-                    if version is None:
-                        continue
-                    current[path] = version
-                if len(current) > self._max_files:
-                    return None
+                current[path] = version
+            if len(current) > self._max_files:
+                return None
         return current
 
-    def _inspect_version(self, path, version):
-        if _dry_run_version(path) != version:
+    def _inspect_version(self, scan, path, version):
+        if scan.version(path.name) != version:
             return None
-        result = inspect_file(path, self._status, destination=str(self.directory))
-        return result if _dry_run_version(path) == version else None
+        result = inspect_file(path, self._status, destination=str(self.directory),
+                              open_stream=partial(scan.open_version, path.name, version))
+        return result if scan.version(path.name) == version else None
 
     def poll(self):
         try:
-            current = self._snapshot()
+            with self._fixture.scan() as scan:
+                return self._poll_scan(scan)
         except (OSError, ValueError):
             self._previous = {}
             raise
+
+    def _poll_scan(self, scan):
+        current = self._snapshot(scan)
         if current is None:
             self._previous = {}
             return []
@@ -324,11 +331,11 @@ class DryRunFolderWatcher:
             if version is None or self._previous.get(path) != version or reported == (version, False):
                 continue
             try:
-                result = self._inspect_version(path, version)
+                result = self._inspect_version(scan, path, version)
             except FileNotFoundError:
                 del current[path]
                 continue
-            except OSError:
+            except (OSError, self._filesystem.EntryChanged):
                 result = None
             if result is None:
                 current[path] = None
@@ -383,15 +390,14 @@ def dry_run_demo():
     ]
 
     print("USB DRY-RUN / SIMULATION")
-    with tempfile.TemporaryDirectory(prefix="dlp-usb-dry-run-") as directory:
-        root = Path(directory)
-        watcher = DryRunFolderWatcher(root, _demo_policies())
+    filesystem = _dry_run_filesystem()
+    temp_root = Path(os.path.abspath(tempfile.gettempdir()))
+    with filesystem.temporary_fixture(temp_root) as fixture, closing(
+        DryRunFolderWatcher(fixture.path, _demo_policies(), _expected_identity=fixture.identity)
+    ) as watcher:
         versions = {}
         for name, content in fixtures.items():
-            path = root / name
-            with path.open("xb") as stream:
-                stream.write(content)
-            version = _dry_run_version(path)
+            version = fixture.write_new(name, content)
             if version is None:
                 raise RuntimeError(f"Synthetic fixture is not a regular file: {name}")
             versions[name] = version
@@ -406,17 +412,21 @@ def dry_run_demo():
             if watcher.poll():
                 raise RuntimeError("Extra polls produced unexpected events.")
 
-        if {path.name for path in root.iterdir()} != fixtures.keys():
-            raise RuntimeError("The set of synthetic files changed.")
-        for name, content in fixtures.items():
-            path = root / name
-            if _dry_run_version(path) != versions[name] or path.read_bytes() != content:
-                raise RuntimeError(f"Synthetic file changed: {name}")
+        with watcher._fixture.scan() as scan:
+            if set(scan.names(include_other=True)) != fixtures.keys():
+                raise RuntimeError("The set of synthetic files changed.")
+            for name, content in fixtures.items():
+                try:
+                    with scan.open_version(name, versions[name]) as stream:
+                        if stream.read(len(content) + 1) != content:
+                            raise filesystem.EntryChanged
+                except (OSError, filesystem.EntryChanged) as error:
+                    raise RuntimeError(f"Synthetic file changed: {name}") from error
 
-        print(f"{'FILE':<16} {'VERDICT':<8} {'ACTION':<12} POLICY ID")
-        for name, verdict, action, policy_id in rows:
-            print(f"{name:<16} {verdict:<8} {action:<12} {policy_id}")
-        print("PASS: All 3 files unchanged. No duplicate events after 2 extra polls.")
+    print(f"{'FILE':<16} {'VERDICT':<8} {'ACTION':<12} POLICY ID")
+    for name, verdict, action, policy_id in rows:
+        print(f"{name:<16} {verdict:<8} {action:<12} {policy_id}")
+    print("PASS: All 3 files unchanged. No duplicate events after 2 extra polls.")
 
 
 def server_demo(config_path):

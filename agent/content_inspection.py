@@ -622,26 +622,34 @@ def scan_content_with_rules(text, rules):
 # ============================================================================
 # 8. QUYẾT ĐỊNH CHO 1 FILE
 # ============================================================================
+def _sha256_stream(stream):
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
 def sha256_file(path):
     try:
         if os.path.getsize(path) > MAX_HASH_BYTES:
             return None
-        h = hashlib.sha256()
         with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                h.update(chunk)
-        return h.hexdigest()
+            return _sha256_stream(f)
     except OSError:
         return None
 
 
+def _read_stream(stream, size):
+    limit = size if size <= MAX_FILE_BYTES else MAX_TEXT_READ_BYTES
+    return stream.read(limit)
+
+
 def _read_file(path, size, retries=3):
     """File có thể đang bị tiến trình khác ghi/khoá (đang copy ra USB) -> thử lại vài lần."""
-    limit = size if size <= MAX_FILE_BYTES else MAX_TEXT_READ_BYTES
     for attempt in range(retries):
         try:
             with open(path, "rb") as f:
-                return f.read(limit)
+                return _read_stream(f, size)
         except PermissionError:
             if attempt == retries - 1:
                 raise
@@ -677,7 +685,7 @@ def _verdict_for_violation(action):
 
 
 def inspect_file(path, status=None, rules=None, file_types=None, destination=None, *,
-                 enforce_file_scope=False, file_name=None):
+                 enforce_file_scope=False, file_name=None, open_stream=None):
     """Kiểm tra 1 file trước khi cho phép nó đi qua exit point.
 
     path        : đường dẫn file cần kiểm tra
@@ -687,6 +695,8 @@ def inspect_file(path, status=None, rules=None, file_types=None, destination=Non
     destination : đích đến (IP:port, ổ USB...) - dùng cho kiểm tra allowed_locations
     enforce_file_scope : bật bộ lọc đuôi file cho kênh yêu cầu
     file_name : tên file gốc nếu path trỏ đến bản sao tạm
+    open_stream : optional context manager factory for an already-confined binary
+                  stream. When supplied, path is used only as policy/report metadata.
 
     Trả về dict, trong đó 'verdict' là ALLOW | LOG | BLOCK.
     Agent tự đổi verdict BLOCK thành action_taken của kênh mình
@@ -700,6 +710,18 @@ def inspect_file(path, status=None, rules=None, file_types=None, destination=Non
 
     @lru_cache(maxsize=1)
     def read():
+        if open_stream is not None:
+            with open_stream() as stream:
+                size = os.fstat(stream.fileno()).st_size
+                data = _read_stream(stream, size)
+                digest = None
+                if size <= MAX_HASH_BYTES:
+                    try:
+                        stream.seek(0)
+                        digest = _sha256_stream(stream)
+                    except OSError:
+                        pass
+                return size, data, digest
         size = os.path.getsize(path)
         return size, _read_file(path, size), sha256_file(path)
 
