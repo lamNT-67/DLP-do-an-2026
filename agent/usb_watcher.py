@@ -1,14 +1,91 @@
-"""USB folder simulation. Run with --demo to exercise post-copy inspection."""
+"""List Windows USB disks or run the isolated USB folder simulation."""
 import argparse
 import configparser
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import re
 import stat
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
 from content_inspection import inspect_file, to_report_fields
 from policy_utils import get_exit_point_status
+
+
+WINDOWS_STORAGE_QUERY = r"""
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$disks = @(Get-Disk | Select-Object Number, Path, IsBoot, IsSystem,
+    @{Name='BusType'; Expression={[string]$_.BusType}})
+$partitions = @(Get-Partition | Select-Object DiskNumber,
+    @{Name='DriveLetter'; Expression={[string]$_.DriveLetter}})
+ConvertTo-Json -InputObject @{disks=$disks; partitions=$partitions} -Compress
+"""
+
+
+@dataclass(frozen=True)
+class UsbDisk:
+    number: int
+    drive_letters: tuple[str, ...]
+
+
+def usb_disks_from_storage(disks, partitions):
+    """Index USB data disks with drive letters by Windows device path."""
+    letters_by_number = {}
+    for partition in partitions:
+        letter = partition["DriveLetter"] or ""
+        if re.fullmatch(r"[A-Za-z]", letter):
+            letters_by_number.setdefault(partition["DiskNumber"], set()).add(letter.upper())
+
+    usb_disks = {}
+    for disk in disks:
+        if disk["BusType"].upper() != "USB" or disk["IsBoot"] or disk["IsSystem"]:
+            continue
+        number = disk["Number"]
+        letters = letters_by_number.get(number)
+        if letters:
+            device = disk["Path"] or f"disk:{number}"
+            usb_disks[device.casefold()] = UsbDisk(number, tuple(sorted(letters)))
+    return usb_disks
+
+
+def scan_windows_usb():
+    """Read Windows storage metadata without opening or changing any volume."""
+    if sys.platform != "win32":
+        raise RuntimeError("--list-usb requires Windows")
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_STORAGE_QUERY],
+            capture_output=True, encoding="utf-8", check=True, timeout=30,
+        )
+        storage = json.loads(result.stdout)
+        return usb_disks_from_storage(storage["disks"], storage["partitions"])
+    except subprocess.CalledProcessError as error:
+        detail = (error.stderr or "").strip() or str(error)
+        raise RuntimeError(f"Windows storage query failed: {detail}") from error
+    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError) as error:
+        raise RuntimeError(f"Cannot read Windows storage metadata: {error}") from error
+
+
+def usb_changes(previous, current):
+    """Return one removal or insertion per device missing from the other scan."""
+    return (
+        [("removed", previous[device]) for device in sorted(previous.keys() - current.keys())]
+        + [("inserted", current[device]) for device in sorted(current.keys() - previous.keys())]
+    )
+
+
+def list_usb():
+    disks = scan_windows_usb()
+    if not disks:
+        print("No USB data disks with assigned drive letters found.")
+        return
+    for disk in sorted(disks.values(), key=lambda disk: disk.number):
+        drives = ", ".join(f"{letter}:" for letter in disk.drive_letters)
+        print(f"Disk {disk.number} (USB): {drives}")
 
 
 def signature(path):
@@ -132,12 +209,25 @@ def server_demo(config_path):
         print("Remaining:", sorted(p.name for p in root.iterdir()))
 
 
-if __name__ == "__main__":
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--demo", required=True, action="store_true")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--demo", action="store_true", help="Run the isolated folder simulation")
+    mode.add_argument("--list-usb", action="store_true", help="List Windows USB data disks with drive letters")
     parser.add_argument("--config", help="Use a registered device config and send real demo reports")
-    args = parser.parse_args()
-    if args.config:
+    args = parser.parse_args(argv)
+    if args.list_usb:
+        if args.config is not None:
+            parser.error("--config requires --demo")
+        try:
+            list_usb()
+        except RuntimeError as error:
+            parser.exit(1, f"{error}\n")
+    elif args.config:
         server_demo(args.config)
     else:
         demo()
+
+
+if __name__ == "__main__":
+    main()
