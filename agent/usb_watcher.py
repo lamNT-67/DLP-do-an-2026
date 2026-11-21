@@ -1,4 +1,4 @@
-"""List Windows USB disks or run the isolated USB folder simulation."""
+"""List or observe Windows USB volumes, or run the isolated folder simulation."""
 import argparse
 import configparser
 from dataclasses import dataclass
@@ -9,6 +9,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from content_inspection import inspect_file, to_report_fields
@@ -24,6 +25,8 @@ $partitions = @(Get-Partition | Select-Object DiskNumber,
     @{Name='DriveLetter'; Expression={[string]$_.DriveLetter}})
 ConvertTo-Json -InputObject @{disks=$disks; partitions=$partitions} -Compress
 """
+MAX_OBSERVATION_ITERATIONS = 60
+MAX_OBSERVATION_INTERVAL = 60
 
 
 @dataclass(frozen=True)
@@ -102,10 +105,10 @@ def _usb_volume_keys(snapshot):
 
 
 class UsbWatcherManager:
-    """Drive synthetic volume watchers from snapshots keyed like scan_windows_usb().
+    """Drive volume watchers from snapshots keyed like scan_windows_usb().
 
     The required factory receives (device_id, drive_letter) and returns a watcher
-    with poll(). The caller supplies the isolated test roots.
+    with poll(). Real storage snapshots use inert watchers.
     """
 
     def __init__(self, snapshot_provider, watcher_factory):
@@ -160,6 +163,21 @@ def list_usb():
     for disk in sorted(disks.values(), key=lambda disk: disk.number):
         drives = ", ".join(f"{letter}:" for letter in disk.drive_letters)
         print(f"Disk {disk.number} (USB): {drives}")
+
+
+class _ObservationWatcher:
+    def poll(self):
+        """Track volume presence only, without accessing the volume."""
+
+
+def observe_usb(iterations, interval):
+    """Print volume lifecycle events from a bounded series of metadata scans."""
+    manager = UsbWatcherManager(scan_windows_usb, lambda _device, _letter: _ObservationWatcher())
+    for iteration in range(iterations):
+        if iteration and interval:
+            time.sleep(interval)
+        for event, _, letter in manager.tick():
+            print(f"{event} {letter}:", flush=True)
 
 
 def signature(path):
@@ -288,11 +306,34 @@ def main(argv=None):
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--demo", action="store_true", help="Run the isolated folder simulation")
     mode.add_argument("--list-usb", action="store_true", help="List Windows USB data disks with drive letters")
+    mode.add_argument("--observe-usb", action="store_true",
+                      help="Print volume events from bounded Windows storage scans")
+    parser.add_argument("--iterations", type=int,
+                        help=f"Number of observation scans (1-{MAX_OBSERVATION_ITERATIONS}, default 3)")
+    parser.add_argument("--interval", type=float,
+                        help=f"Seconds between observation scans (0-{MAX_OBSERVATION_INTERVAL}, default 2)")
     parser.add_argument("--config", help="Use a registered device config and send real demo reports")
     args = parser.parse_args(argv)
-    if args.list_usb:
-        if args.config is not None:
-            parser.error("--config requires --demo")
+    if args.config is not None and not args.demo:
+        parser.error("--config requires --demo")
+    if not args.observe_usb and (args.iterations is not None or args.interval is not None):
+        parser.error("--iterations and --interval require --observe-usb")
+
+    if args.observe_usb:
+        iterations = 3 if args.iterations is None else args.iterations
+        interval = 2 if args.interval is None else args.interval
+        if not 1 <= iterations <= MAX_OBSERVATION_ITERATIONS:
+            parser.error(f"--iterations must be between 1 and {MAX_OBSERVATION_ITERATIONS}")
+        if not 0 <= interval <= MAX_OBSERVATION_INTERVAL:
+            parser.error(f"--interval must be between 0 and {MAX_OBSERVATION_INTERVAL} seconds")
+        try:
+            observe_usb(iterations, interval)
+        except KeyboardInterrupt:
+            parser.exit(130, "USB observation interrupted.\n")
+        except (RuntimeError, ValueError):
+            # Storage-provider diagnostics may contain physical device identifiers.
+            parser.exit(1, "USB observation failed: could not read or validate Windows storage metadata.\n")
+    elif args.list_usb:
         try:
             list_usb()
         except RuntimeError as error:

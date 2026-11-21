@@ -168,6 +168,127 @@ class UsbCommandTests(unittest.TestCase):
             offline.assert_called_once_with()
 
 
+class UsbObserverTests(unittest.TestCase):
+    device = r"\synthetic\USBSTOR\serial-test"
+
+    def setUp(self):
+        scanner = patch.object(usb_watcher, "scan_windows_usb")
+        sleeper = patch.object(usb_watcher.time, "sleep")
+        self.scan = scanner.start()
+        self.sleep = sleeper.start()
+        self.addCleanup(scanner.stop)
+        self.addCleanup(sleeper.stop)
+
+    def snapshot(self, *letters):
+        return {self.device: usb_watcher.UsbDisk(3, letters)}
+
+    def observe(self, *snapshots):
+        self.scan.side_effect = snapshots
+        output = io.StringIO()
+        with redirect_stdout(output):
+            usb_watcher.main(["--observe-usb", "--iterations", str(len(snapshots)), "--interval", "0"])
+        return output.getvalue().splitlines()
+
+    def test_initial_scan_prints_letter_without_physical_identity(self):
+        self.assertEqual(self.observe(self.snapshot("F")), ["inserted F:"])
+
+    def test_stable_snapshots_emit_no_duplicate_events(self):
+        snapshot = self.snapshot("F")
+        self.assertEqual(self.observe(snapshot, snapshot, snapshot), ["inserted F:"])
+
+    def test_removal_and_reinsertion(self):
+        self.assertEqual(self.observe(self.snapshot("F"), {}, self.snapshot("F")),
+                         ["inserted F:", "removed F:", "inserted F:"])
+
+    def test_drive_letter_reassignment_on_same_device(self):
+        self.assertEqual(self.observe(self.snapshot("F"), self.snapshot("J")),
+                         ["inserted F:", "removed F:", "inserted J:"])
+
+    def test_multiple_volumes_have_separate_events(self):
+        self.assertEqual(self.observe(self.snapshot("G", "F"), self.snapshot("G")),
+                         ["inserted F:", "inserted G:", "removed F:"])
+
+    def test_empty_snapshots_exit_normally(self):
+        self.assertEqual(self.observe({}, {}), [])
+        self.assertEqual(self.scan.call_count, 2)
+
+    def test_storage_failure_exits_without_false_removal_or_identifier(self):
+        self.scan.side_effect = [self.snapshot("F"), RuntimeError(f"Access denied: {self.device}")]
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
+            usb_watcher.main(["--observe-usb", "--iterations", "3", "--interval", "1"])
+        self.assertEqual(raised.exception.code, 1)
+        self.assertEqual(stdout.getvalue().splitlines(), ["inserted F:"])
+        self.assertIn("could not read or validate Windows storage metadata", stderr.getvalue())
+        self.assertNotIn(self.device, stderr.getvalue())
+        self.assertEqual(self.scan.call_count, 2)
+        self.sleep.assert_called_once_with(1)
+
+    def test_invalid_observation_arguments_are_rejected_before_scanning(self):
+        for argv in (
+            ["--observe-usb", "--iterations", "0"],
+            ["--observe-usb", "--iterations", "-1"],
+            ["--observe-usb", "--iterations", "61"],
+            ["--observe-usb", "--iterations", "2.5"],
+            ["--observe-usb", "--interval", "-1"],
+            ["--observe-usb", "--interval", "61"],
+            ["--observe-usb", "--interval", "nan"],
+            ["--observe-usb", "--interval", "inf"],
+            ["--observe-usb", "--list-usb"],
+            ["--observe-usb", "--demo"],
+            ["--observe-usb", "--config", "synthetic.ini"],
+            ["--demo", "--interval", "2"],
+            ["--list-usb", "--iterations", "3"],
+        ):
+            with self.subTest(argv=argv), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    usb_watcher.main(argv)
+                self.assertEqual(raised.exception.code, 2)
+        self.scan.assert_not_called()
+        self.sleep.assert_not_called()
+
+    def test_iteration_limit_and_sleep_only_between_scans(self):
+        self.scan.return_value = {}
+        usb_watcher.main(["--observe-usb"])
+        self.assertEqual(self.scan.call_count, 3)
+        self.assertEqual(self.sleep.call_args_list, [call(2), call(2)])
+
+        self.scan.reset_mock()
+        self.sleep.reset_mock()
+        usb_watcher.main(["--observe-usb", "--iterations", "60", "--interval", "0"])
+        self.assertEqual(self.scan.call_count, 60)
+        self.sleep.assert_not_called()
+
+    def test_interruption_stops_cleanly_before_next_scan(self):
+        self.scan.return_value = self.snapshot("F")
+        self.sleep.side_effect = KeyboardInterrupt
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
+            usb_watcher.main(["--observe-usb"])
+        self.assertEqual(raised.exception.code, 130)
+        self.assertEqual(stdout.getvalue().splitlines(), ["inserted F:"])
+        self.assertEqual(stderr.getvalue(), "USB observation interrupted.\n")
+        self.scan.assert_called_once_with()
+
+    def test_observer_watcher_avoids_filesystem_access(self):
+        with patch.object(usb_watcher, "Path") as path, patch("builtins.open") as open_file, \
+                patch("os.open") as os_open, patch("os.scandir") as scandir, \
+                patch("os.listdir") as listdir:
+            self.assertEqual(self.observe(self.snapshot("F"), self.snapshot("F"), {}),
+                             ["inserted F:", "removed F:"])
+        for filesystem_call in (path, open_file, os_open, scandir, listdir):
+            filesystem_call.assert_not_called()
+
+    def test_observer_does_not_use_folder_watcher_or_server(self):
+        with patch.object(usb_watcher, "FolderWatcher") as folder, \
+                patch.object(usb_watcher, "inspect_file") as inspect, \
+                patch("policy_client.PolicyClient") as client:
+            self.assertEqual(self.observe(self.snapshot("F")), ["inserted F:"])
+        folder.assert_not_called()
+        inspect.assert_not_called()
+        client.assert_not_called()
+
+
 class UsbWatcherManagerTests(unittest.TestCase):
     def setUp(self):
         self.provider = Mock()
