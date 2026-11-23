@@ -46,7 +46,7 @@ def load_config(path="config.ini"):
     cfg = configparser.ConfigParser()
     if not Path(path).exists():
         raise FileNotFoundError("Khong tim thay %s." % path)
-    cfg.read(path)
+    cfg.read(path, encoding="utf-8-sig")
     return cfg
 
 
