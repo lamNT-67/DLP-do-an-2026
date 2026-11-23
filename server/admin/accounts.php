@@ -36,7 +36,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if (strlen($password) < 10) throw new RuntimeException('Mat khau phai co it nhat 10 ky tu.');
                 $stmt = $pdo->prepare("INSERT INTO admins (username, password_hash, full_name, role, is_active) VALUES (?, ?, ?, 'VIEWER', 1)");
                 $stmt->execute([$username, password_hash($password, PASSWORD_DEFAULT), $fullName]);
-                $message = 'Da tao tai khoan. Hay cap quyen trong danh sach ben duoi.';
+                $newUserId = (int)$pdo->lastInsertId();
+                $defaultPermission = $pdo->prepare("INSERT INTO admin_permissions (admin_id, module_key, can_view, can_edit) VALUES (?, ?, 1, 0)");
+                foreach ($modules as $moduleKey => $_moduleLabel) {
+                    $defaultPermission->execute([$newUserId, $moduleKey]);
+                }
+                $message = 'Da tao tai khoan voi quyen View mac dinh. Co the nang quyen Edit rieng tung muc.';
             } elseif ($action === 'permissions') {
                 $userId = (int)($_POST['user_id'] ?? 0);
                 if ($userId === (int)$_SESSION['admin_id']) throw new RuntimeException('Khong the thay doi quyen cua chinh tai khoan dang dang nhap.');
