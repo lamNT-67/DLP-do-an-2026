@@ -61,13 +61,23 @@
       nativeSet.call(this, name, value);
   };
   window.fetch = function(input, init) {
-    const body = init?.body || (input instanceof Request ? input.body : null);
-    const hit = inspect(body);
-    if (hit) {
-      deny(hit);
-      return Promise.reject(new DOMException("DLP blocked file upload", "NotAllowedError"));
+    if (!init || (typeof init !== "object" && typeof init !== "function")) {
+      return nativeFetch.apply(this, arguments);
     }
-    return nativeFetch.apply(this, arguments);
+    try {
+      const body = init.body;
+      const hit = inspect(body);
+      if (hit) {
+        deny(hit);
+        return Promise.reject(new DOMException("DLP blocked file upload", "NotAllowedError"));
+      }
+      // The next wrapper and Fetch must see the same body, including for a getter.
+      // Forward other Web IDL dictionary members, including inherited properties.
+      const options = new Proxy({}, {
+        get: (_, key) => key === "body" ? body : Reflect.get(init, key, init)
+      });
+      return nativeFetch.call(this, input, options);
+    } catch (error) { return Promise.reject(error); }
   };
   XMLHttpRequest.prototype.send = function(body) {
     const hit = inspect(body);

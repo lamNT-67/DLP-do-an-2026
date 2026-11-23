@@ -146,13 +146,19 @@ class BrowserGuard:
         channel = body.get("channel")
         name = _clean_name(body.get("file_name"))
         b64 = body.get("content_base64")
+        page_fetch = "initial_destination_hint" in body
+        hint = body.get("initial_destination_hint")
         if channel not in CHANNELS or not name or not isinstance(b64, str):
+            return 400, {"decision": "BLOCK", "reason": "INVALID_REQUEST"}
+        if page_fetch and not isinstance(hint, str):
             return 400, {"decision": "BLOCK", "reason": "INVALID_REQUEST"}
         status = self._status(channel)
         if status is None:
             return 200, {"decision": "BLOCK", "reason": "POLICY_UNAVAILABLE"}
+        # Picker approvals can only be reused when destination exceptions played no role.
+        reuse = not page_fetch and not status["allowed_locations"]
         if not status["is_governed"]:
-            return 200, {"decision": "ALLOW", "reason": "NOT_GOVERNED"}
+            return 200, {"decision": "ALLOW", "reason": "NOT_GOVERNED", "reusable_for_page_fetch": reuse}
         try:
             data = base64.b64decode(b64, validate=True)
         except ValueError:
@@ -164,20 +170,24 @@ class BrowserGuard:
         try:
             path = str(Path(tmpdir) / ("upload" + ("." + m.group(1) if m else "")))
             Path(path).write_bytes(data)
-            res = inspect_file(path, status, destination=dest, enforce_file_scope=True, file_name=name)
+            # A page's claimed target is for reporting only. It cannot grant an exception.
+            res = inspect_file(path, status, destination=None if page_fetch else dest,
+                               enforce_file_scope=True, file_name=name)
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
         res["file_path"], res["file_name"] = name, name   # khong lo duong dan tam
 
         if res["verdict"] == "ALLOW":
-            return 200, {"decision": "ALLOW", "reason": res["reason"]}
+            return 200, {"decision": "ALLOW", "reason": res["reason"], "reusable_for_page_fetch": reuse}
         status = decision_status(status, res)
         blocking = res["verdict"] == "BLOCK"
         action = "BLOCKED_BROWSER" if blocking else "LOGGED"
         peer = _peer_process(peer_port)
-        threading.Thread(target=self._record, args=(channel, status, res, action, dest, peer),
+        report_dest = re.sub(r"[^\x20-\x7e]", "", hint)[:255] if page_fetch else dest
+        threading.Thread(target=self._record, args=(channel, status, res, action, report_dest, peer),
                          daemon=True).start()
-        return 200, {"decision": "BLOCK" if blocking else "REPORT_ONLY", "reason": res["reason"]}
+        return 200, {"decision": "BLOCK" if blocking else "REPORT_ONLY", "reason": res["reason"],
+                     "reusable_for_page_fetch": reuse and not blocking}
 
     # ---- POST /event ----
     def event(self, body, dest, peer_port):
