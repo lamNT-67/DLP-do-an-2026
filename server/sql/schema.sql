@@ -176,9 +176,21 @@ CREATE TABLE admins (
     password_hash   VARCHAR(255) NOT NULL,
     full_name       VARCHAR(100),
     role            ENUM('SUPER_ADMIN','VIEWER') DEFAULT 'VIEWER',
+    is_active       BOOLEAN NOT NULL DEFAULT TRUE,
     created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
     last_login      DATETIME
 );
+
+-- Per-module permissions for non-Super-Admin accounts.
+CREATE TABLE IF NOT EXISTS admin_permissions (
+    admin_id INT NOT NULL,
+    module_key VARCHAR(50) NOT NULL,
+    can_view BOOLEAN NOT NULL DEFAULT FALSE,
+    can_edit BOOLEAN NOT NULL DEFAULT FALSE,
+    PRIMARY KEY (admin_id, module_key),
+    CONSTRAINT fk_admin_permissions_admin
+        FOREIGN KEY (admin_id) REFERENCES admins(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Wazuh SIEM destination for future DLP event forwarding (configuration only).
 CREATE TABLE IF NOT EXISTS wazuh_settings (
