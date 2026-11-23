@@ -29,19 +29,23 @@ import argparse
 import configparser
 import datetime
 import getpass
+import json
 import os
 import signal
 import socket
 import sys
 import threading
 import time
+import uuid
+from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 import psutil
 
 from content_inspection import (BLOCK_MIN_LEVEL, DEFAULT_FILE_TYPES, DEFAULT_RULES, _LEVEL_IDX,
                                 inspect_file, scan_text, to_log_inspection, to_report_fields)
-from log_writer import write_log_event
+from log_writer import write_clipboard_delivery_status, write_log_event
 from policy_utils import decision_status, evaluate_policies, get_exit_point_status
 
 POLICY_REFRESH_SECONDS = 60
@@ -53,6 +57,14 @@ NOTICE_IMAGE = "[DLP] Ảnh chụp màn hình đã bị chặn theo chính sách
 NOTICE_FILES = "[DLP] Không được sao chép file nhạy cảm: {name}."
 ACTION_BLOCK = "BLOCKED_DELETE"   # server chưa có action riêng cho clipboard -> dùng BLOCKED_DELETE
 HOTKEY_LOG_GAP_SECONDS = 2        # giữ phím lâu / bấm liên tục: chỉ ghi log 1 lần mỗi 2 giây
+
+
+class ClipboardEnforcement(NamedTuple):
+    state: str
+    reason: str | None = None
+
+
+CLIPBOARD_REPLACED = ClipboardEnforcement("REPLACED")
 
 
 def _now_iso():
@@ -88,12 +100,12 @@ def screenshot_folders():
 # 1. LOGIC QUYẾT ĐỊNH (không phụ thuộc Windows -> test được ở mọi máy)
 # ============================================================================
 class ClipboardGuard:
-    """Nhận sự kiện clipboard, hỏi policy + bộ não, trả về có xoá clipboard không."""
+    """Evaluate clipboard policy and record the result of the supplied replacement operation."""
 
     def __init__(self, hostname, get_policies, reporter=None):
         self.hostname = hostname
         self.get_policies = get_policies   # hàm trả về applicable_policies hiện tại
-        self.reporter = reporter           # hàm gửi report lên server (hoặc None)
+        self.reporter = reporter           # Returns the acknowledged server log ID or None.
         self.user = getpass.getuser()
         self._known_shots = {}             # thư mục Screenshots -> tập file đã thấy
         self._killed_pids = set()
@@ -121,18 +133,71 @@ class ClipboardGuard:
         }
         if report_fields:
             payload.update(report_fields)
-        reported = False
-        if self.reporter:
-            threading.Thread(target=self.reporter, args=(payload,), daemon=True).start()
-            reported = True  # gửi nền, không chặn vòng lặp tin nhắn của Windows
-        write_log_event(self.hostname, "clipboard", exit_point,
-                        "violation" if action != "LOGGED" else "logged", status["effective_action"],
-                        {"process_name": owner, "process_pid": None, "user": self.user},
-                        target, inspection, action, reported)
+
+        event_id = uuid.uuid4().hex
+        reporter = self.reporter
+        try:
+            write_log_event(self.hostname, "clipboard", exit_point,
+                            "violation" if action != "LOGGED" else "logged", status["effective_action"],
+                            {"process_name": owner, "process_pid": None, "user": self.user},
+                            target, inspection, action, False, event_id=event_id,
+                            policy_id=payload["policy_id"], report_configured=reporter is not None, durable=True)
+        except (OSError, UnicodeError):
+            event_id = None
+            _say("Khong ghi duoc log clipboard.")
+
+        if reporter is None:
+            return
+
+        def record_delivery(status, server_log_id=None):
+            if event_id is None:
+                return
+            try:
+                write_clipboard_delivery_status(event_id, status, server_log_id=server_log_id)
+            except OSError:
+                _say("Khong ghi duoc trang thai gui bao cao clipboard.")
+
+        def report():
+            try:
+                server_log_id = reporter(payload)
+            except Exception:
+                server_log_id = None
+            if type(server_log_id) is int and server_log_id > 0:
+                record_delivery("ACKNOWLEDGED", server_log_id)
+            else:
+                record_delivery("UNACKNOWLEDGED")
+                _say("Khong nhan duoc xac nhan bao cao clipboard tu server.")
+
+        try:
+            threading.Thread(target=report, daemon=True).start()
+        except RuntimeError:
+            record_delivery("NOT_STARTED")
+            _say("Khong khoi dong duoc luong gui bao cao clipboard.")
+
+    @staticmethod
+    def _enforce_clipboard(replace, notice):
+        if replace is None:
+            return ClipboardEnforcement("UNCHANGED", "NOT_ATTEMPTED")
+        try:
+            outcome = replace(notice)
+        except Exception:
+            return ClipboardEnforcement("UNCERTAIN", "REPLACEMENT_ERROR")
+        if isinstance(outcome, ClipboardEnforcement):
+            return outcome
+        return ClipboardEnforcement("UNCERTAIN", "INVALID_RESULT")
+
+    def _record_clipboard_result(self, exit_point, status, outcome, owner, target, inspection, report_fields=None):
+        if outcome is not None:
+            inspection = dict(inspection, enforcement_result=outcome.state)
+            if outcome.reason is not None:
+                inspection["enforcement_reason"] = outcome.reason
+            report_fields = dict(report_fields or {}, enforcement_result=outcome.state)
+        action = ACTION_BLOCK if outcome == CLIPBOARD_REPLACED else "LOGGED"
+        self._record(exit_point, status, action, owner, target, inspection, report_fields)
 
     # -------------------------------------------------- chữ
-    def on_text(self, text, owner=None):
-        """Trả về (xoá_clipboard: bool, dòng_thông_báo | None)."""
+    def on_text(self, text, owner=None, *, replace=None):
+        """Return the policy's block decision and notice."""
         status = self._status("CLIPBOARD")
         if not status["is_governed"] or not text.strip():
             return False, None
@@ -153,55 +218,63 @@ class ClipboardGuard:
         if result["verdict"] == "ALLOW":
             return False, None
         block = result["verdict"] == "BLOCK"
-        action = ACTION_BLOCK if block else "LOGGED"
         status = decision_status(status, result)
-        if result["reason"] != "CONTENT_MATCH":
-            self._record("CLIPBOARD", status, action, owner,
-                         {"destination_domain": "Clipboard", "file_path": None},
-                         {"verdict": result["verdict"], "reason": result["reason"]})
-            return block, NOTICE_TEXT.format(rules="kênh bị khoá")
-        self._record("CLIPBOARD", status, action, owner,
-                     {"destination_domain": "Clipboard", "file_path": None}, to_log_inspection(result),
-                     {"matched_rule_ids": result["matched_rule_ids"],
-                      "confidence_score": result["confidence_level"]})
-        names = ", ".join(result["matched_rule_names"])
-        _say("%s chu (%s, %s) tu %s" % ("CHAN" if block else "GHI NHAN", names,
-                                         result["confidence_level"], owner or "?"))
-        return block, NOTICE_TEXT.format(rules=names)
+        if result["reason"] == "CONTENT_MATCH":
+            names = ", ".join(result["matched_rule_names"])
+            inspection = to_log_inspection(result)
+            report_fields = {"matched_rule_ids": result["matched_rule_ids"],
+                             "confidence_score": result["confidence_level"]}
+        else:
+            names = "kênh bị khoá"
+            inspection = {"verdict": result["verdict"], "reason": result["reason"]}
+            report_fields = None
+        notice = NOTICE_TEXT.format(rules=names)
+        outcome = self._enforce_clipboard(replace, notice) if block else None
+        self._record_clipboard_result("CLIPBOARD", status, outcome, owner,
+                                      {"destination_domain": "Clipboard", "file_path": None},
+                                      inspection, report_fields)
+        if report_fields is not None:
+            _say("%s chu (%s, %s) tu %s" % ("CHAN" if outcome == CLIPBOARD_REPLACED else "GHI NHAN",
+                                             names, result["confidence_level"], owner or "?"))
+        return block, notice
 
     # -------------------------------------------------- file copy trong Explorer
-    def on_files(self, paths, owner=None):
+    def on_files(self, paths, owner=None, *, replace=None):
         status = self._status("CLIPBOARD")
         if not status["is_governed"]:
             return False, None
+        findings = []
         blocked_name = None
         for path in [p for p in paths if os.path.isfile(p)][:MAX_FILES_PER_COPY]:
             res = inspect_file(path, status)
             if res["verdict"] == "ALLOW":
                 continue
-            action = ACTION_BLOCK if res["verdict"] == "BLOCK" else "LOGGED"
-            self._record("CLIPBOARD", decision_status(status, res), action, owner,
-                         {"destination_domain": "Clipboard (copy file)", "file_path": path},
-                         to_log_inspection(res), to_report_fields(res))
-            _say("%s file %s (%s, %s)" % ("CHAN" if action != "LOGGED" else "GHI NHAN",
-                                         res["file_name"], res["reason"], res["confidence_level"]))
-            if action != "LOGGED" and blocked_name is None:
+            findings.append(res)
+            if res["verdict"] == "BLOCK" and blocked_name is None:
                 blocked_name = res["file_name"]
-        if blocked_name:
-            return True, NOTICE_FILES.format(name=blocked_name)
-        return False, None
+        notice = NOTICE_FILES.format(name=blocked_name) if blocked_name else None
+        outcome = self._enforce_clipboard(replace, notice) if notice else None
+        for res in findings:
+            file_outcome = outcome if res["verdict"] == "BLOCK" else None
+            self._record_clipboard_result("CLIPBOARD", decision_status(status, res), file_outcome, owner,
+                                          {"destination_domain": "Clipboard (copy file)", "file_path": res["file_path"]},
+                                          to_log_inspection(res), to_report_fields(res))
+            _say("%s file %s (%s, %s)" % ("CHAN" if file_outcome == CLIPBOARD_REPLACED else "GHI NHAN",
+                                         res["file_name"], res["reason"], res["confidence_level"]))
+        return bool(notice), notice
 
     # -------------------------------------------------- ảnh (chụp màn hình)
-    def on_image(self, owner=None):
+    def on_image(self, owner=None, *, replace=None):
         status = self._status("SCREEN_CAPTURE")
         if not status["is_governed"]:
             return False, None
         block = status["effective_action"] == "BLOCK"
-        action = ACTION_BLOCK if block else "LOGGED"
-        self._record("SCREEN_CAPTURE", status, action, owner,
-                     {"destination_domain": "Clipboard (anh)", "file_path": None},
-                     {"verdict": "BLOCK" if block else "LOG", "reason": "SCREENSHOT_IN_CLIPBOARD"})
-        _say("%s anh trong clipboard (tu %s)" % ("CHAN" if block else "GHI NHAN", owner or "PrintScreen"))
+        outcome = self._enforce_clipboard(replace, NOTICE_IMAGE) if block else None
+        self._record_clipboard_result("SCREEN_CAPTURE", status, outcome, owner,
+                                      {"destination_domain": "Clipboard (anh)", "file_path": None},
+                                      {"verdict": "BLOCK" if block else "LOG", "reason": "SCREENSHOT_IN_CLIPBOARD"})
+        _say("%s anh trong clipboard (tu %s)" % ("CHAN" if outcome == CLIPBOARD_REPLACED else "GHI NHAN",
+                                                  owner or "PrintScreen"))
         return block, NOTICE_IMAGE
 
     # -------------------------------------------------- phím chụp màn hình
@@ -216,7 +289,7 @@ class ClipboardGuard:
         if now - self._last_hotkey_log.get(combo, -1e9) >= HOTKEY_LOG_GAP_SECONDS:
             self._last_hotkey_log[combo] = now
             action = ACTION_BLOCK if block else "LOGGED"
-            threading.Thread(target=self._record, daemon=True, args=(
+            threading.Thread(target=self._record, daemon=False, args=(
                 "SCREEN_CAPTURE", status, action, "Ban phim: " + combo,
                 {"destination_domain": "Phim chup man hinh", "file_path": None},
                 {"verdict": "BLOCK" if block else "LOG", "reason": "SCREENSHOT_HOTKEY"})).start()
@@ -288,14 +361,14 @@ def is_screenshot(data, owner):
     return data["image"] and not (data["text"] or "").strip() and not data["files"]
 
 
-def route_clipboard(guard, data, owner):
+def route_clipboard(guard, data, owner, *, replace=None):
     """Quyết định nội dung clipboard thuộc loại nào và giao cho đúng hàm xử lý."""
     if data["files"]:
-        return guard.on_files(data["files"], owner)
+        return guard.on_files(data["files"], owner, replace=replace)
     if is_screenshot(data, owner):
-        return guard.on_image(owner)
+        return guard.on_image(owner, replace=replace)
     if data["text"]:
-        return guard.on_text(data["text"], owner)
+        return guard.on_text(data["text"], owner, replace=replace)
     return False, None
 
 
@@ -362,6 +435,25 @@ class HotkeyFilter:
 CF_TEXT_UNICODE, CF_HDROP, CF_BITMAP, CF_DIB, CF_DIBV5 = 13, 15, 2, 8, 17
 WM_CLIPBOARDUPDATE, WM_TIMER = 0x031D, 0x0113
 GMEM_MOVEABLE = 0x0002
+SCREENSHOT_TIMER, CLIPBOARD_READ_TIMER = 1, 2
+CLIPBOARD_QUIET_NS = 25_000_000
+CLIPBOARD_DEFERRAL_CAP_NS = 50_000_000
+USER_TIMER_MINIMUM_NS = 10_000_000
+CLIPBOARD_OWNER_CHANGED = object()
+
+
+@dataclass
+class PendingClipboardRead:
+    started_ns: int
+    due_ns: int
+    sequence: int
+    coalesced: int = 0
+    superseded: int = 0
+
+    def observe_sequence(self, sequence):
+        if self.sequence and sequence and sequence != self.sequence:
+            self.superseded += 1
+        self.sequence = sequence
 
 
 def _load_win32():
@@ -402,6 +494,7 @@ def _load_win32():
         (user32, "DispatchMessageW"): ([ctypes.POINTER(w.MSG)], LRESULT),
         (user32, "PostQuitMessage"): ([ctypes.c_int], None),
         (user32, "SetTimer"): ([w.HWND, ctypes.c_size_t, w.UINT, ctypes.c_void_p], ctypes.c_size_t),
+        (user32, "KillTimer"): ([w.HWND, ctypes.c_size_t], w.BOOL),
         (user32, "OpenClipboard"): ([w.HWND], w.BOOL),
         (user32, "CloseClipboard"): ([], w.BOOL),
         (user32, "EmptyClipboard"): ([], w.BOOL),
@@ -410,6 +503,7 @@ def _load_win32():
         (user32, "SetClipboardData"): ([w.UINT, w.HANDLE], w.HANDLE),
         (user32, "GetClipboardSequenceNumber"): ([], w.DWORD),
         (user32, "GetClipboardOwner"): ([], w.HWND),
+        (user32, "GetOpenClipboardWindow"): ([], w.HWND),
         (user32, "GetWindowThreadProcessId"): ([w.HWND, ctypes.POINTER(w.DWORD)], w.DWORD),
         (user32, "RegisterClipboardFormatW"): ([w.LPCWSTR], w.UINT),
         (kernel32, "GlobalLock"): ([w.HANDLE], ctypes.c_void_p),
@@ -429,11 +523,13 @@ def _load_win32():
 class ClipboardWatcher:
     """Cửa sổ ẩn nhận thông báo WM_CLIPBOARDUPDATE mỗi khi clipboard thay đổi."""
 
-    def __init__(self, guard):
+    def __init__(self, guard, *, trace_native_clipboard=False, defer_clipboard_read=False):
         (self.ct, self.w, self.user32, self.kernel32, self.shell32,
          WNDPROC, WNDCLASSW, HOOKPROC, self.KBD) = _load_win32()
         self.guard = guard
-        self._own_seq = None
+        self.trace_native_clipboard = trace_native_clipboard
+        self.defer_clipboard_read = defer_clipboard_read
+        self._pending_clipboard_read = None
         self.cf_png = self.user32.RegisterClipboardFormatW("PNG")
         self._proc = WNDPROC(self._wndproc)  # giữ tham chiếu, không thì bị thu hồi -> crash
         hinst = self.kernel32.GetModuleHandleW(None)
@@ -447,7 +543,7 @@ class ClipboardWatcher:
             raise OSError("Khong tao duoc cua so lang nghe (loi %d)" % self.ct.get_last_error())
         if not self.user32.AddClipboardFormatListener(self.hwnd):
             raise OSError("AddClipboardFormatListener that bai (loi %d)" % self.ct.get_last_error())
-        self.user32.SetTimer(self.hwnd, 1, TICK_MS, None)
+        self.user32.SetTimer(self.hwnd, SCREENSHOT_TIMER, TICK_MS, None)
         # Hook bàn phím mức thấp: chạy trên chính luồng có vòng lặp tin nhắn này
         self.keys = HotkeyFilter(self.guard.on_screenshot_hotkey)
         self._hook_proc = HOOKPROC(self._keyboard_hook)  # giữ tham chiếu, tránh bị thu hồi
@@ -468,6 +564,10 @@ class ClipboardWatcher:
                 self.user32.DispatchMessageW(self.ct.byref(msg))
         finally:
             signal.signal(signal.SIGINT, old_handler)
+            if self._pending_clipboard_read is not None:
+                self._pending_clipboard_read = None
+                self.user32.KillTimer(self.hwnd, CLIPBOARD_READ_TIMER)
+                self._clipboard_diagnostic("read_abandoned_on_shutdown")
             self.user32.RemoveClipboardFormatListener(self.hwnd)
             if self.hook:
                 self.user32.UnhookWindowsHookEx(self.hook)
@@ -491,17 +591,71 @@ class ClipboardWatcher:
     def _wndproc(self, hwnd, msg, wparam, lparam):
         try:
             if msg == WM_CLIPBOARDUPDATE:
-                self._on_clipboard_update()
+                if self.defer_clipboard_read:
+                    self._schedule_clipboard_read()
+                else:
+                    self._on_clipboard_update()
                 return 0
             if msg == WM_TIMER:
-                self.guard.tick()
+                if wparam == SCREENSHOT_TIMER:
+                    self.guard.tick()
+                elif wparam == CLIPBOARD_READ_TIMER:
+                    pending = self._pending_clipboard_read
+                    now = time.monotonic_ns()
+                    # KillTimer can leave an old message queued.
+                    if pending is not None and now >= pending.due_ns:
+                        self._dispatch_pending_read(now)
                 return 0
         except KeyboardInterrupt:
             self.user32.PostQuitMessage(0)
             return 0
         except Exception as e:  # lỗi trong callback không được làm chết agent
-            _say("Loi xu ly: %s: %s" % (type(e).__name__, e))
+            _say("Loi xu ly: %s" % type(e).__name__)
         return self.user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    def _clipboard_diagnostic(self, event, **fields):
+        try:
+            _say("clipboard_inspection " + json.dumps(dict(event=event, **fields), separators=(",", ":")))
+        except OSError:
+            pass
+
+    def _schedule_clipboard_read(self):
+        now = time.monotonic_ns()
+        sequence = self.user32.GetClipboardSequenceNumber()
+        pending = self._pending_clipboard_read
+        if pending is None:
+            pending = PendingClipboardRead(now, now + CLIPBOARD_QUIET_NS, sequence)
+            self._pending_clipboard_read = pending
+        else:
+            pending.coalesced += 1
+            pending.observe_sequence(sequence)
+            if now >= pending.due_ns:
+                self._dispatch_pending_read(now)
+                return
+            due_ns = min(now + CLIPBOARD_QUIET_NS, pending.started_ns + CLIPBOARD_DEFERRAL_CAP_NS)
+            # Keep the earlier timer if Windows would round a rearm past the cap.
+            if due_ns == pending.due_ns or due_ns - now < USER_TIMER_MINIMUM_NS:
+                return
+            pending.due_ns = due_ns
+        delay_ms = (pending.due_ns - now + 999_999) // 1_000_000
+        if not self.user32.SetTimer(self.hwnd, CLIPBOARD_READ_TIMER, delay_ms, None):
+            self._dispatch_pending_read(now, timer_error=self.ct.get_last_error())
+
+    def _dispatch_pending_read(self, now, *, timer_error=None):
+        pending = self._pending_clipboard_read
+        self._pending_clipboard_read = None
+        self.user32.KillTimer(self.hwnd, CLIPBOARD_READ_TIMER)
+        try:
+            self._on_clipboard_update(pending)
+        finally:
+            if self.trace_native_clipboard or pending.coalesced or pending.superseded or timer_error is not None:
+                self._clipboard_diagnostic(
+                    "timer_fallback" if timer_error is not None else "deferred_read",
+                    deferral_ms=(now - pending.started_ns) / 1e6,
+                    coalesced_notifications=pending.coalesced,
+                    observed_sequence_changes=pending.superseded,
+                    timer_error=timer_error,
+                )
 
     # -------------------------------------------------- đọc / ghi clipboard
     def _open(self):
@@ -511,8 +665,52 @@ class ClipboardWatcher:
             time.sleep(0.02)
         return False
 
-    def _owner_name(self):
-        owner = self.user32.GetClipboardOwner()
+    def _start_native_trace(self):
+        if self.trace_native_clipboard:
+            return {"started_utc": _now_iso(), "started_ns": time.perf_counter_ns()}
+        return None
+
+    def _finish_native_trace(self, phase, trace, *, closed=None, close_error=None):
+        if trace is not None:
+            finished_ns = time.perf_counter_ns()
+            started_ns = trace.pop("started_ns")
+            opened_ns = trace.pop("opened_ns", None)
+            trace.update(
+                phase=phase, pid=os.getpid(), tid=threading.get_native_id(), hwnd=hex(self.hwnd),
+                finished_utc=_now_iso(), open_ok=opened_ns is not None, close_ok=closed,
+                open_ms=(finished_ns - started_ns if opened_ns is None else opened_ns - started_ns) / 1e6,
+                hold_until_close_return_ms=None if opened_ns is None else (finished_ns - opened_ns) / 1e6,
+                close_error=close_error,
+            )
+            if closed is False:
+                opener = self.user32.GetOpenClipboardWindow()
+                trace["opener_after_failed_close"] = hex(opener) if opener else None
+            message = "clipboard_native " + json.dumps(trace, separators=(",", ":"))
+        elif closed is False:
+            message = "CloseClipboard failed phase=%s winerror=%d" % (phase, close_error)
+        else:
+            return
+        try:
+            _say(message)
+        except OSError:
+            pass  # Diagnostic output must not change the clipboard result.
+
+    def _close_clipboard(self, phase, trace):
+        closed = bool(self.user32.CloseClipboard())
+        error = None if closed else self.ct.get_last_error()
+        self._finish_native_trace(phase, trace, closed=closed, close_error=error)
+        return closed
+
+    def _get_clipboard_data(self, clipboard_format, trace):
+        if trace is None:
+            return self.user32.GetClipboardData(clipboard_format)
+        started_ns = time.perf_counter_ns()
+        try:
+            return self.user32.GetClipboardData(clipboard_format)
+        finally:
+            trace.setdefault("get_data_ms", {})[clipboard_format] = (time.perf_counter_ns() - started_ns) / 1e6
+
+    def _owner_name(self, owner):
         if not owner:
             return None
         pid = self.w.DWORD()
@@ -522,71 +720,145 @@ class ClipboardWatcher:
         except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError):
             return None
 
-    def _read(self):
-        """Đọc nhanh rồi đóng clipboard ngay, để không giữ chân ứng dụng khác."""
-        u = self.user32
-        data = {"text": None, "files": [], "image": False}
+    def _read(self, pending=None):
+        """Snapshot data, owner, and sequence under the same clipboard lock."""
+        trace = self._start_native_trace()
+        unreadable = set() if pending is not None else None
         if not self._open():
+            self._finish_native_trace("read", trace)
+            if pending is not None:
+                self._clipboard_diagnostic("read_open_failed")
             return None
         try:
-            if u.IsClipboardFormatAvailable(CF_HDROP):
-                h = u.GetClipboardData(CF_HDROP)
-                if h:
-                    count = self.shell32.DragQueryFileW(h, 0xFFFFFFFF, None, 0)
-                    for i in range(min(count, MAX_FILES_PER_COPY)):
-                        n = self.shell32.DragQueryFileW(h, i, None, 0)
-                        buf = self.ct.create_unicode_buffer(n + 1)
-                        self.shell32.DragQueryFileW(h, i, buf, n + 1)
-                        data["files"].append(buf.value)
-            if u.IsClipboardFormatAvailable(CF_TEXT_UNICODE):
-                h = u.GetClipboardData(CF_TEXT_UNICODE)
-                if h:
-                    p = self.kernel32.GlobalLock(h)
-                    if p:
-                        try:
-                            size = self.kernel32.GlobalSize(h) // 2
-                            data["text"] = self.ct.wstring_at(p, size).split("\0", 1)[0]
-                        finally:
-                            self.kernel32.GlobalUnlock(h)
-            data["image"] = any(u.IsClipboardFormatAvailable(f)
-                                for f in (CF_BITMAP, CF_DIB, CF_DIBV5, self.cf_png) if f)
+            if trace is not None:
+                trace["opened_ns"] = time.perf_counter_ns()
+            snapshot = self._read_open_clipboard(trace, pending, unreadable)
         finally:
-            u.CloseClipboard()
-        return data
+            closed = self._close_clipboard("read", trace)
+            if unreadable:
+                self._clipboard_diagnostic("unreadable_advertised_formats", formats=sorted(unreadable))
+        if closed and snapshot is CLIPBOARD_OWNER_CHANGED:
+            self._clipboard_diagnostic("owner_changed_during_read")
+            return None
+        if closed and snapshot is not None and unreadable:
+            snapshot[0]["unreadable_formats"] = unreadable
+        return snapshot if closed else None
 
-    def _replace_with_notice(self, notice, seq_before):
-        """Xoá clipboard, thay bằng dòng thông báo (paste ra sẽ thấy lý do bị chặn)."""
+    def _read_open_clipboard(self, trace, pending, unreadable):
+        u = self.user32
+        owner = u.GetClipboardOwner()
+        if pending is not None:
+            # Sample before requesting data, since rendering can advance the sequence.
+            pending.observe_sequence(u.GetClipboardSequenceNumber())
+        if trace is not None:
+            trace["owner_hwnd"] = hex(owner) if owner else None
+        if owner == self.hwnd:
+            return None  # An update caused by our own notice or by clearing the clipboard.
+
+        data = {"text": None, "files": [], "image": False}
+        if u.IsClipboardFormatAvailable(CF_HDROP):
+            if unreadable is not None:
+                unreadable.add(CF_HDROP)
+            h = self._get_clipboard_data(CF_HDROP, trace)
+            if h:
+                count = self.shell32.DragQueryFileW(h, 0xFFFFFFFF, None, 0)
+                for i in range(min(count, MAX_FILES_PER_COPY)):
+                    n = self.shell32.DragQueryFileW(h, i, None, 0)
+                    buf = self.ct.create_unicode_buffer(n + 1)
+                    self.shell32.DragQueryFileW(h, i, buf, n + 1)
+                    data["files"].append(buf.value)
+                if unreadable is not None and data["files"] and all(data["files"]):
+                    unreadable.discard(CF_HDROP)
+        if u.IsClipboardFormatAvailable(CF_TEXT_UNICODE):
+            if unreadable is not None:
+                unreadable.add(CF_TEXT_UNICODE)
+            h = self._get_clipboard_data(CF_TEXT_UNICODE, trace)
+            if h:
+                p = self.kernel32.GlobalLock(h)
+                if p:
+                    try:
+                        size = self.kernel32.GlobalSize(h) // 2
+                        data["text"] = self.ct.wstring_at(p, size).split("\0", 1)[0]
+                        if unreadable is not None and size:
+                            unreadable.discard(CF_TEXT_UNICODE)
+                    finally:
+                        self.kernel32.GlobalUnlock(h)
+        data["image"] = any(u.IsClipboardFormatAvailable(f)
+                            for f in (CF_BITMAP, CF_DIB, CF_DIBV5, self.cf_png) if f)
+        if pending is not None and u.GetClipboardOwner() != owner:
+            return CLIPBOARD_OWNER_CHANGED
+        # Reading a delayed format can itself advance the sequence.
+        return data, owner, u.GetClipboardSequenceNumber()
+
+    def _replace_with_notice(self, notice, seq_before, owner_before=None):
+        """Replace the inspected clipboard snapshot and return the observed outcome."""
         u, k = self.user32, self.kernel32
+        if not seq_before:
+            return ClipboardEnforcement("UNCHANGED", "SEQUENCE_UNAVAILABLE")
         if u.GetClipboardSequenceNumber() != seq_before:
-            return  # người dùng đã copy cái khác trong lúc đang quét -> không xoá nhầm
-        if not self._open():
-            _say("Khong mo duoc clipboard de xoa!")
-            return
+            return ClipboardEnforcement("UNCHANGED", "SEQUENCE_CHANGED")
         try:
-            u.EmptyClipboard()
             raw = (notice + "\0").encode("utf-16-le")
-            hmem = k.GlobalAlloc(GMEM_MOVEABLE, len(raw))
-            p = k.GlobalLock(hmem) if hmem else None
-            if p:
+        except (UnicodeError, MemoryError):
+            return ClipboardEnforcement("UNCHANGED", "NOTICE_WRITE_FAILED")
+        hmem = k.GlobalAlloc(GMEM_MOVEABLE, len(raw))
+        if not hmem:
+            return ClipboardEnforcement("UNCHANGED", "GLOBAL_ALLOC_FAILED")
+        try:
+            p = k.GlobalLock(hmem)
+            if not p:
+                return ClipboardEnforcement("UNCHANGED", "GLOBAL_LOCK_FAILED")
+            try:
                 self.ct.memmove(p, raw, len(raw))
-                k.GlobalUnlock(hmem)
-                if not u.SetClipboardData(CF_TEXT_UNICODE, hmem):
-                    k.GlobalFree(hmem)
-        finally:
-            u.CloseClipboard()
-        self._own_seq = u.GetClipboardSequenceNumber()
+            except Exception:
+                return ClipboardEnforcement("UNCHANGED", "NOTICE_WRITE_FAILED")
+            finally:
+                self.ct.set_last_error(0)
+                unlocked = not k.GlobalUnlock(hmem) and not self.ct.get_last_error()
+            if not unlocked:
+                return ClipboardEnforcement("UNCHANGED", "GLOBAL_UNLOCK_FAILED")
 
-    def _on_clipboard_update(self):
-        seq = self.user32.GetClipboardSequenceNumber()
-        if seq == self._own_seq:
-            return  # chính agent vừa ghi dòng thông báo -> bỏ qua
-        owner = self._owner_name()
-        data = self._read()
-        if data is None:
+            trace = self._start_native_trace()
+            if not self._open():
+                self._finish_native_trace("replace", trace)
+                return ClipboardEnforcement("UNCHANGED", "OPEN_CLIPBOARD_FAILED")
+            try:
+                if trace is not None:
+                    trace["opened_ns"] = time.perf_counter_ns()
+                # The sequence can change while preparing the notice or waiting for OpenClipboard.
+                if u.GetClipboardSequenceNumber() != seq_before:
+                    outcome = ClipboardEnforcement("UNCHANGED", "SEQUENCE_CHANGED")
+                elif self.defer_clipboard_read and u.GetClipboardOwner() != owner_before:
+                    outcome = ClipboardEnforcement("UNCHANGED", "OWNER_CHANGED")
+                elif not u.EmptyClipboard():
+                    state = "UNCHANGED" if u.GetClipboardSequenceNumber() == seq_before else "UNCERTAIN"
+                    outcome = ClipboardEnforcement(state, "EMPTY_CLIPBOARD_FAILED")
+                elif not u.SetClipboardData(CF_TEXT_UNICODE, hmem):
+                    outcome = ClipboardEnforcement("CLEARED_WITHOUT_NOTICE", "SET_CLIPBOARD_DATA_FAILED")
+                else:
+                    hmem = None  # Windows owns the handle after a successful SetClipboardData.
+                    outcome = CLIPBOARD_REPLACED
+            finally:
+                closed = self._close_clipboard("replace", trace)
+            if not closed:
+                return ClipboardEnforcement("UNCERTAIN", "CLOSE_CLIPBOARD_FAILED")
+            return outcome
+        finally:
+            if hmem:
+                k.GlobalFree(hmem)
+
+    def _on_clipboard_update(self, pending=None):
+        snapshot = self._read(pending)
+        if snapshot is None:
             return
-        block, notice = route_clipboard(self.guard, data, owner)
-        if block:
-            self._replace_with_notice(notice, seq)
+        data, owner, seq = snapshot
+        owner_name = self._owner_name(owner)
+        # Unreadable text does not establish that a mixed clipboard is image-only.
+        if (CF_TEXT_UNICODE in data.get("unreadable_formats", ()) and data["image"]
+                and not data["files"] and (owner_name or "").lower() not in SCREENSHOT_TOOLS):
+            return
+        route_clipboard(self.guard, data, owner_name,
+                        replace=lambda notice: self._replace_with_notice(notice, seq, owner))
 
 
 # ============================================================================
@@ -650,7 +922,7 @@ class ServerPolicy:
             return list(self.policies)
 
     def report(self, payload):
-        self.client.send_report(payload)
+        return self.client.send_report(payload, require_ack=True)
 
 
 def main(argv=None):
@@ -661,6 +933,10 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="DLP Clipboard + Screenshot Agent")
     ap.add_argument("--demo", action="store_true", help="chay thu khong can server")
     ap.add_argument("--monitor", action="store_true", help="(voi --demo) chi ghi nhan, khong chan")
+    ap.add_argument("--trace-native-clipboard", action="store_true",
+                    help="trace clipboard open, read and close timing to stdout")
+    ap.add_argument("--defer-clipboard-read", action="store_true",
+                    help="enable experimental deferred clipboard acquisition")
     ap.add_argument("--config", default=str(Path(__file__).with_name("config.ini")))
     args = ap.parse_args(argv)
     if sys.platform != "win32":
@@ -676,7 +952,8 @@ def main(argv=None):
         sp.start()
         guard = ClipboardGuard(sp.hostname, sp.get, sp.report)
         _say("Ket noi server voi may %s." % sp.hostname)
-    watcher = ClipboardWatcher(guard)
+    watcher = ClipboardWatcher(guard, trace_native_clipboard=args.trace_native_clipboard,
+                               defer_clipboard_read=args.defer_clipboard_read)
     _say("Dang theo doi clipboard va chup man hinh. Bam Ctrl+C de dung.")
     try:
         watcher.run()

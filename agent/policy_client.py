@@ -51,12 +51,23 @@ class PolicyClient:
             print(f"[policy_client] Loi heartbeat: {e}")
             return False
 
-    def send_report(self, event):
+    def send_report(self, event, *, require_ack=False):
+        """Return a validated server log ID or None in acknowledgment mode."""
         url = f"{self.server_url}/agent_report.php"
         try:
             resp = requests.post(url, json=event, headers=self._headers(), timeout=DEFAULT_TIMEOUT)
             resp.raise_for_status()
-            return True
+            if not require_ack:
+                return True
+            if resp.status_code != 201:
+                return None
+            acknowledgment = resp.json()
+            if not isinstance(acknowledgment, dict) or acknowledgment.get("status") != "ok":
+                return None
+            log_id = acknowledgment.get("id")
+            return log_id if type(log_id) is int and log_id > 0 else None
         except requests.RequestException as e:
+            if require_ack:
+                return None
             print(f"[policy_client] Loi report: {e}")
             return False
