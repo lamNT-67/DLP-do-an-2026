@@ -17,6 +17,7 @@ $exitPointLabels = [
     'CLIENT_FTP'        => 'CLI - FTP',
     'CLIENT_WINSCP'     => 'Ứng dụng - WinSCP',
     'CLIENT_FILEZILLA'  => 'Ứng dụng - FileZilla',
+    'CLIENT_CURL'       => 'CLI - cURL (curl.exe)',
     'NETWORK_WEB'       => '[Legacy] Network - Web/Cloud',
     'NETWORK_SCP_SFTP'  => '[Legacy] Network - SCP/SFTP',
     'NETWORK_FTP'       => '[Legacy] Network - FTP',
