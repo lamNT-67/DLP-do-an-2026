@@ -221,6 +221,24 @@ class PolicyEvaluationTests(unittest.TestCase):
                     status = get_exit_point_status(policies, channel)
                     self.assertIsNone(sftp_scp_agent._inspect_file(str(self.path), status))
 
+    def test_page_fetch_destination_hint_is_reporting_only(self):
+        guard = browser_agent.BrowserGuard(None, "TEST")
+        destination = "https://receiver.example"
+        guard.set_policies([policy(4, "BLOCK", rule(5, "Confidential"), allowed_locations=[destination])])
+        body = {"channel": "chrome", "file_name": "sample.txt",
+                "content_base64": base64.b64encode(b"Confidential").decode("ascii")}
+        _, picker = guard.inspect(body, destination, 0)
+        self.assertEqual((picker["decision"], picker["reason"], picker["reusable_for_page_fetch"]),
+                         ("ALLOW", "ALLOWED_LOCATION", False))
+
+        with patch.object(browser_agent, "_peer_process", return_value=(None, None, None)), \
+                patch.object(browser_agent.threading, "Thread") as thread:
+            _, fetch = guard.inspect({**body, "initial_destination_hint": destination}, destination, 0)
+        self.assertEqual((fetch["decision"], fetch["reason"]), ("BLOCK", "CONTENT_MATCH"))
+        _, status, inspection, action, reported_dest, _ = thread.call_args.kwargs["args"]
+        self.assertEqual((status["policy_ids"], inspection["matched_rule_ids"], action, reported_dest),
+                         ([4], [5], "BLOCKED_BROWSER", destination))
+
     def test_transfer_decision_and_blanket_port_eligibility(self):
         self.path.write_text("ALPHA", encoding="utf-8")
         monitor = policy(11, "REPORT_ONLY", allowed_locations=["test.example:22"],
