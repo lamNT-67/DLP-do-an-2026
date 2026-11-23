@@ -93,7 +93,7 @@ CREATE TABLE dlp_policy_devices (
 -- 8. Exit point duoc tick trong Policy
 CREATE TABLE dlp_policy_exit_points (
     policy_id           INT NOT NULL,
-    exit_point_type     ENUM('USB','CLIPBOARD','NETWORK_WEB','NETWORK_SCP_SFTP','NETWORK_FTP','RDP','SCREEN_CAPTURE','BROWSER_CHROME','BROWSER_EDGE','BROWSER_FIREFOX','CLIENT_SCP','CLIENT_SFTP','CLIENT_FTP','CLIENT_WINSCP','CLIENT_FILEZILLA') NOT NULL,
+    exit_point_type     ENUM('USB','CLIPBOARD','NETWORK_WEB','NETWORK_SCP_SFTP','NETWORK_FTP','RDP','SCREEN_CAPTURE','BROWSER_CHROME','BROWSER_EDGE','BROWSER_FIREFOX','CLIENT_SCP','CLIENT_SFTP','CLIENT_FTP','CLIENT_WINSCP','CLIENT_FILEZILLA','CLIENT_CURL') NOT NULL,
     PRIMARY KEY (policy_id, exit_point_type),
     FOREIGN KEY (policy_id) REFERENCES dlp_policies(id) ON DELETE CASCADE
 );
@@ -140,7 +140,7 @@ CREATE TABLE usb_whitelist (
 -- 13. Network blacklist
 CREATE TABLE network_blacklist (
     id              INT PRIMARY KEY AUTO_INCREMENT,
-    target_type     ENUM('DOMAIN','IP','PORT','PROCESS') NOT NULL,
+    target_type     ENUM('DOMAIN','IP','PORT') NOT NULL,
     value           VARCHAR(255) NOT NULL,
     description     VARCHAR(200),
     is_active       BOOLEAN DEFAULT TRUE,
