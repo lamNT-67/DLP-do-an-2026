@@ -4,21 +4,13 @@ require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/../includes/helpers.php';
 
 $message = '';
-$error = '';
-$allowedTargetTypes = ['DOMAIN', 'IP', 'PORT', 'PROCESS'];
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'add') {
-    $targetType = strtoupper(trim($_POST['target_type'] ?? 'DOMAIN'));
+    $targetType = $_POST['target_type'] ?? 'DOMAIN';
     $value = trim($_POST['value'] ?? '');
     $description = trim($_POST['description'] ?? '');
 
-    if (!in_array($targetType, $allowedTargetTypes, true)) {
-        $error = 'Loai blacklist khong hop le.';
-    } elseif ($value === '') {
-        $error = 'Vui long nhap gia tri.';
-    } elseif ($targetType === 'PROCESS' && !preg_match('/^[A-Za-z0-9_.-]+(?:\.exe)?$/i', $value)) {
-        $error = 'Ten process khong hop le. Vi du: curl.exe';
-    } else {
+    if ($value !== '') {
         $stmt = $pdo->prepare("INSERT INTO network_blacklist (target_type, value, description) VALUES (?, ?, ?)");
         $stmt->execute([$targetType, $value, $description]);
         $message = 'Da them vao blacklist.';
@@ -47,13 +39,9 @@ require __DIR__ . '/../includes/layout_header.php';
 <?php if ($message): ?>
     <div class="success-msg"><?= h($message) ?></div>
 <?php endif; ?>
-<?php if ($error): ?>
-    <div class="alert alert-error"><?= h($error) ?></div>
-<?php endif; ?>
 
 <div class="card">
-    <h2>Them Domain/IP/Port/Process vao Blacklist</h2>
-    <p class="hint">PROCESS la ten tien trinh can Agent xu ly, vi du curl.exe. Muc nay chi gui cau hinh den Agent; can cap nhat Agent de thuc hien chan tien trinh. Blacklist dang ap dung global cho cac Agent nhan policy.</p>
+    <h2>Them Domain/IP/Port vao Blacklist</h2>
     <form method="POST">
         <input type="hidden" name="action" value="add">
         <div class="form-group">
@@ -62,12 +50,11 @@ require __DIR__ . '/../includes/layout_header.php';
                 <option value="DOMAIN">DOMAIN</option>
                 <option value="IP">IP</option>
                 <option value="PORT">PORT</option>
-                <option value="PROCESS">PROCESS (ten tien trinh)</option>
             </select>
         </div>
         <div class="form-group">
             <label>Gia tri</label>
-            <input type="text" name="value" placeholder="curl.exe / example.com / 192.0.2.10 / 22" required>
+            <input type="text" name="value" required>
         </div>
         <div class="form-group">
             <label>Mo ta</label>
