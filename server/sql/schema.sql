@@ -140,7 +140,7 @@ CREATE TABLE usb_whitelist (
 -- 13. Network blacklist
 CREATE TABLE network_blacklist (
     id              INT PRIMARY KEY AUTO_INCREMENT,
-    target_type     ENUM('DOMAIN','IP','PORT') NOT NULL,
+    target_type     ENUM('DOMAIN','IP','PORT','PROCESS') NOT NULL,
     value           VARCHAR(255) NOT NULL,
     description     VARCHAR(200),
     is_active       BOOLEAN DEFAULT TRUE,
