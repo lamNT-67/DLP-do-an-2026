@@ -117,7 +117,8 @@ class PolicyEvaluationTests(unittest.TestCase):
             with self.subTest(policies=policies):
                 guard = clipboard_agent.ClipboardGuard("TEST", lambda: policies)
                 with patch.object(guard, "_record") as record, patch.object(clipboard_agent, "_say"):
-                    self.assertTrue(guard.on_files([str(self.path)])[0])
+                    replace = Mock(return_value=clipboard_agent.CLIPBOARD_REPLACED)
+                    self.assertTrue(guard.on_files([str(self.path)], replace=replace)[0])
                 self.assertEqual(record.call_args.args[1:3],
                                  ({"policy_ids": [11], "effective_action": "BLOCK"},
                                   clipboard_agent.ACTION_BLOCK))
@@ -135,17 +136,19 @@ class PolicyEvaluationTests(unittest.TestCase):
         monitor = policy(11, "REPORT_ONLY", exit_points=["SCREEN_CAPTURE"])
         block = policy(22, "BLOCK", rule(2, "BETA"), exit_points=["SCREEN_CAPTURE"])
 
-        def inline_thread(target, args, daemon):
+        def inline_thread(target, args=(), daemon=True):
             return Mock(start=lambda: target(*args))
 
         for policies in ([monitor, block], [block, monitor]):
             with self.subTest(policies=policies):
-                reporter = Mock()
+                reporter = Mock(return_value=12)
                 guard = clipboard_agent.ClipboardGuard("TEST", lambda: policies, reporter)
                 with patch.object(clipboard_agent.threading, "Thread", side_effect=inline_thread), \
                         patch.object(clipboard_agent, "write_log_event"), \
+                        patch.object(clipboard_agent, "write_clipboard_delivery_status"), \
                         patch.object(clipboard_agent, "_say"):
-                    self.assertTrue(guard.on_image()[0])
+                    replace = Mock(return_value=clipboard_agent.CLIPBOARD_REPLACED)
+                    self.assertTrue(guard.on_image(replace=replace)[0])
                     self.assertTrue(guard.on_screenshot_hotkey("PrtSc"))
                 self.assertEqual(reporter.call_count, 2)
                 for call in reporter.call_args_list:
@@ -153,6 +156,8 @@ class PolicyEvaluationTests(unittest.TestCase):
                     self.assertEqual((report["exit_point_type"], report["policy_id"],
                                       report["action_taken"], report["matched_rule_ids"]),
                                      ("SCREEN_CAPTURE", 22, clipboard_agent.ACTION_BLOCK, []))
+                self.assertEqual(reporter.call_args_list[0].args[0]["enforcement_result"], "REPLACED")
+                self.assertNotIn("enforcement_result", reporter.call_args_list[1].args[0])
 
     def test_file_and_location_exceptions_only_exempt_their_owner(self):
         for conditions in ({"allowed_files": [self.path.name]},
