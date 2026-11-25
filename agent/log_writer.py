@@ -6,6 +6,7 @@ from pathlib import Path
 LOG_DIR = Path(os.environ.get("DLP_LOG_DIR", "./logs"))
 LOG_FILE = LOG_DIR / "dlp_events.log"
 CLIPBOARD_DELIVERY_FILE = LOG_DIR / "clipboard_delivery.log"
+CURL_DELIVERY_FILE = LOG_DIR / "curl_delivery.log"
 
 
 if os.name == "nt":
@@ -62,7 +63,8 @@ def _append_json(path, record, *, durable):
 
 def write_log_event(hostname, agent_module, exit_point_type, event_type, policy_state,
                      source, target, content_inspection, action_taken, reported_to_server, *,
-                     event_id=None, policy_id=None, report_configured=None, durable=False):
+                     event_id=None, policy_id=None, report_configured=None, durable=False,
+                     enforcement=None):
     event = {
         "timestamp": _now_iso(), "hostname": hostname, "agent_module": agent_module,
         "exit_point_type": exit_point_type, "event_type": event_type,
@@ -72,15 +74,25 @@ def write_log_event(hostname, agent_module, exit_point_type, event_type, policy_
     }
     if event_id is not None:
         event.update(event_id=event_id, policy_id=policy_id, report_configured=report_configured)
+    if enforcement is not None:
+        event["enforcement"] = enforcement
     _append_json(LOG_FILE, event, durable=durable)
     return event
 
 
 def write_clipboard_delivery_status(event_id, status, *, server_log_id=None):
+    _write_delivery_status(CLIPBOARD_DELIVERY_FILE, event_id, status, server_log_id)
+
+
+def write_curl_delivery_status(event_id, status, *, server_log_id=None):
+    _write_delivery_status(CURL_DELIVERY_FILE, event_id, status, server_log_id)
+
+
+def _write_delivery_status(path, event_id, status, server_log_id):
     record = {
         "timestamp": _now_iso(), "event_id": event_id, "status": status,
         "reported_to_server": status == "ACKNOWLEDGED",
     }
     if server_log_id is not None:
         record["server_log_id"] = server_log_id
-    _append_json(CLIPBOARD_DELIVERY_FILE, record, durable=True)
+    _append_json(path, record, durable=True)

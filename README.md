@@ -11,7 +11,7 @@ Hệ thống **Data Loss Prevention (DLP)** phục vụ đồ án nghiên cứu 
   ┌─────────────────────────────────────────────┐
   │ Python DLP Agent                            │
   │ - Network monitoring / policy enforcement   │
-  │ - SCP/SFTP/FTP process monitoring           │
+  │ - SCP/SFTP/FTP and curl process monitoring  │
   │ - Clipboard & screenshot (user session)     │
   │ - Content Inspection Engine                 │
   └───────────────────┬─────────────────────────┘
@@ -45,12 +45,13 @@ Hệ thống **Data Loss Prevention (DLP)** phục vụ đồ án nghiên cứu 
 - Hiển thị tên các content rule khớp trong trang Logs.
 - Lưu sự kiện DLP vào MySQL và chuyển tiếp Syslog sang Wazuh thông qua outbox có retry.
 
-### Windows Agent trên `main`
+### Windows Agent
 
 | Thành phần | Mục đích | Trạng thái / giới hạn |
 |---|---|---|
 | `network_agent.py` | Theo dõi và áp dụng chính sách mạng/web | Không thay thế cho browser extension; không bảo đảm kiểm tra payload upload HTTPS |
 | `sftp_scp_agent.py` | Theo dõi tiến trình SCP/SFTP/FTP, kiểm tra file được phát hiện | Cơ chế polling có nguy cơ chặn muộn; một số trường hợp tạo firewall rule ảnh hưởng toàn kết nối SSH/port |
+| `curl_agent.py` | Kiểm tra file HTTP(S) upload qua curl.exe theo policy `CLIENT_CURL` | Dò tiến trình định kỳ. Một phần hoặc toàn bộ dữ liệu có thể đến đích trước khi Agent tạm dừng curl. |
 | `clipboard_agent.py` | Kiểm soát clipboard và thao tác chụp màn hình | Phải chạy trong **phiên đăng nhập của người dùng**; installer hiện chưa tự cài module này thành service/task |
 | `content_inspection.py` | Nhận diện loại file, trích xuất nội dung, so khớp Regex/Dictionary và đánh giá confidence | Khả năng trích xuất phụ thuộc định dạng và giới hạn đọc file |
 
@@ -93,6 +94,7 @@ DLP-do-an-2026/
     ├── policy_utils.py
     ├── network_agent.py
     ├── sftp_scp_agent.py
+    ├── curl_agent.py
     ├── clipboard_agent.py
     ├── service/                # Windows installer/uninstaller
     ├── config.ini.example
@@ -150,6 +152,8 @@ C:\DLP\venv\Scripts\python.exe clipboard_agent.py
 **Lưu ý:** Agent nhận policy theo chu kỳ; trạng thái heartbeat thành công chưa chứng minh đã có policy phù hợp. Không đăng tải `config.ini` chứa API token/enrollment key lên repository.
 
 Xem thêm: [Agent README](agent/README.md).
+
+Curl Agent V1 chạy như một tiến trình giám sát riêng trên Windows. Tài liệu liệt kê cú pháp hỗ trợ và cách đo số byte tới máy nhận HTTP cục bộ. [Hướng dẫn Curl Agent](agent/docs/CURL_AGENT.md)
 
 ## 7. Chính sách và kiểm thử
 

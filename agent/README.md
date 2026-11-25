@@ -68,6 +68,10 @@ Lưu ý:
 
 - Extension kiểm tra mỗi file tối đa 2 MiB; file lớn hơn bị chặn.
 
+### Curl Agent V1
+
+Chạy `python -B agent/curl_agent.py --config C:\DLP\agent\config.ini` từ thư mục gốc của repo, trong phiên Windows đang thử nghiệm. Chọn exit point `CLIENT_CURL` trong policy của thiết bị đã đăng ký. Agent tự phát hiện các tiến trình `curl.exe` khi người dùng gọi curl như bình thường. Cơ chế dò tiến trình có thể phát hiện sau khi dữ liệu đã đến đích. [Cách chạy và kiểm thử Curl Agent](docs/CURL_AGENT.md)
+
 5. Các chức năng của Agent
 
  Chặn truy cập web: Luật tường lửa Windows chặn domain/IP 

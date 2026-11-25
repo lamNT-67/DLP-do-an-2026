@@ -1,6 +1,6 @@
 # DLP Agent–Server API Contract (v2)
 
-Tài liệu này mô tả API thực tế trên branch `fix/server-agent-api-validation`.
+Tài liệu này mô tả API trong `server/api/`.
 
 **Base URL (lab):** `http://<SERVER-IP>/dlp_server/api/`. Dùng HTTPS trong triển khai thực tế.
 
@@ -71,7 +71,7 @@ Ví dụ trên minh họa thiết bị **chưa gán Group nhưng có policy gán
 
 `action`: `BLOCK` | `REPORT_ONLY`.
 
-`exit_points`: `USB` | `CLIPBOARD` | `NETWORK_WEB` | `NETWORK_SCP_SFTP` | `NETWORK_FTP` | `RDP` | `SCREEN_CAPTURE`.
+`exit_points` gồm `USB`, `CLIPBOARD`, `NETWORK_WEB`, `NETWORK_SCP_SFTP`, `NETWORK_FTP`, `RDP`, `SCREEN_CAPTURE`, `BROWSER_CHROME`, `BROWSER_EDGE`, `BROWSER_FIREFOX`, `CLIENT_SCP`, `CLIENT_SFTP`, `CLIENT_FTP`, `CLIENT_WINSCP`, `CLIENT_FILEZILLA` và `CLIENT_CURL`. `agent_report.php` nhận cùng tập giá trị cho `exit_point_type`.
 
 `is_assigned` hiện phản ánh việc có Group hay chưa, **không** phải có policy hay không. Với thiết bị chưa có Group, USB whitelist global và network blacklist vẫn được trả về.
 
@@ -115,7 +115,9 @@ Header: `Authorization: Bearer <api_token>`.
 
 Bắt buộc: `hostname`, `exit_point_type`, `action_taken`, `occurred_at`.
 
-`action_taken`: `ALLOWED` | `LOGGED` | `BLOCKED_DELETE` | `BLOCKED_FIREWALL` | `BLOCKED_KILL`.
+`action_taken` nhận `ALLOWED`, `LOGGED`, `BLOCKED_DELETE`, `BLOCKED_FIREWALL`, `BLOCKED_KILL`, `BLOCKED_PROXY`, `BLOCKED_BROWSER` và `BLOCKED_TRANSFER`.
+
+Với `CLIENT_CURL`, `BLOCKED_KILL` xác nhận Agent đã kết thúc tiến trình. Một phần hoặc toàn bộ dữ liệu có thể đã tới đích. `LOGGED` ghi nhận quyết định LOG hoặc quyết định BLOCK khi Agent chưa xác nhận việc kết thúc tiến trình. Lý do kiểm tra và kết quả tạm dừng, kết thúc, tiếp tục nằm trong log cục bộ. `destination_value` chỉ chứa hostname và cổng. [Hướng dẫn Curl Agent](../../agent/docs/CURL_AGENT.md)
 
 `confidence_score`: `LOW` | `MEDIUM` | `HIGH` | `CRITICAL`.
 

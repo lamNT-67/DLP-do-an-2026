@@ -248,6 +248,7 @@ require_once __DIR__ . '/../includes/layout_header.php';
     <div class="form-section">
         <h3>Bước 1 — Chọn ứng dụng / kênh truyền cần kiểm soát</h3>
         <p class="hint">Chrome/Edge/Firefox: cần cài và bật browser extension của Agent; chặn theo File Type mới hỗ trợ một số luồng file-picker, kéo/thả. SCP/SFTP/FTP: hiện cần chạy qua guarded-upload.ps1. WinSCP/FileZilla: đang là kênh policy dự kiến, <strong>chưa có module chặn tự động</strong>. Không có kênh nào được đảm bảo chỉ bằng cách tick checkbox.</p>
+        <p class="hint">CLI - cURL cần chạy Curl Agent trên máy Windows. Agent theo dõi tiến trình curl.exe và kiểm tra các tệp nguồn HTTP(S) nhận diện được. Một phần hoặc toàn bộ dữ liệu có thể đã truyền trước khi Agent tạm dừng tiến trình.</p>
         <div class="checkbox-list">
             <?php foreach ($exitPointLabels as $value => $label): ?>
             <label>
@@ -298,6 +299,7 @@ require_once __DIR__ . '/../includes/layout_header.php';
     <div class="form-section">
         <h3>Bước 4 — Ngoại lệ (Allowed Files / Allowed Locations)</h3>
         <p class="hint">File hoặc đường dẫn nằm trong danh sách này sẽ được bỏ qua, không bị chặn dù policy đang BLOCK.</p>
+        <p class="hint">Với CLI - cURL, nhập đích HTTP(S) theo dạng hostname:cổng, ví dụ upload.example.com:443.</p>
         <div class="form-group">
             <label>Allowed Locations (mỗi dòng 1 đường dẫn hoặc domain/IP)</label>
             <textarea name="allowed_locations" rows="3" placeholder="C:\Shared\Export\&#10;drive.company.com"><?= h($allowedLocationsText) ?></textarea>
