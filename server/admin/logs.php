@@ -59,6 +59,7 @@ require __DIR__ . '/../includes/layout_header.php';
     <option value="BROWSER_CHROME"    <?= $filterExitPoint === 'BROWSER_CHROME' ? 'selected' : '' ?>>Google Chrome</option>
     <option value="BROWSER_EDGE"      <?= $filterExitPoint === 'BROWSER_EDGE' ? 'selected' : '' ?>>Microsoft Edge</option>
     <option value="BROWSER_FIREFOX"   <?= $filterExitPoint === 'BROWSER_FIREFOX' ? 'selected' : '' ?>>Mozilla Firefox</option>
+    <option value="CLIENT_CURL"       <?= $filterExitPoint === 'CLIENT_CURL' ? 'selected' : '' ?>>CLI - cURL (curl.exe)</option>
     <option value="NETWORK_WEB"       <?= $filterExitPoint === 'NETWORK_WEB' ? 'selected' : '' ?>>Network - Web/Cloud</option>
     <option value="NETWORK_SCP_SFTP"  <?= $filterExitPoint === 'NETWORK_SCP_SFTP' ? 'selected' : '' ?>>Network - SCP/SFTP</option>
     <option value="NETWORK_FTP"       <?= $filterExitPoint === 'NETWORK_FTP' ? 'selected' : '' ?>>Network - FTP</option>

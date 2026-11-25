@@ -1,6 +1,6 @@
 # DLP Management Server
 
-Server quản lý hệ thống Data Loss Prevention (DLP) phục vụ đồ án. Backend sử dụng PHP 8+, MySQL/MariaDB và giao diện quản trị chạy qua Apache/XAMPP. Agent giao tiếp với server bằng HTTP API dạng JSON.
+Server quản lý hệ thống Data Loss Prevention (DLP) phục vụ đồ án. Backend sử dụng PHP 8.1 trở lên, MySQL/MariaDB và giao diện quản trị chạy qua Apache/XAMPP. Agent giao tiếp với server bằng HTTP API dạng JSON.
 
 > **Trạng thái:** bản demo/lab, chưa được harden để triển khai production. Chỉ dùng trong mạng thử nghiệm đáng tin cậy; không công khai API qua Internet khi chưa bật HTTPS, bảo vệ token và hoàn thiện kiểm soát truy cập.
 
@@ -11,15 +11,17 @@ Server quản lý hệ thống Data Loss Prevention (DLP) phục vụ đồ án.
 - Policy nhắm tới **Group** hoặc **Device**; mỗi policy có action `BLOCK` hoặc `REPORT_ONLY`, các exit point, file types, content rules và exceptions.
 - Agent lấy policy, gửi heartbeat và báo cáo sự kiện.
 
-**Exit points trong schema:** `USB`, `CLIPBOARD`, `NETWORK_WEB`, `NETWORK_SCP_SFTP`, `NETWORK_FTP`, `RDP`.
+**Exit points trong schema** gồm `CLIENT_CURL` cho upload HTTP(S) qua `curl.exe`. Danh sách đầy đủ nằm trong hợp đồng API. [API Contract](docs/API_CONTRACT.md)
 
 **Lưu ý:** Server phân phối policy và lưu log; khả năng phát hiện/chặn thực tế phụ thuộc vào Agent. Có khai báo exit point không đồng nghĩa Agent đã hỗ trợ chặn kênh đó.
 
 ## 2. Yêu cầu
 
-- Apache, PHP >= 8.0 (có dùng `match`), PDO MySQL, MySQL/MariaDB.
+- Apache, PHP 8.1 trở lên và PDO MySQL. API dùng `array_is_list()` để kiểm tra JSON.
 - XAMPP phù hợp để chạy trên Windows trong môi trường lab.
 - Máy Agent truy cập được địa chỉ IP và cổng Apache của server.
+
+Khi chọn hệ quản trị cho lab, ghi rõ phiên bản MariaDB và PHP đã kiểm thử. Schema còn dùng tên bảng `groups` không đặt trong dấu nháy. Từ MySQL 8.0.2, tên này là từ khóa dành riêng, nên cần sửa cách trích dẫn tên bảng và kiểm thử import mới trước khi dùng MySQL 8. [Từ khóa MySQL](https://dev.mysql.com/doc/refman/8.0/en/keywords.html)
 
 ## 3. Cài đặt
 
@@ -28,6 +30,14 @@ Server quản lý hệ thống Data Loss Prevention (DLP) phục vụ đồ án.
 3. Mở phpMyAdmin và import `sql/schema.sql`. Script tạo database `dlp_system`, bảng và dữ liệu demo. **Chỉ import vào database lab mới; script seed không được thiết kế để chạy lặp lại trên dữ liệu đang sử dụng.**
 4. Kiểm tra `config/database.php`: host, database, username, password. Cấu hình hiện tại dùng `localhost`, `dlp_system`, `root`, mật khẩu rỗng theo XAMPP lab.
 5. Mở `http://localhost/dlp_server/` để vào trang đăng nhập admin.
+
+### Nâng cấp database hiện có cho CLIENT_CURL
+
+Database tạo từ `sql/schema.sql` hiện tại đã có kênh này. Với database có dữ liệu, duyệt và chạy thử migration trên bản sao trước khi áp dụng thủ công. [Migration curl](sql/migrations/add_curl_policy_exit_point.sql)
+
+- Sao lưu dữ liệu và dùng `SHOW CREATE TABLE` để kiểm tra `dlp_policy_exit_points` và `logs`. Hai cột `exit_point_type` phải là enum theo schema chuẩn, có `NOT NULL` và không có mặc định, chú thích hoặc charset/collation riêng cần giữ. Với schema đã tùy chỉnh, chuẩn bị câu lệnh ALTER giữ nguyên các thuộc tính trước khi nâng cấp.
+- Hoàn tất các migration nền cần thiết trước khi thêm curl. Một số migration cũ thay toàn bộ danh sách enum nên có thể làm mất `CLIENT_CURL` nếu chạy lại sau đó. Bản dump cũ cũng có thể thiếu các cột mà API hiện tại yêu cầu.
+- Chọn đúng database, dùng tài khoản có quyền ALTER và chạy toàn bộ script trong một phiên kết nối. Hai lệnh ALTER commit độc lập. Nếu lệnh thứ hai lỗi, kiểm tra cả hai cột rồi chạy lại sau khi xử lý lỗi. Script sẽ bỏ qua enum đã có `CLIENT_CURL`. Trên bản sao, xác nhận thứ tự và giá trị cũ được giữ, sau đó chạy lại để kiểm tra tính lặp lại.
 
 **Cảnh báo:** Schema có sẵn tài khoản admin, enrollment key và API token mẫu. Hãy thay/thu hồi toàn bộ thông tin demo trước khi cho thiết bị thật kết nối. Không dùng tài khoản MySQL root không mật khẩu trong môi trường chia sẻ.
 
@@ -126,11 +136,11 @@ Header: `Authorization: Bearer <api_token>`.
 
 Bắt buộc: `hostname`, `exit_point_type`, `action_taken`, `occurred_at`. Thành công trả `status: ok` và ID log.
 
-`action_taken`: `ALLOWED`, `LOGGED`, `BLOCKED_DELETE`, `BLOCKED_FIREWALL`, `BLOCKED_KILL`.
+Danh sách `exit_point_type` và `action_taken` được mô tả trong hợp đồng API. [API Contract](docs/API_CONTRACT.md)
 
 `confidence_score`: `LOW`, `MEDIUM`, `HIGH`, `CRITICAL`.
 
-`matched_rule_ids` chấp nhận mảng hoặc chuỗi phân tách bằng dấu phẩy. Hiện API chưa kiểm tra đầy đủ enum, định dạng thời gian và quyền liên quan tới `policy_id`; Agent cần gửi dữ liệu đúng schema.
+`matched_rule_ids` chấp nhận mảng hoặc chuỗi phân tách bằng dấu phẩy. API kiểm tra enum, định dạng thời gian có múi giờ và quyền gán policy nếu Agent gửi `policy_id`.
 
 ## 7. Kiểm thử nhanh
 
