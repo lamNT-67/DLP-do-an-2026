@@ -44,10 +44,11 @@ Ba service được cài đặt là:
 - DLPSftpScpAgent: Theo dõi hoạt động SCP/SFTP/FTP.
 - DLPBrowserAgent: Nhận file từ extension trình duyệt (qua `127.0.0.1:18765`) để kiểm tra nội dung trước khi upload.
 
-Hai tác vụ chạy khi người dùng đăng nhập là:
+Ba tác vụ chạy khi người dùng đăng nhập:
 
 - DLPClipboardAgent: Chặn sao chép dữ liệu nhạy cảm (clipboard) và chụp màn hình. Chạy trong phiên của người dùng vì service không nhìn thấy clipboard và màn hình.
 - DLPNotifier: Hiện thông báo trên máy khi một thao tác bị chặn.
+- DLPCurlAgent: Theo dõi upload HTTP(S) qua `curl.exe` trong phiên đăng nhập tương tác với quyền người dùng. Agent ghi nhật ký riêng theo tài khoản Windows.
 
 Ngoài ra bộ cài còn:
 
@@ -70,7 +71,7 @@ Lưu ý:
 
 ### Curl Agent V1
 
-Chạy `python -B agent/curl_agent.py --config C:\DLP\agent\config.ini` từ thư mục gốc của repo, trong phiên Windows đang thử nghiệm. Chọn exit point `CLIENT_CURL` trong policy của thiết bị đã đăng ký. Agent tự phát hiện các tiến trình `curl.exe` khi người dùng gọi curl như bình thường. Cơ chế dò tiến trình có thể phát hiện sau khi dữ liệu đã đến đích. [Cách chạy và kiểm thử Curl Agent](docs/CURL_AGENT.md)
+Bộ cài đăng ký Curl Agent để chạy khi người dùng đăng nhập tương tác lần tiếp theo. Chọn exit point `CLIENT_CURL` trong policy của thiết bị đã đăng ký. Cơ chế dò tiến trình có thể phát hiện sau khi dữ liệu đã đến đích. Bộ cài cần Python cài cho mọi người dùng trong Program Files. Khi cần, truyền `-CurlPython` với đường dẫn đến `python.exe` cho `install.ps1`. [Triển khai, chạy thủ công và kiểm thử Curl Agent](docs/CURL_AGENT.md)
 
 5. Các chức năng của Agent
 

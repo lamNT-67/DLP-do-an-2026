@@ -3,7 +3,8 @@ param(
     [string]$ServerUrl,
     [string]$Hostname,
     [string]$EnrollmentKey,
-    [switch]$NoPrompt
+    [switch]$NoPrompt,
+    [string]$CurlPython
 )
 $ErrorActionPreference = 'Stop'
 
@@ -56,6 +57,9 @@ function Invoke-Nssm {
     $ErrorActionPreference = $old
 }
 
+. (Join-Path $PSScriptRoot 'curl_task.ps1')
+$curlDeployment = $null
+$installFailed = $false
 try {
     # ---- 1. Python ----
     Step 'Tim Python'
@@ -69,6 +73,13 @@ try {
     if ($pyExe -match 'py\.exe$') { $pyArgs = @('-3') }
     & $pyExe @pyArgs --version
 
+    Step 'Stage managed Curl and request cooperative shutdown'
+    $curlBase = Resolve-CurlPython $CurlPython $pyExe
+    $curlDeployment = Open-CurlDeployment $true
+    Initialize-CurlConfigRoot $InstallDir
+    New-CurlRelease $curlDeployment $Source $curlBase
+    Enter-CurlMaintenance $curlDeployment $curlDeployment.Task
+
     # ---- 2. Dung service cu ----
     Step 'Dung service cu (neu co)'
     foreach ($s in $Services) {
@@ -80,7 +91,7 @@ try {
     # ---- 3. Chep file ----
     Step "Chep agent vao $AgentDir"
     New-Item -ItemType Directory -Force $AgentDir, $ToolsDir, $LogDir | Out-Null
-    robocopy $Source $AgentDir /E /NFL /NDL /NJH /NJS /NP /XD logs __pycache__ dev_tools tools service .git /XF config.ini install.ps1 install.bat uninstall.ps1 uninstall.bat | Out-Null
+    robocopy $Source $AgentDir /E /NFL /NDL /NJH /NJS /NP /XD logs __pycache__ dev_tools tools service .git /XF config.ini curl_managed.py install.ps1 install.bat uninstall.ps1 uninstall.bat | Out-Null
     if ($LASTEXITCODE -ge 8) { throw "robocopy loi (ma $LASTEXITCODE)" }
 
     # ---- 4. config.ini ----
@@ -218,6 +229,10 @@ try {
     } else {
         Write-Host '  khong thay clipboard_agent.py, bo qua'
     }
+    Step 'Register managed Curl for the next eligible interactive logon'
+    foreach ($protected in $InstallDir, $AgentDir, $cfg) { Assert-CurlProtectedPath $protected }
+    Complete-CurlInstall $curlDeployment
+
     # ---- 8. Kiem tra ----
     Step 'Ket qua'
     Start-Sleep 8
@@ -229,10 +244,15 @@ try {
     Write-Host "`nXong. Agent se tu chay moi khi may khoi dong." -ForegroundColor Green
 }
 catch {
+    $installFailed = $true
     Write-Host ("`nLOI: " + $_.Exception.Message) -ForegroundColor Red
+    try { Undo-CurlInstall $curlDeployment }
+    catch { Write-Warning ("Curl rollback held for review: " + $_.Exception.Message) }
 }
 finally {
+    Close-CurlDeployment $curlDeployment
     if (-not $NoPrompt) { Read-Host "`nNhan Enter de dong" }
 }
+if ($installFailed) { exit 1 }
 
 

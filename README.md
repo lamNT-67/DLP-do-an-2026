@@ -153,7 +153,7 @@ C:\DLP\venv\Scripts\python.exe clipboard_agent.py
 
 Xem thêm: [Agent README](agent/README.md).
 
-Curl Agent V1 chạy như một tiến trình giám sát riêng trên Windows. Tài liệu liệt kê cú pháp hỗ trợ và cách đo số byte tới máy nhận HTTP cục bộ. [Hướng dẫn Curl Agent](agent/docs/CURL_AGENT.md)
+Curl Agent V1 được bộ cài đăng ký để tự chạy khi người dùng đăng nhập tương tác trên Windows. Tài liệu liệt kê cú pháp hỗ trợ và cách đo số byte tới máy nhận HTTP cục bộ. [Hướng dẫn Curl Agent](agent/docs/CURL_AGENT.md)
 
 ## 7. Chính sách và kiểm thử
 
