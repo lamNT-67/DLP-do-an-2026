@@ -10,6 +10,17 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     exit
 }
 
+. (Join-Path $PSScriptRoot 'curl_task.ps1')
+$curlDeployment = $null
+try {
+    $curlDeployment = Open-CurlDeployment $false
+    Uninstall-CurlTask $curlDeployment $RemoveFiles.IsPresent
+} catch {
+    Close-CurlDeployment $curlDeployment
+    Write-Error ("Uninstall stopped before shared teardown: " + $_.Exception.Message)
+    exit 1
+}
+try {
 $nssm = 'C:\DLP\tools\nssm.exe'
 foreach ($n in 'DLPNetworkAgent', 'DLPSftpScpAgent', 'DLPBrowserAgent') {
     if (Get-Service $n -ErrorAction SilentlyContinue) {
@@ -32,4 +43,5 @@ if ($RemoveFiles) {
     Remove-Item 'C:\ProgramData\DLP' -Recurse -Force -ErrorAction SilentlyContinue
     Write-Host 'Da xoa C:\DLP va C:\ProgramData\DLP'
 }
+} finally { Close-CurlDeployment $curlDeployment }
 Read-Host "`nNhan Enter de dong"

@@ -16,6 +16,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager, suppress
+from functools import partial
 from pathlib import Path, PureWindowsPath
 from queue import Empty, Full, Queue
 from typing import NamedTuple
@@ -24,7 +25,10 @@ from urllib.parse import urlsplit
 import psutil
 import requests
 
-from content_inspection import MAX_TEXT_READ_BYTES, TEXT_EXTS, inspect_file, to_report_fields
+from content_inspection import LEVELS, MAX_TEXT_READ_BYTES, TEXT_EXTS, inspect_file, to_report_fields
+from curl_windows import (OriginUnavailable, PathContextUnavailable, impersonate_origin,
+                          open_origin, verify_drive, verify_file_volume)
+from curl_worker import MAX_INSPECTION_REQUEST, WorkerCleanupUnconfirmed, run_inspection_worker
 from log_writer import write_curl_delivery_status, write_log_event
 from policy_client import DEFAULT_TIMEOUT, PolicyClient
 from policy_utils import get_exit_point_status
@@ -33,6 +37,8 @@ from policy_utils import get_exit_point_status
 EXIT_POINT = "CLIENT_CURL"
 PROCESS_NAME = "curl.exe"
 POLL_INTERVAL = 0.25
+ENROLLMENT_RETRY_INTERVAL = 5
+ENROLLMENT_TIMEOUT = 300
 POLICY_REFRESH_INTERVAL = 60
 INSPECTION_TIMEOUT = 5
 TERMINATION_WAIT_MS = 1000
@@ -67,6 +73,14 @@ INCOMPLETE_INSPECTIONS = {"UNREADABLE", "TOO_LARGE", "ENCRYPTED_CONTENT", "NOT_I
 LIMITED_EXTRACTION_NOTES = {
     "ARCHIVE_TRUNCATED", "BEST_EFFORT_STRINGS", "MEMBER_TOO_LARGE",
     "NESTED_ARCHIVE_SKIPPED", "PDF_TRUNCATED", "ZIP_BOMB_SUSPECT",
+}
+INSPECTION_REASONS = {
+    "ALLOWED_FILE", "ALLOWED_LOCATION", "CLEAN", "CONTENT_MATCH", "EXIT_POINT_BLOCKED",
+    "EXIT_POINT_MONITORED", "FILE_TYPE_BLOCKED", "NOT_GOVERNED", "OUT_OF_SCOPE",
+} | INCOMPLETE_INSPECTIONS
+INSPECTION_DIAGNOSTICS = {
+    "INSPECTION_ERROR", "NON_LOCAL_SOURCE_VOLUME", "NON_REGULAR_FILE",
+    "UNSUPPORTED_SOURCE_ALIAS", "UNVERIFIED_SOURCE_PATH",
 }
 
 
@@ -278,9 +292,10 @@ def _windows_final_path(stream):
 
 
 @contextmanager
-def _open_local_file(path):
+def _open_local_file(path, *, verify_origin=False):
     """Provide the shared engine with a single handle for inspection and hashing."""
     source = Path(path)
+    drive = verify_drive(source) if verify_origin else None
     if sys.platform == "win32":
         if not _is_local_windows_volume(source.anchor):
             raise UnsupportedSyntax("NON_LOCAL_SOURCE_VOLUME")
@@ -298,15 +313,18 @@ def _open_local_file(path):
             raise UnsupportedSyntax("NON_REGULAR_FILE")
         if sys.platform == "win32" and os.path.normcase(_windows_final_path(stream)) != os.path.normcase(path):
             raise UnsupportedSyntax("UNSUPPORTED_SOURCE_ALIAS")
+        if verify_origin:
+            verify_file_volume(stream, drive)
         yield stream
 
 
-def _inspect_uploads(uploads, status):
+def _inspect_uploads(uploads, status, *, verify_origin=False):
+    open_file = partial(_open_local_file, verify_origin=True) if verify_origin else _open_local_file
     results = []
     for path, destination in uploads:
         try:
             result = inspect_file(path, status, destination=destination, enforce_file_scope=True,
-                                  open_stream=lambda: _open_local_file(path))
+                                  open_stream=lambda: open_file(path))
             fields = to_report_fields(result)
             del fields["file_path"]
             if result["reason"] in INCOMPLETE_INSPECTIONS:
@@ -325,6 +343,8 @@ def _inspect_uploads(uploads, status):
                 break
         except UnsupportedSyntax as exc:
             results.append(_diagnostic(str(exc)))
+        except PathContextUnavailable as exc:
+            results.append(_diagnostic(exc.reason))
         except Exception:
             results.append(_diagnostic("INSPECTION_ERROR"))
     return results
@@ -339,6 +359,97 @@ def _inspect_in_worker(uploads, status):
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     return json.loads(finished.stdout)
+
+
+def _valid_worker_result(item, status):
+    if not isinstance(item, dict) or type(item.get("inspected")) is not bool:
+        return False
+    verdict, reason = item.get("verdict"), item.get("reason")
+    if not isinstance(reason, str):
+        return False
+    if verdict is None:
+        return (item.keys() == {"verdict", "reason", "inspected"}
+                and not item["inspected"] and reason in INSPECTION_DIAGNOSTICS)
+    fields = {"verdict", "reason", "inspected", "file_hash_sha256", "matched_rule_ids",
+              "confidence_score", "policy_id", "policy_action"}
+    if not fields <= item.keys() <= fields | {"inspection_limit"}:
+        return False
+    digest, rules, policy_id = item["file_hash_sha256"], item["matched_rule_ids"], item["policy_id"]
+    limit = item.get("inspection_limit")
+    policies = status.get("policies") or ()
+    if policies:
+        policy = next((p for p in policies if type(policy_id) is int and p["policy_id"] == policy_id), None)
+        if policy is None:
+            return False
+        expected_action = policy["action"]
+    elif policy_id is None:
+        policy, expected_action = status, status.get("effective_action")
+    else:
+        return False
+    rule_ids = {rule["id"] for rule in policy.get("content_rules") or ()}
+    confidence = item["confidence_score"]
+    # A BLOCK policy can log low-confidence matches or files it could not fully inspect.
+    return (isinstance(verdict, str) and verdict in VERDICT_PRIORITY and reason in INSPECTION_REASONS
+            and expected_action in ("OPEN", "BLOCK", "REPORT_ONLY")
+            and item["policy_action"] == expected_action
+            and (verdict != "BLOCK" or expected_action == "BLOCK")
+            and (verdict != "LOG" or expected_action in ("BLOCK", "REPORT_ONLY"))
+            and (digest is None or isinstance(digest, str) and bool(re.fullmatch(r"[0-9a-f]{64}", digest)))
+            and (reason != "UNREADABLE" or digest is None and not item["inspected"] and rules == [])
+            and isinstance(rules, list) and all(type(rule) is int and rule in rule_ids for rule in rules)
+            and (confidence is None or confidence in LEVELS)
+            and (limit is None or isinstance(limit, str)
+                 and (limit in INCOMPLETE_INSPECTIONS or limit == "PARTIAL_CONTENT_INSPECTION")))
+
+
+def _inspect_verified_origin(uploads, status, origin):
+    request_id = uuid.uuid4().hex
+    request = {"request_id": request_id, "uploads": uploads, "status": status}
+    response = json.loads(run_inspection_worker(
+        Path(__file__).resolve(), json.dumps(request).encode("utf-8"), origin.token_handle,
+        INSPECTION_TIMEOUT,
+    ))
+    if not isinstance(response, dict) or response.get("request_id") != request_id:
+        raise ValueError("Invalid inspection reply")
+    if response == {"request_id": request_id, "error": "ORIGIN_IMPERSONATION_FAILED"}:
+        raise OriginUnavailable("ORIGIN_IMPERSONATION_FAILED")
+    results = response.get("results")
+    if (response.keys() != {"request_id", "results"} or not isinstance(results, list)
+            or not 0 < len(results) <= len(uploads)
+            or not all(_valid_worker_result(item, status) for item in results)
+            or any(item["verdict"] == "BLOCK" for item in results[:-1])
+            or (len(results) < len(uploads) and results[-1]["verdict"] != "BLOCK")):
+        raise ValueError("Invalid inspection reply")
+    return results
+
+
+def _run_origin_worker(token_handle):
+    # No path access is performed while decoding the bounded request. On a malformed
+    # request the child exits immediately and Windows closes its inherited handles.
+    payload = sys.stdin.buffer.read(MAX_INSPECTION_REQUEST + 1)
+    if len(payload) > MAX_INSPECTION_REQUEST:
+        return 2
+    try:
+        request = json.loads(payload)
+    except (ValueError, RecursionError):
+        return 2
+    if not isinstance(request, dict) or request.keys() != {"request_id", "uploads", "status"}:
+        return 2
+    request_id, uploads, status = request["request_id"], request["uploads"], request["status"]
+    if (not isinstance(request_id, str) or not re.fullmatch(r"[0-9a-f]{32}", request_id)
+            or not isinstance(status, dict) or not isinstance(uploads, list)
+            or not 0 < len(uploads) <= MAX_FILES
+            or not all(isinstance(item, list) and len(item) == 2
+                       and all(isinstance(value, str) for value in item) for item in uploads)):
+        return 2
+    try:
+        with impersonate_origin(token_handle):
+            results = _inspect_uploads(uploads, status, verify_origin=True)
+    except OriginUnavailable:
+        print(json.dumps({"request_id": request_id, "error": "ORIGIN_IMPERSONATION_FAILED"}))
+        return 0
+    print(json.dumps({"request_id": request_id, "results": results}))
+    return 0
 
 
 def _terminate_windows(proc):
@@ -398,13 +509,17 @@ def _resume(proc):
 
 
 class CurlMonitor:
-    def __init__(self, record, inspect_uploads=_inspect_in_worker, terminate=_terminate_windows):
+    def __init__(self, record, inspect_uploads=_inspect_in_worker, terminate=_terminate_windows,
+                 *, windows_scope=None):
         self.record = record
         self.inspect_uploads = inspect_uploads
         self.terminate = terminate
         self.seen = set()
         self.metadata_attempts = {}
         self.pending_resume = {}
+        self.windows_scope = windows_scope
+        self._pending_origins = {}
+        self.worker_cleanup_confirmed = True
 
     def retry_resumes(self):
         failures = {}
@@ -412,6 +527,9 @@ class CurlMonitor:
             resume = _resume(proc)
             if resume.error is None:
                 del self.pending_resume[key]
+                origin = self._pending_origins.pop(key, None)
+                if origin is not None:
+                    origin.close()
                 self.record(key, None, _diagnostic("RESUME_RETRY"), {"resume": resume.outcome})
             else:
                 failures[key] = resume.error
@@ -448,14 +566,21 @@ class CurlMonitor:
             if (proc.info.get("name") or "").lower() != PROCESS_NAME:
                 continue
             key = (proc.pid, None)
+            verified = False
             try:
                 key = (proc.pid, proc.create_time())
                 current.add(key)
                 if key in self.seen or key in self.pending_resume or not proc.is_running():
                     continue
-                error = self._handle(proc, key, status, stop)
+                if self.windows_scope is None:
+                    error = self._handle(proc, key, status, stop)
+                else:
+                    error = self._handle_verified(proc, key, status, stop)
+                    verified = True
             except psutil.NoSuchProcess:
                 continue
+            except OriginUnavailable as exc:
+                error = exc.reason
             except (psutil.Error, OSError):
                 # Until creation time is readable, account for the failure by
                 # PID only. Fresh scans can still discover a new identity.
@@ -471,14 +596,32 @@ class CurlMonitor:
                 if attempts < METADATA_ATTEMPTS:
                     self.metadata_attempts[key] = attempts
                     continue
-                self.record(key, None, _diagnostic(error), None)
+                # A limited task can enumerate curl.exe in other logons. Until
+                # origin verification succeeds, keep identifiers out of its journal.
+                record_key = key if verified or self.windows_scope is None else (None, None)
+                self.record(record_key, None, _diagnostic(error), None)
             self.seen.add(key)
             self.metadata_attempts.pop(key, None)
         self.seen.intersection_update(current)
         self.metadata_attempts = {key: attempts for key, attempts in self.metadata_attempts.items()
                                   if key in current}
 
-    def _handle(self, proc, key, status, stop):
+    def _handle_verified(self, proc, key, status, stop):
+        origin = open_origin(proc.pid, key[1], self.windows_scope)
+        try:
+            if not origin.is_running():
+                return
+            return self._handle(proc, key, status, stop, origin=origin)
+        finally:
+            # A failed resume stays pinned for subsequent retries. The token is
+            # only needed for the inspection already completed on this path.
+            origin.close_token()
+            if key in self.pending_resume:
+                self._pending_origins[key] = origin
+            else:
+                origin.close()
+
+    def _handle(self, proc, key, status, stop, *, origin=None):
         try:
             argv = proc.cmdline()
             if not argv:
@@ -515,7 +658,19 @@ class CurlMonitor:
                 return
             incomplete_reason = "INSPECTION_INCOMPLETE"
             try:
-                results = self.inspect_uploads(uploads, status)
+                if origin is None:
+                    results = self.inspect_uploads(uploads, status)
+                else:
+                    results = _inspect_verified_origin(uploads, status, origin)
+            except OriginUnavailable as exc:
+                incomplete_reason = exc.reason
+                results = []
+            except WorkerCleanupUnconfirmed:
+                self.worker_cleanup_confirmed = False
+                if stop is not None:
+                    stop.set()
+                incomplete_reason = "WORKER_CLEANUP_UNCONFIRMED"
+                results = []
             except subprocess.TimeoutExpired:
                 incomplete_reason = "INSPECTION_TIMEOUT"
                 results = []
@@ -832,11 +987,82 @@ class CurlPolicy:
             stop.wait(POLICY_REFRESH_INTERVAL)
 
 
+def _wait_for_enrollment(config_path, stop):
+    """Only the primary agent enrolls. Reopen its config after each interruptible wait."""
+    deadline = time.monotonic() + ENROLLMENT_TIMEOUT
+    while not stop.is_set():
+        config = configparser.ConfigParser(interpolation=None)
+        try:
+            with config_path.open(encoding="utf-8-sig") as stream:
+                config.read_file(stream)
+            agent = config["agent"]
+            token = agent.get("api_token", "").strip()
+            hostname = agent.get("hostname", "")
+            if token and _valid_hostname(hostname):
+                return CurlPolicyClient(agent.get("server_url", ""), hostname, token)
+        except (OSError, UnicodeError, configparser.Error, KeyError, ValueError):
+            # The shared file may be absent or partially written during enrollment.
+            # Its contents and parsing exceptions can include device credentials.
+            pass
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Waiting for the enrolled device configuration timed out.")
+        stop.wait(min(remaining, ENROLLMENT_RETRY_INTERVAL))
+    return None
+
+
+def _watch(client, stop, *, windows_scope=None):
+    policy = CurlPolicy(client)
+    journal = CurlJournal(client.hostname, client)
+    monitor = CurlMonitor(journal.record, windows_scope=windows_scope)
+    runtime_failed = False
+    try:
+        threading.Thread(target=policy.run, args=(stop,), daemon=True).start()
+        while not stop.is_set():
+            monitor.poll(policy.status, stop=stop)
+            stop.wait(POLL_INTERVAL)
+    except Exception:
+        if windows_scope is None:
+            raise
+        runtime_failed = True
+    finally:
+        stop.set()
+        try:
+            # Leave unresolved processes pinned through all final resume attempts.
+            # If cleanup itself raises, do not construct a success receipt.
+            monitor.cleanup()
+        finally:
+            drained = journal.close()
+    return {"pending_resumes": len(monitor.pending_resume),
+            "worker_cleanup_confirmed": monitor.worker_cleanup_confirmed,
+            "report_drained": drained and journal.reports.unfinished_tasks == 0,
+            "runtime_failed": runtime_failed}
+
+
+def run_managed_watcher(config_path, windows_scope, stop):
+    """Run only with a verified logon scope and a private journal initialized by the caller."""
+    if windows_scope is None:
+        raise ValueError("A managed watcher requires a verified Windows logon context.")
+    try:
+        client = _wait_for_enrollment(config_path, stop)
+    except TimeoutError:
+        client = None
+    if client is None or stop.is_set():
+        return {"pending_resumes": 0, "worker_cleanup_confirmed": True, "report_drained": True,
+                "runtime_failed": not stop.is_set()}
+    return _watch(client, stop, windows_scope=windows_scope)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Monitor curl.exe HTTP(S) file uploads.")
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.ini"))
     parser.add_argument("--inspect-worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--origin-token", type=int, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if args.origin_token is not None:
+        if not args.inspect_worker or sys.platform != "win32" or args.origin_token <= 0:
+            parser.error("Invalid inspection worker arguments.")
+        return _run_origin_worker(args.origin_token)
     if args.inspect_worker:
         uploads, status = json.load(sys.stdin.buffer)
         print(json.dumps(_inspect_uploads(uploads, status)))
@@ -860,25 +1086,20 @@ def main(argv=None):
         client = CurlPolicyClient(agent["server_url"], hostname, token)
     except ValueError as exc:
         parser.error(str(exc))
-    policy = CurlPolicy(client)
-    journal = CurlJournal(hostname, client)
-    monitor = CurlMonitor(journal.record)
-    stop = threading.Event()
-    signal.signal(signal.SIGINT, lambda *_: stop.set())
-    threading.Thread(target=policy.run, args=(stop,), daemon=True).start()
-    print("[curl_agent] Watching for curl.exe. Press Ctrl+C to stop.", flush=True)
-    try:
-        while not stop.is_set():
-            monitor.poll(policy.status, stop=stop)
-            stop.wait(POLL_INTERVAL)
-    finally:
-        try:
-            monitor.cleanup()
-            if monitor.pending_resume:
-                print("[curl_agent] Windows refused to resume one or more curl processes.",
-                      file=sys.stderr, flush=True)
-        finally:
-            journal.close()
+    from curl_lifecycle import standalone_admission
+    with standalone_admission() as admitted:
+        if not admitted:
+            print("[curl_agent] Standalone monitoring is unavailable during managed deployment "
+                  "or while another watcher owns this logon.", file=sys.stderr, flush=True)
+            return 1
+        stop = threading.Event()
+        signal.signal(signal.SIGINT, lambda *_: stop.set())
+        print("[curl_agent] Watching for curl.exe. Press Ctrl+C to stop.", flush=True)
+        outcome = _watch(client, stop)
+    if outcome["pending_resumes"]:
+        print("[curl_agent] Windows refused to resume one or more curl processes.",
+              file=sys.stderr, flush=True)
+        return 1
     return 0
 
 
