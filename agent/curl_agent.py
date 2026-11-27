@@ -25,7 +25,7 @@ from urllib.parse import urlsplit
 import psutil
 import requests
 
-from content_inspection import LEVELS, MAX_TEXT_READ_BYTES, TEXT_EXTS, inspect_file, to_report_fields
+from content_inspection import LEVELS, inspect_file, to_report_fields
 from curl_windows import (OriginUnavailable, PathContextUnavailable, impersonate_origin,
                           open_origin, verify_drive, verify_file_volume)
 from curl_worker import MAX_INSPECTION_REQUEST, WorkerCleanupUnconfirmed, run_inspection_worker
@@ -70,13 +70,9 @@ FORM_FILE = re.compile(r'(?:"(?P<quoted>(?:\\["\\]|\\(?!["\\])|[^"\\])*)"|(?P<pl
 FORM_ATTRIBUTES = re.compile(r'(?:;[ \t]*(?:type|filename)=[^",;]+)*')
 VERDICT_PRIORITY = {"ALLOW": 0, "LOG": 1, "BLOCK": 2}
 INCOMPLETE_INSPECTIONS = {"UNREADABLE", "TOO_LARGE", "ENCRYPTED_CONTENT", "NOT_INSPECTABLE"}
-LIMITED_EXTRACTION_NOTES = {
-    "ARCHIVE_TRUNCATED", "BEST_EFFORT_STRINGS", "MEMBER_TOO_LARGE",
-    "NESTED_ARCHIVE_SKIPPED", "PDF_TRUNCATED", "ZIP_BOMB_SUSPECT",
-}
 INSPECTION_REASONS = {
     "ALLOWED_FILE", "ALLOWED_LOCATION", "CLEAN", "CONTENT_MATCH", "EXIT_POINT_BLOCKED",
-    "EXIT_POINT_MONITORED", "FILE_TYPE_BLOCKED", "NOT_GOVERNED", "OUT_OF_SCOPE",
+    "EXIT_POINT_MONITORED", "FILE_TYPE_BLOCKED", "INSPECTION_INCOMPLETE", "NOT_GOVERNED", "OUT_OF_SCOPE",
 } | INCOMPLETE_INSPECTIONS
 INSPECTION_DIAGNOSTICS = {
     "INSPECTION_ERROR", "NON_LOCAL_SOURCE_VOLUME", "NON_REGULAR_FILE",
@@ -329,13 +325,13 @@ def _inspect_uploads(uploads, status, *, verify_origin=False):
             del fields["file_path"]
             if result["reason"] in INCOMPLETE_INSPECTIONS:
                 fields["inspection_limit"] = result["reason"]
-            elif (any(note.split(":", 1)[0] in LIMITED_EXTRACTION_NOTES for note in result["notes"])
-                  or (result["inspected"] and result["real_type"] in TEXT_EXTS
-                      and result["file_size"] > MAX_TEXT_READ_BYTES)):
+            elif ((result["inspected"] and result["inspection_coverage"] != "FULL")
+                  or result["inspection_stages"]["extract"] in ("PARTIAL", "UNSUPPORTED", "ERROR")):
                 fields["inspection_limit"] = "PARTIAL_CONTENT_INSPECTION"
             results.append({
                 **fields,
                 "verdict": result["verdict"], "reason": result["reason"],
+                "inspection_coverage": result["inspection_coverage"],
                 "inspected": result["inspected"], "policy_id": result.get("policy_id"),
                 "policy_action": result["policy_action"],
             })
@@ -372,10 +368,20 @@ def _valid_worker_result(item, status):
                 and not item["inspected"] and reason in INSPECTION_DIAGNOSTICS)
     fields = {"verdict", "reason", "inspected", "file_hash_sha256", "matched_rule_ids",
               "confidence_score", "policy_id", "policy_action"}
-    if not fields <= item.keys() <= fields | {"inspection_limit"}:
+    if not fields <= item.keys() <= fields | {"inspection_limit", "inspection_coverage"}:
         return False
+    coverage = item.get("inspection_coverage")
+    if "inspection_coverage" in item:
+        if coverage not in ("FULL", "PARTIAL", "UNSUPPORTED", "ERROR"):
+            return False
+        if reason == "CLEAN" and coverage != "FULL":
+            return False
     digest, rules, policy_id = item["file_hash_sha256"], item["matched_rule_ids"], item["policy_id"]
     limit = item.get("inspection_limit")
+    if reason == "INSPECTION_INCOMPLETE" and not (
+            coverage in ("PARTIAL", "UNSUPPORTED", "ERROR") and verdict == "ALLOW" and item["inspected"]
+            and rules == [] and item["confidence_score"] is None and limit == "PARTIAL_CONTENT_INSPECTION"):
+        return False
     policies = status.get("policies") or ()
     if policies:
         policy = next((p for p in policies if type(policy_id) is int and p["policy_id"] == policy_id), None)

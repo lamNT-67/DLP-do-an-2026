@@ -145,7 +145,8 @@ class VerifiedWorkerTests(unittest.TestCase):
             self.assertEqual(curl._inspect_verified_origin([UPLOAD], STATUS, Mock(token_handle=7)), [verdict])
             for field, value in (("policy_id", 10), ("policy_action", "REPORT_ONLY"),
                                  ("matched_rule_ids", [99]), ("matched_rule_ids", [True]),
-                                 ("file_hash_sha256", "secret"), ("verdict", []), ("pid", 100)):
+                                 ("file_hash_sha256", "secret"), ("verdict", []), ("pid", 100),
+                                 ("inspection_coverage", ["FULL"])):
                 with self.subTest(field=field), patch.dict(verdict, {field: value}):
                     with self.assertRaises(ValueError):
                         curl._inspect_verified_origin([UPLOAD], STATUS, Mock(token_handle=7))
@@ -244,6 +245,16 @@ class EngineWorkerResultTests(unittest.TestCase):
                 result, = curl._inspect_verified_origin([curl.Upload(str(source), DESTINATION)], status,
                                                         Mock(token_handle=7))
         return result
+
+    def test_worker_transports_coverage_without_changing_verdict_or_confidence(self):
+        with patch.object(content_inspection, "MAX_TEXT_CHARS", 3):
+            result = self.inspect_source("sample.txt", b"blue")
+        self.assertEqual((result["verdict"], result["reason"], result["inspection_coverage"],
+                          result["inspection_limit"], result["confidence_score"]),
+                         ("ALLOW", "INSPECTION_INCOMPLETE", "PARTIAL", "PARTIAL_CONTENT_INSPECTION", None))
+        for invalid in ({"reason": "CLEAN"}, {"verdict": "BLOCK"}, {"inspection_coverage": "FULL"}):
+            with self.subTest(invalid=invalid):
+                self.assertFalse(curl._valid_worker_result({**result, **invalid}, STATUS))
 
     def test_block_policy_accepts_low_confidence_log(self):
         result = self.inspect_source("low.txt", b"sensitive")

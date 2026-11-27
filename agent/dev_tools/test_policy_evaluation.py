@@ -208,6 +208,25 @@ class PolicyEvaluationTests(unittest.TestCase):
                          ([22], "REPORT_ONLY", "LOGGED"))
         self.assertEqual((inspection["file_name"], inspection["matched_rule_ids"]), ("public.txt", [2]))
 
+    def test_partial_no_match_preserves_channel_decisions(self):
+        policies = [policy(11, "BLOCK", rule(1, "blue"))]
+        self.path.write_text("ordinary", encoding="utf-8")
+        browser = browser_agent.BrowserGuard(None, "TEST")
+        browser.set_policies(policies)
+        body = {"channel": "chrome", "file_name": self.path.name,
+                "content_base64": base64.b64encode(self.path.read_bytes()).decode("ascii")}
+        clipboard = clipboard_agent.ClipboardGuard("TEST", lambda: policies)
+        with patch.object(content_inspection, "MAX_TEXT_CHARS", 3), patch.object(clipboard, "_record") as record:
+            code, result = browser.inspect(body, "https://test.example", 0)
+            self.assertEqual((code, result["decision"], result["reason"]), (200, "ALLOW", "INSPECTION_INCOMPLETE"))
+            self.assertEqual(clipboard.on_text("ordinary"), (False, None))
+            record.assert_not_called()
+            status = get_exit_point_status(policies, "NETWORK_SCP_SFTP")
+            self.assertIsNone(sftp_scp_agent._inspect_file(str(self.path), status))
+            status = get_exit_point_status(policies, "NETWORK_WEB")
+            network = network_agent._inspect_blacklist_match("ordinary", status)
+            self.assertEqual((network["verdict"], network["inspection_coverage"]), ("ALLOW", "PARTIAL"))
+
     def test_browser_and_transfer_keep_declared_extension_scope(self):
         block = policy(11, "BLOCK", rule(1, "ALPHA"), file_types=[{"extension": "pdf"}])
         monitor = policy(22, "REPORT_ONLY", rule(2, "BETA"))

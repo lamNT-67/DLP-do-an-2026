@@ -44,7 +44,7 @@ from typing import NamedTuple
 import psutil
 
 from content_inspection import (BLOCK_MIN_LEVEL, DEFAULT_FILE_TYPES, DEFAULT_RULES, _LEVEL_IDX,
-                                inspect_file, scan_text, to_log_inspection, to_report_fields)
+                                inspect_file, no_match_reason, scan_text, to_log_inspection, to_report_fields)
 from log_writer import write_clipboard_delivery_status, write_log_event
 from policy_utils import decision_status, evaluate_policies, get_exit_point_status
 
@@ -210,7 +210,7 @@ class ClipboardGuard:
                         "reason": "EXIT_POINT_BLOCKED" if blocking else "EXIT_POINT_MONITORED"}
             scan = scan_text(text, rules)
             if not scan["matched_rule_ids"]:
-                return {"verdict": "ALLOW", "reason": "CLEAN"}
+                return dict(scan, verdict="ALLOW", reason=no_match_reason(scan["inspection_coverage"]))
             block = blocking and _LEVEL_IDX[scan["confidence_level"]] >= _LEVEL_IDX[BLOCK_MIN_LEVEL]
             return dict(scan, verdict="BLOCK" if block else "LOG", reason="CONTENT_MATCH", real_type="text")
 
