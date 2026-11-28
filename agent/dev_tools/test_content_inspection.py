@@ -5,12 +5,15 @@ Test tự động cho Content Inspection Engine (chỉ dùng thư viện chuẩn
     python -m unittest dev_tools.test_content_inspection -v
 """
 
+import io
 import os
 import shutil
 import sys
 import tempfile
 import time
 import unittest
+import zipfile
+from unittest.mock import patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))  # thư mục agent/
@@ -57,6 +60,167 @@ class Base(unittest.TestCase):
         with open(path, "wb") as f:
             f.write(data)
         return path
+
+
+class TestInspectionCoverage(Base):
+    def check(self, result, verdict, reason, coverage, read, extract, scan):
+        self.assertEqual((result["verdict"], result["reason"], result["inspection_coverage"]),
+                         (verdict, reason, coverage))
+        self.assertEqual(result["inspection_stages"], {"read": read, "extract": extract, "scan": scan})
+        self.assertEqual(result["inspected"], scan != "NOT_RUN")
+        log = ci.to_log_inspection(result)
+        self.assertEqual(log["inspection_coverage"], coverage)
+        self.assertEqual(log["inspection_stages"], result["inspection_stages"])
+
+    def test_empty_and_exact_limits_are_full(self):
+        with patch.multiple(ci, MAX_TEXT_READ_BYTES=4, MAX_TEXT_CHARS=4, MAX_FILE_BYTES=4):
+            for text in ("", "abcd"):
+                with self.subTest(text=text):
+                    r = ci.inspect_file(self.write("sample.txt", text), status())
+                    self.check(r, "ALLOW", "CLEAN", "FULL", "FULL", "FULL", "FULL")
+                    self.assertIsNone(ci.to_report_fields(r)["confidence_score"])
+
+    def test_limits_are_attributed_to_the_stage_that_stopped(self):
+        path = self.write("sample.txt", "abcd")
+        cases = [
+            ({"MAX_FILE_BYTES": 3, "MAX_TEXT_READ_BYTES": 2}, ("PARTIAL", "FULL", "FULL")),
+            ({"MAX_TEXT_READ_BYTES": 3}, ("FULL", "PARTIAL", "FULL")),
+            ({"MAX_TEXT_CHARS": 3}, ("FULL", "FULL", "PARTIAL")),
+        ]
+        for limits, stages in cases:
+            with self.subTest(limits=limits), patch.multiple(ci, **limits):
+                r = ci.inspect_file(path, status())
+                self.check(r, "ALLOW", "INSPECTION_INCOMPLETE", "PARTIAL", *stages)
+                self.assertIsNone(ci.to_report_fields(r)["confidence_score"])
+
+    def test_partial_scan_retains_match_and_action(self):
+        path = self.write("sample.txt", "blue blue blue")
+        for kind in ("REGEX", "DICTIONARY"):
+            rule = {"id": 37, "rule_name": "COLOR", "rule_type": kind,
+                    "pattern": "blue", "severity": "CRITICAL"}
+            for action, verdict in (("BLOCK", "BLOCK"), ("REPORT_ONLY", "LOG")):
+                with self.subTest(kind=kind, action=action), patch.object(ci, "MAX_MATCHES_PER_RULE", 2):
+                    r = ci.inspect_file(path, status(action, rules=[rule]))
+                    self.check(r, verdict, "CONTENT_MATCH", "PARTIAL", "FULL", "FULL", "PARTIAL")
+                    self.assertEqual((r["matched_rule_ids"], r["match_count"]), ([37], 2))
+
+    def test_skipped_rule_is_scan_error(self):
+        rule = {"id": 1, "pattern": "("}
+        for text in ("blue", ""):
+            with self.subTest(text=text):
+                r = ci.inspect_file(self.write("sample.txt", text), status(rules=[rule]))
+                self.check(r, "ALLOW", "INSPECTION_INCOMPLETE", "ERROR", "FULL", "FULL", "ERROR")
+        # An empty-matching regex still produces no hit on an empty input.
+        self.assertEqual(ci.scan_text("", [{"id": 2, "pattern": "^$"}])["matched_rule_ids"], [])
+        with patch.object(ci, "MAX_TEXT_CHARS", 2):
+            r = ci.scan_content_with_rules("blue", [rule, {"id": 2, "pattern": "bl"}])
+            self.assertEqual((r["inspection_coverage"], r["matched_rule_ids"]), ("ERROR", [2]))
+
+    def test_empty_dictionary_is_an_error_and_valid_rules_still_match(self):
+        empty = {"id": 1, "rule_type": "DICTIONARY", "pattern": " , , "}
+        good = {"id": 2, "pattern": "green", "severity": "HIGH"}
+        for text in ("", "ordinary"):
+            r = ci.inspect_file(self.write("sample.txt", text), status(rules=[empty]))
+            self.check(r, "ALLOW", "INSPECTION_INCOMPLETE", "ERROR", "FULL", "FULL", "ERROR")
+        for rules in ([empty, good], [good, empty]):
+            r = ci.inspect_file(self.write("sample.txt", "green"), status(rules=rules))
+            self.check(r, "BLOCK", "CONTENT_MATCH", "ERROR", "FULL", "FULL", "ERROR")
+            self.assertEqual(r["matched_rule_ids"], [2])
+
+    def test_xlsx_only_requires_the_string_table_for_referenced_cells(self):
+        # Start with a workbook containing ordinary text and change only the cell representation.
+        with zipfile.ZipFile(io.BytesIO(ms.build_xlsx([["green"]]))) as original:
+            members = {name: original.read(name) for name in original.namelist()}
+        table = "xl/sharedStrings.xml"
+        sheet = "xl/worksheets/sheet1.xml"
+        cell = b'<c r="A1" t="s"><v>0</v></c>'
+        inline = b'<c r="B1" t="inlineStr"><is><t>green</t></is></c>'
+        self.assertIn(cell, members[sheet])
+        good = {"id": 3, "pattern": "green", "severity": "HIGH"}
+        cases = [
+            (False, inline, "FULL", "BLOCK", "CONTENT_MATCH"),
+            (False, cell, "ERROR", "ALLOW", "INSPECTION_INCOMPLETE"),
+            (False, cell + inline, "PARTIAL", "BLOCK", "CONTENT_MATCH"),
+            (True, cell, "FULL", "BLOCK", "CONTENT_MATCH"),
+            (True, inline, "FULL", "BLOCK", "CONTENT_MATCH"),
+        ]
+        for index in (b"-1", b"9", b"unknown", b""):
+            cases.append((True, cell.replace(b">0<", b">" + index + b"<"),
+                          "ERROR", "ALLOW", "INSPECTION_INCOMPLETE"))
+        for has_table, cells, coverage, verdict, reason in cases:
+            with self.subTest(has_table=has_table, cells=cells):
+                parts = dict(members)
+                if not has_table:
+                    del parts[table]
+                parts[sheet] = parts[sheet].replace(cell, cells)
+                r = ci.inspect_file(self.write("sample.xlsx", ms.build_zip(parts)), status(rules=[good]))
+                self.check(r, verdict, reason, coverage, "FULL", coverage, "FULL")
+                self.assertEqual(r["matched_rule_ids"], [3] if verdict == "BLOCK" else [])
+
+    def test_zip_codec_unavailable_and_integrity_error_are_distinct(self):
+        path = self.write("palette.zip", ms.build_zip({"palette.txt": "green"}))
+        self.check(ci.inspect_file(path, status()), "ALLOW", "CLEAN", "FULL", "FULL", "FULL", "FULL")
+        with patch.object(zipfile, "zlib", None):
+            r = ci.inspect_file(path, status())
+            self.check(r, "ALLOW", "NOT_INSPECTABLE", "UNSUPPORTED", "FULL", "UNSUPPORTED", "NOT_RUN")
+            self.assertEqual(r["notes"], ["ZIP_CODEC_UNAVAILABLE"])
+        with patch.object(zipfile.ZipFile, "read", side_effect=NotImplementedError):
+            r = ci.inspect_file(path, status())
+            self.check(r, "ALLOW", "NOT_INSPECTABLE", "UNSUPPORTED", "FULL", "UNSUPPORTED", "NOT_RUN")
+            self.assertEqual(r["notes"], ["ZIP_FEATURE_UNSUPPORTED"])
+        for fault in (zipfile.BadZipFile("CRC mismatch"), zipfile.zlib.error("invalid compressed data")):
+            with self.subTest(error=type(fault)), patch.object(zipfile.ZipFile, "read", side_effect=fault):
+                r = ci.inspect_file(path, status())
+                self.check(r, "ALLOW", "NOT_INSPECTABLE", "ERROR", "FULL", "ERROR", "NOT_RUN")
+                self.assertEqual(r["notes"], ["ZIP_CORRUPT"])
+
+    def test_read_failure_and_policy_shortcuts(self):
+        path = os.path.join(self.dir, "absent.txt")
+        self.check(ci.inspect_file(path, status()), "BLOCK", "UNREADABLE", "ERROR",
+                   "ERROR", "NOT_RUN", "NOT_RUN")
+        self.check(ci.inspect_file(path, status(allowed_files=["absent.txt"])), "ALLOW", "ALLOWED_FILE",
+                   "PARTIAL", "NOT_RUN", "NOT_RUN", "NOT_RUN")
+        path = self.write("sample.txt", "blue")
+        self.check(ci.inspect_file(path, status(rules=[])), "BLOCK", "EXIT_POINT_BLOCKED",
+                   "PARTIAL", "FULL", "NOT_RUN", "NOT_RUN")
+
+    def test_extractor_coverage(self):
+        image = b"GIF89a"
+        cases = [
+            ("image.gif", image, "ALLOW", "NOT_INSPECTABLE", "UNSUPPORTED", "NOT_RUN"),
+            ("broken.zip", b"PK\x03\x04", "ALLOW", "NOT_INSPECTABLE", "ERROR", "NOT_RUN"),
+            ("password.zip", ms.mark_zip_encrypted(ms.build_zip({"a.txt": "blue"})),
+             "BLOCK", "ENCRYPTED_CONTENT", "UNSUPPORTED", "NOT_RUN"),
+            ("mixed.zip", ms.build_zip({"a.txt": "blue", "b.gif": image}),
+             "ALLOW", "INSPECTION_INCOMPLETE", "PARTIAL", "FULL"),
+            ("binary.bin", b"\0blue", "ALLOW", "INSPECTION_INCOMPLETE", "PARTIAL", "FULL"),
+            ("lossy.txt", b"blue\xff", "ALLOW", "INSPECTION_INCOMPLETE", "PARTIAL", "FULL"),
+            ("ok.zip", ms.build_zip({"a.txt": "blue"}), "ALLOW", "CLEAN", "FULL", "FULL"),
+            ("ok.docx", ms.build_docx(["blue"]), "ALLOW", "CLEAN", "FULL", "FULL"),
+            ("ok.xlsx", ms.build_xlsx([["blue"]]), "ALLOW", "CLEAN", "FULL", "FULL"),
+        ]
+        for name, data, verdict, reason, extract, scan in cases:
+            with self.subTest(name=name):
+                r = ci.inspect_file(self.write(name, data), status())
+                self.check(r, verdict, reason, extract, "FULL", extract, scan)
+
+    def test_archive_budgets_propagate_to_file_coverage(self):
+        path = self.write("samples.zip", ms.build_zip({"a.txt": "green", "b.txt": "blue"}))
+        for limits in ({"MAX_ARCHIVE_MEMBERS": 1}, {"MAX_ZIP_MEMBER_BYTES": 4}, {"MAX_TEXT_READ_BYTES": 4}):
+            with self.subTest(limits=limits), patch.multiple(ci, **limits):
+                r = ci.inspect_file(path, status())
+                self.check(r, "ALLOW", "INSPECTION_INCOMPLETE", "PARTIAL", "FULL", "PARTIAL", "FULL")
+
+    @unittest.skipUnless(HAS_PDF, "chua cai pypdf")
+    def test_pdf_without_text_and_pdf_page_budget(self):
+        for lines, extract, reason in (([], "UNSUPPORTED", "INSPECTION_INCOMPLETE"),
+                                       (["blue"], "FULL", "CLEAN")):
+            with self.subTest(lines=lines):
+                path = self.write("sample.pdf", ms.build_pdf(lines))
+                self.check(ci.inspect_file(path, status()), "ALLOW", reason, extract, "FULL", extract, "FULL")
+        with patch.object(ci, "MAX_PDF_PAGES", 0):
+            self.check(ci.inspect_file(path, status()), "ALLOW", "INSPECTION_INCOMPLETE", "PARTIAL",
+                       "FULL", "PARTIAL", "FULL")
 
 
 class TestValidators(unittest.TestCase):

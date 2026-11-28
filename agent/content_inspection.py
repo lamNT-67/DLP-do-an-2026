@@ -207,15 +207,6 @@ _VALIDATORS = {"CCCD": cccd_valid, "CARD": luhn_valid, "PHONE": phone_valid, "EM
 # ============================================================================
 # 4. BIÊN DỊCH RULE (có cache - rule từ server được dùng lại nhiều lần)
 # ============================================================================
-@lru_cache(maxsize=256)
-def _compile_regex(pattern):
-    try:
-        return re.compile(pattern)
-    except re.error:
-        return None
-
-
-@lru_cache(maxsize=256)
 def _compile_dictionary(pattern):
     """Trả về list (regex, chạy_trên_text_bỏ_dấu).
     - Từ khoá 1 từ ('Mật'): so khớp CÓ dấu, tránh nhầm 'mắt', 'mất', 'format'.
@@ -232,6 +223,16 @@ def _compile_dictionary(pattern):
         body = r"\s+".join(re.escape(part) for part in body.split())
         out.append((re.compile(r"(?<!\w)" + body + r"(?!\w)"), on_folded))
     return tuple(out)
+
+
+@lru_cache(maxsize=256)
+def _compile_rule_pattern(rtype, pattern):
+    try:
+        if rtype == "DICTIONARY":
+            return _compile_dictionary(pattern)
+        return re.compile(pattern)
+    except (re.error, ValueError, OverflowError, RecursionError):
+        return None
 
 
 # ============================================================================
@@ -311,25 +312,36 @@ def detect_file_type(data, declared_ext=""):
 # ============================================================================
 # 6. TRÍCH XUẤT TEXT
 # ============================================================================
-def _decode_text(data):
+def _decode_bytes(data, encoding, errors, notes):
+    if notes is not None:
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            notes.append("TEXT_DECODE_LOSS")
+    return data.decode(encoding, errors)
+
+
+def _decode_text(data, notes=None):
     if data.startswith(codecs.BOM_UTF8):
-        return data[3:].decode("utf-8", "ignore")
+        return _decode_bytes(data[3:], "utf-8", "ignore", notes)
     if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
-        return data.decode("utf-16", "ignore")
+        return _decode_bytes(data, "utf-16", "ignore", notes)
     if _looks_utf16le(data):
-        return data.decode("utf-16-le", "ignore")
+        return _decode_bytes(data, "utf-16-le", "ignore", notes)
     text = data.decode("utf-8", "replace")
     if text.count("\ufffd") <= max(2, len(text) // 1000):
+        if notes is not None and "\ufffd" in text:
+            notes.append("TEXT_DECODE_LOSS")
         return _nfc(text.replace("\ufffd", ""))
-    return _nfc(data.decode("cp1258", "replace"))  # Windows ANSI tiếng Việt
+    return _nfc(_decode_bytes(data, "cp1258", "replace", notes))  # Windows ANSI tiếng Việt
 
 
 _TAG_RE = re.compile(r"<[^>]+>")
 
 
-def _xml_text(xml_bytes):
+def _xml_text(xml_bytes, notes):
     """Lấy text từ XML của Office: xuống dòng theo đoạn/hàng, tab giữa các ô."""
-    s = xml_bytes.decode("utf-8", "ignore")
+    s = _decode_bytes(xml_bytes, "utf-8", "ignore", notes)
     s = re.sub(r"</(?:w:p|a:p)>", "\n", s)
     s = re.sub(r"<(?:w:tab|w:br|a:br)\b[^>]*/>", " ", s)
     s = re.sub(r"</w:tc>", "\t", s)
@@ -356,24 +368,31 @@ def _extract_docx_pptx(zf, ftype, notes):
         if wanted.match(info.filename):
             raw = _safe_read_member(zf, info, notes)
             if raw:
-                parts.append(_xml_text(raw))
+                parts.append(_xml_text(raw, notes))
     return "\n".join(parts)
 
 
-_SI_RE = re.compile(r"<si>(.*?)</si>", re.S)
+_SI_RE = re.compile(r"<si\b[^>]*?(?:/>|>(.*?)</si>)", re.S)
 _ROW_RE = re.compile(r"<row\b[^>]*>(.*?)</row>", re.S)
 _CELL_RE = re.compile(r"<c\b([^>]*?)(?:/>|>(.*?)</c>)", re.S)
+_CELL_TYPE_RE = re.compile(r"""(?:^|\s)t\s*=\s*["'](s|inlineStr)["']""")
 _V_RE = re.compile(r"<v>(.*?)</v>", re.S)
 
 
-def _extract_xlsx(zf, notes):
-    shared = []
+def _xlsx_shared_strings(zf, notes):
     try:
         raw = _safe_read_member(zf, zf.getinfo("xl/sharedStrings.xml"), notes)
         if raw:
-            shared = [html.unescape(_TAG_RE.sub("", m)) for m in _SI_RE.findall(raw.decode("utf-8", "ignore"))]
+            xml = _decode_bytes(raw, "utf-8", "ignore", notes)
+            return [html.unescape(_TAG_RE.sub("", m)) for m in _SI_RE.findall(xml)]
     except KeyError:
         pass
+    return []
+
+
+def _extract_xlsx(zf, notes):
+    shared = None
+    unresolved = False
     lines = []
     for info in zf.infolist():
         if not re.match(r"^xl/worksheets/sheet\d+\.xml$", info.filename):
@@ -381,20 +400,34 @@ def _extract_xlsx(zf, notes):
         raw = _safe_read_member(zf, info, notes)
         if not raw:
             continue
-        for row in _ROW_RE.findall(raw.decode("utf-8", "ignore")):
+        for row in _ROW_RE.findall(_decode_bytes(raw, "utf-8", "ignore", notes)):
             cells = []
             for attrs, inner in _CELL_RE.findall(row):
                 inner = inner or ""
                 v = _V_RE.search(inner)
-                if 't="s"' in attrs and v:
-                    idx = int(v.group(1))
-                    cells.append(shared[idx] if idx < len(shared) else "")
-                elif 't="inlineStr"' in attrs:
+                type_attr = _CELL_TYPE_RE.search(attrs)
+                cell_type = type_attr.group(1) if type_attr else None
+                if cell_type == "s":
+                    if shared is None:
+                        shared = _xlsx_shared_strings(zf, notes)
+                    try:
+                        idx = int(v.group(1)) if v else -1
+                    except ValueError:
+                        idx = -1
+                    if 0 <= idx < len(shared):
+                        cells.append(shared[idx])
+                    else:
+                        unresolved = True
+                        cells.append("")
+                elif cell_type == "inlineStr":
                     cells.append(html.unescape(_TAG_RE.sub("", inner)))
                 elif v:
                     cells.append(html.unescape(v.group(1)))
             lines.append("\t".join(cells))
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    if unresolved:
+        notes.append("XLSX_SHARED_STRING_SKIPPED" if text.strip() else "XLSX_SHARED_STRING_ERROR")
+    return text
 
 
 def _extract_pdf(data, notes):
@@ -426,6 +459,8 @@ def _extract_pdf(data, notes):
         text = "\n".join(parts)
         if not text.strip():
             notes.append("PDF_NO_TEXT_LAYER")  # PDF scan ảnh -> cần OCR
+        elif any(not part.strip() for part in parts):
+            notes.append("PDF_PAGE_WITHOUT_TEXT")
         return text, False
     except Exception as e:
         notes.append("PDF_PARSE_ERROR:" + type(e).__name__)
@@ -444,10 +479,20 @@ def _extract_binary_strings(data):
     return "\n".join(parts)
 
 
+# zipfile uses optional codecs. A corrupt compressed stream may fail before the CRC check.
+_ZIP_DATA_ERRORS = (zipfile.BadZipFile, EOFError, ValueError, OSError)
+if getattr(zipfile, "zlib", None) is not None:
+    _ZIP_DATA_ERRORS += (zipfile.zlib.error,)
+if getattr(zipfile, "lzma", None) is not None:
+    _ZIP_DATA_ERRORS += (zipfile.lzma.LZMAError,)
+
+
 def _extract(data, ftype, notes, depth=0):
     """Trả về (text | None, encrypted: bool, member_types: list)."""
     if ftype in TEXT_EXTS or ftype == "sql":
-        return _decode_text(data[:MAX_TEXT_READ_BYTES]), False, []
+        if len(data) > MAX_TEXT_READ_BYTES:
+            notes.append("TEXT_READ_LIMIT")
+        return _decode_text(data[:MAX_TEXT_READ_BYTES], notes), False, []
     if ftype == "office_encrypted":
         return None, True, []
     if ftype == "pdf":
@@ -463,7 +508,17 @@ def _extract(data, ftype, notes, depth=0):
                 if ftype in ("docx", "pptx"):
                     return _extract_docx_pptx(zf, ftype, notes), False, []
                 return _extract_archive(zf, notes, depth)
-        except (zipfile.BadZipFile, RuntimeError, ValueError, OSError):
+        except NotImplementedError:
+            notes.append("ZIP_FEATURE_UNSUPPORTED")
+            return None, False, []
+        except RuntimeError as exc:
+            # zipfile reports a missing optional codec as a plain RuntimeError.
+            if str(exc).startswith("Compression requires the (missing) "):
+                notes.append("ZIP_CODEC_UNAVAILABLE")
+            else:
+                notes.append("ZIP_READ_ERROR")
+            return None, False, []
+        except _ZIP_DATA_ERRORS:
             notes.append("ZIP_CORRUPT")
             return None, False, []
     if ftype in ("doc", "xls", "ppt", "ole", "bin", "sqlite"):
@@ -473,6 +528,8 @@ def _extract(data, ftype, notes, depth=0):
         notes.append("IMAGE_NO_OCR")
     elif ftype in ("rar", "7z", "gz"):
         notes.append("ARCHIVE_UNSUPPORTED")
+    else:
+        notes.append("NO_EXTRACTOR")
     return None, False, []
 
 
@@ -513,13 +570,21 @@ def _has_context(text, start, kind):
 
 
 def _scan_rule(rule, text, text_cf, text_folded):
-    """Trả về chi tiết match của 1 rule, hoặc None nếu không match."""
+    """Return match details (if any) and whether this rule finished scanning."""
     rtype = (rule.get("rule_type") or "REGEX").upper()
     pattern = rule.get("pattern") or ""
     total, values, samples, context = 0, set(), [], False
 
+    if not isinstance(pattern, str):
+        return None, "ERROR"
+    compiled = _compile_rule_pattern(rtype, pattern)
+    if not compiled:
+        return None, "ERROR"
+    if not text:
+        return None, "FULL"
+
     if rtype == "DICTIONARY":
-        for rx, on_folded in _compile_dictionary(pattern):
+        for rx, on_folded in compiled:
             for m in rx.finditer(text_folded if on_folded else text_cf):
                 total += 1
                 values.add(m.group(0))
@@ -528,12 +593,9 @@ def _scan_rule(rule, text, text_cf, text_folded):
         context = total > 0  # nhãn mật là dấu hiệu có chủ đích, không cần ngữ cảnh
         samples = sorted(values)[:SAMPLES_PER_RULE]
     else:
-        rx = _compile_regex(pattern)
-        if rx is None:
-            return None
         kind = _rule_kind(rule)
         validator = _VALIDATORS.get(kind)
-        for m in rx.finditer(text):
+        for m in compiled.finditer(text):
             value = m.group(0)
             if validator and not validator(value):
                 continue  # regex khớp nhưng không phải dữ liệu thật -> bỏ (giảm false positive)
@@ -549,11 +611,12 @@ def _scan_rule(rule, text, text_cf, text_folded):
                 break
 
     if total == 0:
-        return None
-    return {"rule_id": rule.get("id"), "rule_name": rule.get("rule_name"),
-            "rule_type": rtype, "category": rule.get("category"),
-            "severity": (rule.get("severity") or "LOW").upper(),
-            "total": total, "unique": len(values), "context": context, "samples": samples}
+        return None, "FULL"
+    hit = {"rule_id": rule.get("id"), "rule_name": rule.get("rule_name"),
+           "rule_type": rtype, "category": rule.get("category"),
+           "severity": (rule.get("severity") or "LOW").upper(),
+           "total": total, "unique": len(values), "context": context, "samples": samples}
+    return hit, "PARTIAL" if total >= MAX_MATCHES_PER_RULE else "FULL"
 
 
 def _score(hits, extension_mismatch=False):
@@ -593,17 +656,22 @@ def _score(hits, extension_mismatch=False):
 def scan_text(text, rules, extension_mismatch=False):
     """Quét 1 đoạn text (dùng trực tiếp cho Clipboard)."""
     started = time.perf_counter()
-    text = _nfc(text or "")[:MAX_TEXT_CHARS]
+    text = _nfc(text or "")
+    coverage = "FULL" if rules and len(text) <= MAX_TEXT_CHARS else "PARTIAL"
+    text = text[:MAX_TEXT_CHARS]
     hits = []
-    if text and rules:
+    if rules:
         text_cf = text.casefold()
         text_folded = fold_accents(text)
         for rule in rules:
-            hit = _scan_rule(rule, text, text_cf, text_folded)
+            hit, rule_coverage = _scan_rule(rule, text, text_cf, text_folded)
+            if rule_coverage == "ERROR" or (rule_coverage == "PARTIAL" and coverage == "FULL"):
+                coverage = rule_coverage
             if hit:
                 hits.append(hit)
     level, reasons = _score(hits, extension_mismatch) if hits else ("LOW", [])
     return {
+        "inspection_coverage": coverage,
         "matched_rule_ids": [h["rule_id"] for h in hits],
         "matched_rule_names": [h["rule_name"] for h in hits],
         "confidence_level": level,
@@ -729,14 +797,39 @@ def inspect_file(path, status=None, rules=None, file_types=None, destination=Non
         path, current, rules, file_types, destination, enforce_file_scope, file_name, started, read))
 
 
+def _extraction_coverage(ftype, text, encrypted, notes):
+    # Extraction notes are only added when an extractor encounters a limitation.
+    if any(note in ("ZIP_CORRUPT", "ZIP_READ_ERROR", "XLSX_SHARED_STRING_ERROR")
+           or note.startswith("PDF_PARSE_ERROR:") for note in notes):
+        return "ERROR"
+    if encrypted or text is None:
+        return "UNSUPPORTED"
+    if ftype == "pdf" and "PDF_NO_TEXT_LAYER" in notes and "PDF_TRUNCATED" not in notes:
+        return "UNSUPPORTED"
+    return "PARTIAL" if notes else "FULL"
+
+
+def _file_coverage(stages):
+    if "ERROR" in stages.values():
+        return "ERROR"
+    if "UNSUPPORTED" in stages.values():
+        return "UNSUPPORTED"
+    return "FULL" if all(stage == "FULL" for stage in stages.values()) else "PARTIAL"
+
+
+def no_match_reason(coverage):
+    return "CLEAN" if coverage == "FULL" else "INSPECTION_INCOMPLETE"
+
+
 def _inspect_file_policy(path, status, rules, file_types, destination, scoped, file_name, started, read):
     action = status.get("effective_action", "OPEN") if status.get("is_governed") else "OPEN"
     rules = status.get("content_rules") if rules is None else rules
     file_types = status.get("file_types") if file_types is None else file_types
 
     declared_ext = os.path.splitext(path)[1].lower().lstrip(".")
+    stages = {"read": "NOT_RUN", "extract": "NOT_RUN", "scan": "NOT_RUN"}
     result = {
-        "verdict": "ALLOW", "reason": "CLEAN", "reasons": [], "notes": [],
+        "inspection_stages": stages, "reasons": [], "notes": [],
         "file_path": path, "file_name": file_name or os.path.basename(path), "file_size": None,
         "file_hash_sha256": None, "declared_ext": declared_ext, "real_type": None,
         "category": None, "extension_mismatch": False, "encrypted": False, "inspected": False,
@@ -744,8 +837,11 @@ def _inspect_file_policy(path, status, rules, file_types, destination, scoped, f
         "confidence_level": "LOW", "match_count": 0, "rule_details": [], "scan_ms": 0.0,
     }
 
-    def done(verdict, reason, confidence=None, extra_reason=None):
-        result["verdict"], result["reason"] = verdict, reason
+    def done(verdict, reason=None, confidence=None, extra_reason=None):
+        coverage = _file_coverage(stages)
+        result["inspection_coverage"] = coverage
+        result["verdict"] = verdict
+        result["reason"] = reason if reason is not None else no_match_reason(coverage)
         if confidence:
             result["confidence_level"] = confidence
         if extra_reason:
@@ -770,10 +866,12 @@ def _inspect_file_policy(path, status, rules, file_types, destination, scoped, f
     try:
         size, data, digest = read()
     except OSError as e:
+        stages["read"] = "ERROR"
         result["notes"].append("READ_ERROR:" + type(e).__name__)
         # Không đọc được file thì không chứng minh được là sạch -> fail-closed khi BLOCK
         return done(_verdict_for_violation(action), "UNREADABLE", "MEDIUM",
                     "Khong doc duoc file (%s)" % type(e).__name__)
+    stages["read"] = "FULL" if len(data) == size else "PARTIAL"
     result["file_size"] = size
     result["file_hash_sha256"] = digest
 
@@ -810,6 +908,7 @@ def _inspect_file_policy(path, status, rules, file_types, destination, scoped, f
 
     # --- Trích xuất nội dung ---
     text, encrypted, member_types = _extract(data, real_type, result["notes"])
+    stages["extract"] = _extraction_coverage(real_type, text, encrypted, result["notes"])
     result["encrypted"] = encrypted
     for m in member_types:
         if m["declared_ext"] in blocked or m["real_type"] in blocked:
@@ -825,11 +924,12 @@ def _inspect_file_policy(path, status, rules, file_types, destination, scoped, f
     # --- Quét + chấm điểm ---
     result["inspected"] = True
     scan = scan_text(text, rules, result["extension_mismatch"])
+    stages["scan"] = scan["inspection_coverage"]
     for key in ("matched_rule_ids", "matched_rule_names", "confidence_level", "match_count", "rule_details"):
         result[key] = scan[key]
     result["reasons"].extend(scan["score_reasons"])
     if not scan["matched_rule_ids"]:
-        return done("ALLOW", "CLEAN")
+        return done("ALLOW")
     if action == "BLOCK" and _LEVEL_IDX[scan["confidence_level"]] >= _LEVEL_IDX[BLOCK_MIN_LEVEL]:
         return done("BLOCK", "CONTENT_MATCH")
     return done("LOG", "CONTENT_MATCH")
@@ -841,6 +941,7 @@ def _inspect_file_policy(path, status, rules, file_types, destination, scoped, f
 def to_log_inspection(result):
     """Phần 'content_inspection' trong log JSON gửi Wazuh (đã che dữ liệu nhạy cảm)."""
     return {
+        **{key: result[key] for key in ("inspection_coverage", "inspection_stages") if key in result},
         "matched_rule_ids": result.get("matched_rule_ids", []),
         "matched_rule_names": result.get("matched_rule_names", []),
         "confidence_level": result.get("confidence_level", "LOW"),
@@ -857,7 +958,7 @@ def to_log_inspection(result):
 
 def to_report_fields(result):
     """Các trường dùng cho POST agent_report.php."""
-    matched = bool(result.get("matched_rule_ids")) or result.get("reason") != "CLEAN"
+    matched = bool(result.get("matched_rule_ids")) or result.get("reason") not in ("CLEAN", "INSPECTION_INCOMPLETE")
     return {
         "file_path": result.get("file_path"),
         "file_hash_sha256": result.get("file_hash_sha256"),

@@ -50,9 +50,46 @@ CLIPBOARD dạng văn bản và NETWORK_WEB dạng kết nối không có điề
 | 5 | File Type Control: đuôi khai báo hoặc loại thật nằm trong danh sách luôn chặn | `FILE_TYPE_BLOCKED` |
 | 6 | Policy không có content rule | `BLOCK` → `EXIT_POINT_BLOCKED`; `REPORT_ONLY` → `EXIT_POINT_MONITORED` |
 | 7 | Trích xuất text; zip được quét 1 cấp bên trong | Zip chứa file bị cấm: `FILE_TYPE_BLOCKED`; có mật khẩu: `ENCRYPTED_CONTENT` |
-| 8 | Quét nội dung 2 tầng + chấm điểm | `CONTENT_MATCH` hoặc `CLEAN` |
+| 8 | Quét nội dung 2 tầng + chấm điểm | `CONTENT_MATCH`, `CLEAN` hoặc `INSPECTION_INCOMPLETE` |
 
 Ánh xạ sang 4 trạng thái trong báo cáo: không có policy = **OPEN**; `REPORT_ONLY` = **MONITORED**; `BLOCK` có content rule = **CONTROLLED**; `BLOCK` không có content rule = **BLOCKED**.
+
+### Đọc inspection metadata
+
+`inspect_file()` trả về `inspection_coverage` cho **policy được chọn**. Dùng `verdict` để thực thi và `inspection_coverage` để biết engine đã kiểm tra được bao nhiêu.
+
+| `inspection_coverage` | Ý nghĩa |
+|---|---|
+| `FULL` | Engine đã đọc đủ số byte theo kích thước file tại thời điểm bắt đầu đọc, trích xuất phần văn bản mà bộ đọc hỗ trợ và quét xong với bộ rule. File text rỗng có thể đạt `FULL`. |
+| `PARTIAL` | Đã chạm giới hạn đọc, trích xuất hoặc quét, phải dùng bộ trích xuất chuỗi best-effort, hoặc policy đã quyết định trước khi quét. Ví dụ khác gồm ZIP có thành viên bị bỏ qua và PDF có trang không trả về text. |
+| `UNSUPPORTED` | Engine không thể trích xuất văn bản của file, chẳng hạn ảnh cần OCR, PDF thiếu thư viện đọc, PDF chỉ có trang không trả về text, hoặc file mã hoá cần mật khẩu. |
+| `ERROR` | Đọc file gặp lỗi, bộ trích xuất báo lỗi parse, hoặc một rule không biên dịch được khi quét. Dictionary có 0 từ khóa thực thi cũng ghi `scan=ERROR`. |
+
+`inspection_stages` ghi riêng ba bước `read`, `extract`, `scan`. Mỗi bước đánh giá phần đầu vào mà bước đó nhận được. Giá trị `NOT_RUN` chỉ xuất hiện ở từng bước. Ví dụ, một file đã đọc đủ nhưng phần text trích xuất vượt giới hạn ký tự có thể trả về kết quả sau.
+
+```json
+{
+  "verdict": "ALLOW",
+  "reason": "INSPECTION_INCOMPLETE",
+  "inspection_coverage": "PARTIAL",
+  "inspection_stages": {"read": "FULL", "extract": "FULL", "scan": "PARTIAL"},
+  "inspected": true
+}
+```
+
+Trạng thái tổng hợp ưu tiên `ERROR`, sau đó đến `UNSUPPORTED`. Chỉ khi cả ba bước đều `FULL` thì kết quả file mới là `FULL`. Với ngoại lệ policy, `reason` vẫn là `ALLOWED_FILE` hoặc `ALLOWED_LOCATION`, các bước chưa chạy ghi `NOT_RUN`. Bước đọc đo lượng byte cấp cho bộ trích xuất, độc lập với việc tính SHA-256. `FULL` mô tả khả năng của bộ đọc đã chọn, ví dụ phần văn bản của PDF và các phần XML nêu ở mục 4. Engine chưa thực hiện OCR hay xác nhận file ổn định trong suốt quá trình đọc.
+
+Khi quét và không có match, engine trả về `CLEAN` chỉ với `FULL`, các trường hợp còn lại trả về `INSPECTION_INCOMPLETE`. Nếu bộ trích xuất không trả về text, đường xử lý `NOT_INSPECTABLE` vẫn áp dụng. Một match trong lần quét chưa hoàn tất vẫn có thể cho `CONTENT_MATCH` và verdict `LOG` hoặc `BLOCK`. Cờ `inspected` cho biết engine đã gọi bộ quét text, kể cả khi phần text nhận được rỗng.
+
+`scan_text()` và `scan_content_with_rules()` trả về `inspection_coverage` cho riêng bước quét. Khi đạt giới hạn số match, bộ quét dừng tìm và ghi `PARTIAL`. Log JSON qua `to_log_inspection()` mang theo metadata hiện có. Worker cURL chuyển trạng thái tổng hợp vào journal và dùng trường `inspection_limit` cho các lần quét bị giới hạn. Payload của `to_report_fields()` tiếp tục dùng các trường báo cáo hiện có.
+
+Lỗi biên dịch của một rule (kể cả `OverflowError`) chỉ ảnh hưởng coverage của policy chứa rule đó. Các rule hợp lệ tiếp tục quét. Engine giữ match tìm được và chọn verdict theo thứ tự `BLOCK > LOG > ALLOW`. Kết quả ghi coverage của policy thắng.
+
+Với XLSX, engine đọc bảng shared strings khi gặp ô dùng chỉ mục. Nếu chỉ mục không phân giải được, engine ghi `XLSX_SHARED_STRING_SKIPPED` và `extract=PARTIAL` khi còn văn bản để quét. Nếu toàn bộ phần văn bản bị mất, engine ghi `XLSX_SHARED_STRING_ERROR` và `extract=ERROR`. Workbook dùng inline strings có thể đạt `FULL` khi thiếu bảng shared strings.
+
+Với ZIP, thiếu codec cho file cần đọc cho kết quả `UNSUPPORTED` với note `ZIP_CODEC_UNAVAILABLE`. Tính năng ZIP mà thư viện chưa hỗ trợ ghi `ZIP_FEATURE_UNSUPPORTED`. Lỗi cấu trúc, dữ liệu nén hỏng hoặc checksum sai cho kết quả `ERROR` với note `ZIP_CORRUPT`.
+
+Khi worker cURL cũ gửi `CLEAN` mà thiếu `inspection_coverage`, phía nhận dùng reason `INSPECTION_INCOMPLETE` và để trống bằng chứng coverage. Verdict, policy và trường `inspection_limit` (nếu có) của worker tiếp tục quyết định cách xử lý và ghi journal.
 
 ## 3. Nhận diện loại file thật (chống đổi đuôi)
 
@@ -116,4 +153,10 @@ python dev_tools/make_samples.py          # tạo 12 file mẫu trong dev_tools/
 python content_inspection.py dev_tools/dlp_samples
 ```
 
-Bộ test gồm 35 ca: validator, false positive, chấm điểm, đổi đuôi file, zip chứa file cấm, zip có mật khẩu, UTF-16, ngoại lệ, fail-closed, log đã che dữ liệu, PDF, và hiệu năng (file 5 MB dày đặc dữ liệu nhạy cảm quét dưới 1 giây).
+Các test dùng fixture tổng hợp để kiểm tra verdict, giới hạn từng bước, trạng thái của PDF và archive, rule lỗi, định dạng log và tốc độ quét. Để chạy cả các consumer và giao thức worker cURL, dùng `python -m unittest discover -s dev_tools -p "test_*.py" -v` trong thư mục `agent`. Các test dùng API Win32 cần chạy trên Windows.
+
+### Kiểm chứng bản tích hợp trên Windows
+
+Chạy lại các test Python cần Win32 và năm suite PowerShell trong `agent/dev_tools` trên bản build từ merge commit. Ghi nhận phiên bản Windows, Python, kết quả và SHA. Kiểm tra cài mới với Python bootstrap, enrollment và redirect theo checklist release. [Installer release acceptance](INSTALLER_PYTHON.md#release-acceptance)
+
+Chạy `agent/dev_tools/curl_windows_runtime_check.py --worker-cleanup-only` trong phiên đăng nhập Windows tiêu chuẩn. Dùng file tổng hợp kiểm tra một lần quét đầy đủ và một lần quét chạm giới hạn qua worker thật. Đối chiếu verdict, reason và `inspection_coverage` trong journal của đúng phiên. Với hai phiên đăng nhập, xác nhận notification của `BLOCKED_KILL` đến đúng desktop và sự kiện coverage không tạo notification chặn. Khi kiểm tra upgrade hoặc uninstall, đối chiếu receipt `complete` với worker cleanup đã xác nhận và `pending_resumes=0`. Nếu cleanup chưa được xác nhận, receipt phải là `incomplete` và giữ marker của phiên. [Native worker cleanup](CURL_AGENT.md#native-worker-cleanup-verification) · [Thông báo cURL](CURL_AGENT.md#curl-notification-acceptance)

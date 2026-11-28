@@ -216,23 +216,31 @@ try {
     }
 
     Check 'the private journal ACL must belong to the originating account' {
-        $file = Join-Path $scratch 'dlp_events.log'
+        $directory = Join-Path $scratch 'private'
+        $file = Join-Path $directory 'dlp_events.log'
         $tail = [DlpNotifier.JournalTail]::new($file, $sid)
         $validate = [DlpNotifier.JournalTail].GetMethod('PrivateAcl', [Reflection.BindingFlags]'Instance, NonPublic')
-        # Validate the writer's exact descriptor in memory. Sandbox temp files also
-        # need a separate sandbox SID for writes and cannot carry that descriptor.
+        # Check the writer's descriptor and use its protected DACL for the fixture directory.
         $security = [Security.AccessControl.DirectorySecurity]::new()
         $descriptor = "O:$($sid.Value)D:P(A;OICI;FA;;;$($sid.Value))(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
         $security.SetSecurityDescriptorSddlForm($descriptor)
         Assert ($validate.Invoke($tail, @($security, $true)))
-        $other = [DlpNotifier.JournalTail]::new($file, [Security.Principal.SecurityIdentifier]::new('S-1-5-11'))
+        $authenticatedUsers = [Security.Principal.SecurityIdentifier]::new('S-1-5-11')
+        $other = [DlpNotifier.JournalTail]::new($file, $authenticatedUsers)
         Assert (-not $validate.Invoke($other, @($security, $true)))
+        $null = [IO.Directory]::CreateDirectory($directory, $security)
         $security.SetSecurityDescriptorSddlForm($descriptor + '(A;OICI;FR;;;AU)')
         Assert (-not $validate.Invoke($tail, @($security, $true)))
 
         [IO.File]::WriteAllText($file, '{"n":1}' + $lf, $utf8)
         Assert ($tail.Poll().Length -eq 0)
         [IO.File]::AppendAllText($file, '{"n":2}' + $lf, $utf8)
+        Assert (($tail.Poll() -join ',') -eq '{"n":2}')
+
+        $fileSecurity = [IO.File]::GetAccessControl($file)
+        $fileSecurity.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($authenticatedUsers, 'Read', 'Allow'))
+        [IO.File]::SetAccessControl($file, $fileSecurity)
+        [IO.File]::AppendAllText($file, '{"n":3}' + $lf, $utf8)
         Assert ($tail.Poll().Length -eq 0)
     }
 } finally {

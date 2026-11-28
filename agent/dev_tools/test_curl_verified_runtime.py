@@ -5,7 +5,7 @@ import json
 import subprocess
 import sys
 import unittest
-from contextlib import contextmanager, redirect_stdout
+from contextlib import contextmanager, nullcontext, redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -17,6 +17,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import curl_agent as curl
 import content_inspection
+import log_writer
+from curl_windows import LogonScope
 from dev_tools import make_samples
 from policy_utils import get_exit_point_status
 
@@ -91,6 +93,54 @@ class VerifiedProcessTests(unittest.TestCase):
         origin.close.assert_called_once()
         self.assertFalse(self.monitor.pending_resume)
 
+    def test_verified_worker_coverage_and_block_reach_scoped_journal(self):
+        scope = LogonScope(b"test-sid", 0x100000002, 3, 0x2000)
+        status = get_exit_point_status([{
+            **STATUS["policies"][0],
+            "content_rules": [{"id": 1, "rule_type": "DICTIONARY", "pattern": "green", "severity": "HIGH"}],
+        }], curl.EXIT_POINT)
+
+        def reply(_script, payload, token_handle, _timeout):
+            output = io.StringIO()
+            reader = SimpleNamespace(buffer=io.BytesIO(payload))
+            with patch.object(curl.sys, "stdin", reader), redirect_stdout(output):
+                self.assertEqual(curl._run_origin_worker(token_handle), 0)
+            return output.getvalue()
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            partial = root / "partial.txt"
+            blocked = root / "blocked.txt"
+            journal_path = root / "events.log"
+            partial.write_text("ordinary text", encoding="utf-8")
+            blocked.write_text("green", encoding="utf-8")
+            self.proc.cmdline.return_value = ["curl.exe", "-F", "a=@" + str(partial),
+                                              "-F", "b=@" + str(blocked), "https://receiver.example/"]
+            journal = curl.CurlJournal("TEST", None, windows_scope=scope)
+            monitor = curl.CurlMonitor(journal.record, self.legacy_worker, self.terminate, windows_scope=scope)
+            self.terminate.return_value = curl.Termination(True, "CONFIRMED")
+            # Mock OS token and volume checks while exercising the real request/reply and journal paths.
+            with (patch.object(content_inspection, "MAX_TEXT_CHARS", 6),
+                  patch.object(log_writer, "LOG_FILE", journal_path),
+                  patch.object(curl, "open_origin", return_value=Mock(token_handle=7)),
+                  patch.object(curl, "impersonate_origin", return_value=nullcontext()),
+                  patch.object(curl, "verify_drive"),
+                  patch.object(curl, "verify_file_volume"),
+                  patch.object(curl, "run_inspection_worker", side_effect=reply)):
+                monitor.poll(status, [self.proc])
+            events = [json.loads(line) for line in journal_path.read_text(encoding="utf-8").splitlines()]
+
+        self.terminate.assert_called_once_with(self.proc)
+        self.legacy_worker.assert_not_called()
+        self.assertEqual([(event["action_taken"], event["content_inspection"]["verdict"],
+                           event["content_inspection"]["reason"], event["content_inspection"]["inspection_coverage"])
+                          for event in events],
+                         [("BLOCKED_KILL", "BLOCK", "CONTENT_MATCH", "FULL"),
+                          ("LOGGED", "ALLOW", "PARTIAL_CONTENT_INSPECTION", "PARTIAL")])
+        for event in events:
+            self.assertEqual((event["source"]["session_id"], event["source"]["logon_luid"]),
+                             (3, "0000000100000002"))
+
     def test_engine_log_followed_by_block_reaches_termination(self):
         status = get_exit_point_status([{
             **STATUS["policies"][0],
@@ -129,6 +179,30 @@ class VerifiedProcessTests(unittest.TestCase):
 
 
 class VerifiedWorkerTests(unittest.TestCase):
+    def test_worker_protocols_only_report_clean_with_full_coverage(self):
+        clean = {"verdict": "ALLOW", "reason": "CLEAN", "inspected": True,
+                 "file_hash_sha256": "a" * 64, "matched_rule_ids": [],
+                 "confidence_score": None, "policy_id": 42, "policy_action": "BLOCK"}
+        for extra, reason in (({}, "INSPECTION_INCOMPLETE"),
+                              ({"inspection_limit": "PARTIAL_CONTENT_INSPECTION"}, "INSPECTION_INCOMPLETE"),
+                              ({"inspection_coverage": "FULL"}, "CLEAN")):
+            with self.subTest(extra=extra):
+                wire = {**clean, **extra}
+
+                def reply(_path, payload, _token, _timeout):
+                    return json.dumps({"request_id": json.loads(payload)["request_id"], "results": [wire]})
+
+                with patch.object(curl, "run_inspection_worker", side_effect=reply):
+                    verified = curl._inspect_verified_origin([UPLOAD], STATUS, Mock(token_handle=7))
+                with patch.object(curl.subprocess, "run", return_value=Mock(stdout=json.dumps([wire]))):
+                    standalone = curl._inspect_in_worker([UPLOAD], STATUS)
+                self.assertEqual(verified, [{**wire, "reason": reason}])
+                self.assertEqual(standalone, verified)
+        for inconsistent in ({"inspected": False}, {"inspection_limit": "PARTIAL_CONTENT_INSPECTION"}):
+            with self.subTest(inconsistent=inconsistent):
+                self.assertFalse(curl._valid_worker_result({**clean, "inspection_coverage": "FULL", **inconsistent},
+                                                          STATUS))
+
     def test_response_binds_to_job_and_rejects_out_of_scope_results(self):
         verdict = {"verdict": "BLOCK", "reason": "CONTENT_MATCH", "inspected": True,
                    "file_hash_sha256": "a" * 64, "matched_rule_ids": [1],
@@ -145,7 +219,8 @@ class VerifiedWorkerTests(unittest.TestCase):
             self.assertEqual(curl._inspect_verified_origin([UPLOAD], STATUS, Mock(token_handle=7)), [verdict])
             for field, value in (("policy_id", 10), ("policy_action", "REPORT_ONLY"),
                                  ("matched_rule_ids", [99]), ("matched_rule_ids", [True]),
-                                 ("file_hash_sha256", "secret"), ("verdict", []), ("pid", 100)):
+                                 ("file_hash_sha256", "secret"), ("verdict", []), ("pid", 100),
+                                 ("inspection_coverage", ["FULL"])):
                 with self.subTest(field=field), patch.dict(verdict, {field: value}):
                     with self.assertRaises(ValueError):
                         curl._inspect_verified_origin([UPLOAD], STATUS, Mock(token_handle=7))
@@ -244,6 +319,16 @@ class EngineWorkerResultTests(unittest.TestCase):
                 result, = curl._inspect_verified_origin([curl.Upload(str(source), DESTINATION)], status,
                                                         Mock(token_handle=7))
         return result
+
+    def test_worker_transports_coverage_without_changing_verdict_or_confidence(self):
+        with patch.object(content_inspection, "MAX_TEXT_CHARS", 3):
+            result = self.inspect_source("sample.txt", b"blue")
+        self.assertEqual((result["verdict"], result["reason"], result["inspection_coverage"],
+                          result["inspection_limit"], result["confidence_score"]),
+                         ("ALLOW", "INSPECTION_INCOMPLETE", "PARTIAL", "PARTIAL_CONTENT_INSPECTION", None))
+        for invalid in ({"reason": "CLEAN"}, {"verdict": "BLOCK"}, {"inspection_coverage": "FULL"}):
+            with self.subTest(invalid=invalid):
+                self.assertFalse(curl._valid_worker_result({**result, **invalid}, STATUS))
 
     def test_block_policy_accepts_low_confidence_log(self):
         result = self.inspect_source("low.txt", b"sensitive")

@@ -145,7 +145,7 @@ class CurlFileCoverageTests(unittest.TestCase):
         terminate.assert_not_called()
 
     def test_partial_text_read_is_separate_from_allow_disposition(self):
-        self.safe.write_bytes(b"a" * (curl.MAX_TEXT_READ_BYTES + 1))
+        self.safe.write_bytes(b"a" * (content_inspection.MAX_TEXT_READ_BYTES + 1))
         records, _, terminate = self.observe(self.safe)
         self.assertEqual(len(records), 1)
         _, result, _ = records[0]
