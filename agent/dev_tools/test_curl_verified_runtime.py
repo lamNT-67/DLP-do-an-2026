@@ -129,6 +129,30 @@ class VerifiedProcessTests(unittest.TestCase):
 
 
 class VerifiedWorkerTests(unittest.TestCase):
+    def test_worker_protocols_only_report_clean_with_full_coverage(self):
+        clean = {"verdict": "ALLOW", "reason": "CLEAN", "inspected": True,
+                 "file_hash_sha256": "a" * 64, "matched_rule_ids": [],
+                 "confidence_score": None, "policy_id": 42, "policy_action": "BLOCK"}
+        for extra, reason in (({}, "INSPECTION_INCOMPLETE"),
+                              ({"inspection_limit": "PARTIAL_CONTENT_INSPECTION"}, "INSPECTION_INCOMPLETE"),
+                              ({"inspection_coverage": "FULL"}, "CLEAN")):
+            with self.subTest(extra=extra):
+                wire = {**clean, **extra}
+
+                def reply(_path, payload, _token, _timeout):
+                    return json.dumps({"request_id": json.loads(payload)["request_id"], "results": [wire]})
+
+                with patch.object(curl, "run_inspection_worker", side_effect=reply):
+                    verified = curl._inspect_verified_origin([UPLOAD], STATUS, Mock(token_handle=7))
+                with patch.object(curl.subprocess, "run", return_value=Mock(stdout=json.dumps([wire]))):
+                    standalone = curl._inspect_in_worker([UPLOAD], STATUS)
+                self.assertEqual(verified, [{**wire, "reason": reason}])
+                self.assertEqual(standalone, verified)
+        for inconsistent in ({"inspected": False}, {"inspection_limit": "PARTIAL_CONTENT_INSPECTION"}):
+            with self.subTest(inconsistent=inconsistent):
+                self.assertFalse(curl._valid_worker_result({**clean, "inspection_coverage": "FULL", **inconsistent},
+                                                          STATUS))
+
     def test_response_binds_to_job_and_rejects_out_of_scope_results(self):
         verdict = {"verdict": "BLOCK", "reason": "CONTENT_MATCH", "inspected": True,
                    "file_hash_sha256": "a" * 64, "matched_rule_ids": [1],

@@ -52,6 +52,32 @@ class PolicyEvaluationTests(unittest.TestCase):
         self.assertEqual((result["verdict"], result["policy_id"], result["policy_action"],
                           result["matched_rule_ids"]), (verdict, policy_id, action, list(rules)))
 
+    def test_compiler_failure_is_local_to_its_rule_and_policy(self):
+        failed = rule(1, "palette-compiler-fixture")
+        good = rule(2, "green")
+        compile_pattern = content_inspection.re.compile
+
+        def compile_with_fault(pattern, *args, **kwargs):
+            if pattern == failed["pattern"]:
+                raise OverflowError("simulated compiler limit")
+            return compile_pattern(pattern, *args, **kwargs)
+
+        self.addCleanup(content_inspection._compile_rule_pattern.cache_clear)
+        with patch.object(content_inspection.re, "compile", side_effect=compile_with_fault):
+            broken = policy(20, "REPORT_ONLY", failed)
+            r = self.inspect("", broken)
+            self.assertEqual((r["verdict"], r["reason"], r["inspection_stages"]["scan"]),
+                             ("ALLOW", "INSPECTION_INCOMPLETE", "ERROR"))
+            for other_id in (10, 30):  # Exercise both evaluation orders after sorting by ID.
+                for action, verdict in (("BLOCK", "BLOCK"), ("REPORT_ONLY", "LOG")):
+                    with self.subTest(other_id=other_id, action=action):
+                        r = self.inspect("", broken, policy(other_id, action))
+                        self.assert_decision(r, verdict, other_id, action)
+            for ordered in ((good, failed), (failed, good)):
+                r = self.inspect("green", policy(10, "BLOCK", *ordered))
+                self.assert_decision(r, "BLOCK", 10, "BLOCK", [2])
+                self.assertEqual(r["inspection_coverage"], "ERROR")
+
     def test_ruleless_block_beats_out_of_scope_monitor(self):
         monitor = policy(22, "REPORT_ONLY", rule(2, "BETA"), file_types=[{"extension": "pdf"}])
         result = self.inspect("ordinary", policy(11, "BLOCK"), monitor, enforce_file_scope=True)

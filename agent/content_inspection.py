@@ -207,15 +207,6 @@ _VALIDATORS = {"CCCD": cccd_valid, "CARD": luhn_valid, "PHONE": phone_valid, "EM
 # ============================================================================
 # 4. BIÊN DỊCH RULE (có cache - rule từ server được dùng lại nhiều lần)
 # ============================================================================
-@lru_cache(maxsize=256)
-def _compile_regex(pattern):
-    try:
-        return re.compile(pattern)
-    except re.error:
-        return None
-
-
-@lru_cache(maxsize=256)
 def _compile_dictionary(pattern):
     """Trả về list (regex, chạy_trên_text_bỏ_dấu).
     - Từ khoá 1 từ ('Mật'): so khớp CÓ dấu, tránh nhầm 'mắt', 'mất', 'format'.
@@ -232,6 +223,16 @@ def _compile_dictionary(pattern):
         body = r"\s+".join(re.escape(part) for part in body.split())
         out.append((re.compile(r"(?<!\w)" + body + r"(?!\w)"), on_folded))
     return tuple(out)
+
+
+@lru_cache(maxsize=256)
+def _compile_rule_pattern(rtype, pattern):
+    try:
+        if rtype == "DICTIONARY":
+            return _compile_dictionary(pattern)
+        return re.compile(pattern)
+    except (re.error, ValueError, OverflowError, RecursionError):
+        return None
 
 
 # ============================================================================
@@ -371,21 +372,27 @@ def _extract_docx_pptx(zf, ftype, notes):
     return "\n".join(parts)
 
 
-_SI_RE = re.compile(r"<si>(.*?)</si>", re.S)
+_SI_RE = re.compile(r"<si\b[^>]*?(?:/>|>(.*?)</si>)", re.S)
 _ROW_RE = re.compile(r"<row\b[^>]*>(.*?)</row>", re.S)
 _CELL_RE = re.compile(r"<c\b([^>]*?)(?:/>|>(.*?)</c>)", re.S)
+_CELL_TYPE_RE = re.compile(r"""(?:^|\s)t\s*=\s*["'](s|inlineStr)["']""")
 _V_RE = re.compile(r"<v>(.*?)</v>", re.S)
 
 
-def _extract_xlsx(zf, notes):
-    shared = []
+def _xlsx_shared_strings(zf, notes):
     try:
         raw = _safe_read_member(zf, zf.getinfo("xl/sharedStrings.xml"), notes)
         if raw:
             xml = _decode_bytes(raw, "utf-8", "ignore", notes)
-            shared = [html.unescape(_TAG_RE.sub("", m)) for m in _SI_RE.findall(xml)]
+            return [html.unescape(_TAG_RE.sub("", m)) for m in _SI_RE.findall(xml)]
     except KeyError:
         pass
+    return []
+
+
+def _extract_xlsx(zf, notes):
+    shared = None
+    unresolved = False
     lines = []
     for info in zf.infolist():
         if not re.match(r"^xl/worksheets/sheet\d+\.xml$", info.filename):
@@ -398,15 +405,29 @@ def _extract_xlsx(zf, notes):
             for attrs, inner in _CELL_RE.findall(row):
                 inner = inner or ""
                 v = _V_RE.search(inner)
-                if 't="s"' in attrs and v:
-                    idx = int(v.group(1))
-                    cells.append(shared[idx] if idx < len(shared) else "")
-                elif 't="inlineStr"' in attrs:
+                type_attr = _CELL_TYPE_RE.search(attrs)
+                cell_type = type_attr.group(1) if type_attr else None
+                if cell_type == "s":
+                    if shared is None:
+                        shared = _xlsx_shared_strings(zf, notes)
+                    try:
+                        idx = int(v.group(1)) if v else -1
+                    except ValueError:
+                        idx = -1
+                    if 0 <= idx < len(shared):
+                        cells.append(shared[idx])
+                    else:
+                        unresolved = True
+                        cells.append("")
+                elif cell_type == "inlineStr":
                     cells.append(html.unescape(_TAG_RE.sub("", inner)))
                 elif v:
                     cells.append(html.unescape(v.group(1)))
             lines.append("\t".join(cells))
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    if unresolved:
+        notes.append("XLSX_SHARED_STRING_SKIPPED" if text.strip() else "XLSX_SHARED_STRING_ERROR")
+    return text
 
 
 def _extract_pdf(data, notes):
@@ -458,6 +479,14 @@ def _extract_binary_strings(data):
     return "\n".join(parts)
 
 
+# zipfile uses optional codecs. A corrupt compressed stream may fail before the CRC check.
+_ZIP_DATA_ERRORS = (zipfile.BadZipFile, EOFError, ValueError, OSError)
+if getattr(zipfile, "zlib", None) is not None:
+    _ZIP_DATA_ERRORS += (zipfile.zlib.error,)
+if getattr(zipfile, "lzma", None) is not None:
+    _ZIP_DATA_ERRORS += (zipfile.lzma.LZMAError,)
+
+
 def _extract(data, ftype, notes, depth=0):
     """Trả về (text | None, encrypted: bool, member_types: list)."""
     if ftype in TEXT_EXTS or ftype == "sql":
@@ -479,7 +508,17 @@ def _extract(data, ftype, notes, depth=0):
                 if ftype in ("docx", "pptx"):
                     return _extract_docx_pptx(zf, ftype, notes), False, []
                 return _extract_archive(zf, notes, depth)
-        except (zipfile.BadZipFile, RuntimeError, ValueError, OSError):
+        except NotImplementedError:
+            notes.append("ZIP_FEATURE_UNSUPPORTED")
+            return None, False, []
+        except RuntimeError as exc:
+            # zipfile reports a missing optional codec as a plain RuntimeError.
+            if str(exc).startswith("Compression requires the (missing) "):
+                notes.append("ZIP_CODEC_UNAVAILABLE")
+            else:
+                notes.append("ZIP_READ_ERROR")
+            return None, False, []
+        except _ZIP_DATA_ERRORS:
             notes.append("ZIP_CORRUPT")
             return None, False, []
     if ftype in ("doc", "xls", "ppt", "ole", "bin", "sqlite"):
@@ -536,10 +575,16 @@ def _scan_rule(rule, text, text_cf, text_folded):
     pattern = rule.get("pattern") or ""
     total, values, samples, context = 0, set(), [], False
 
+    if not isinstance(pattern, str):
+        return None, "ERROR"
+    compiled = _compile_rule_pattern(rtype, pattern)
+    if not compiled:
+        return None, "ERROR"
+    if not text:
+        return None, "FULL"
+
     if rtype == "DICTIONARY":
-        if not text:
-            return None, "FULL"
-        for rx, on_folded in _compile_dictionary(pattern):
+        for rx, on_folded in compiled:
             for m in rx.finditer(text_folded if on_folded else text_cf):
                 total += 1
                 values.add(m.group(0))
@@ -548,14 +593,9 @@ def _scan_rule(rule, text, text_cf, text_folded):
         context = total > 0  # nhãn mật là dấu hiệu có chủ đích, không cần ngữ cảnh
         samples = sorted(values)[:SAMPLES_PER_RULE]
     else:
-        rx = _compile_regex(pattern)
-        if rx is None:
-            return None, "ERROR"
-        if not text:
-            return None, "FULL"
         kind = _rule_kind(rule)
         validator = _VALIDATORS.get(kind)
-        for m in rx.finditer(text):
+        for m in compiled.finditer(text):
             value = m.group(0)
             if validator and not validator(value):
                 continue  # regex khớp nhưng không phải dữ liệu thật -> bỏ (giảm false positive)
@@ -759,7 +799,8 @@ def inspect_file(path, status=None, rules=None, file_types=None, destination=Non
 
 def _extraction_coverage(ftype, text, encrypted, notes):
     # Extraction notes are only added when an extractor encounters a limitation.
-    if any(note == "ZIP_CORRUPT" or note.startswith("PDF_PARSE_ERROR:") for note in notes):
+    if any(note in ("ZIP_CORRUPT", "ZIP_READ_ERROR", "XLSX_SHARED_STRING_ERROR")
+           or note.startswith("PDF_PARSE_ERROR:") for note in notes):
         return "ERROR"
     if encrypted or text is None:
         return "UNSUPPORTED"

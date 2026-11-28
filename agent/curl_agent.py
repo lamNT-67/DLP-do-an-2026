@@ -346,6 +346,18 @@ def _inspect_uploads(uploads, status, *, verify_origin=False):
     return results
 
 
+def _has_full_inspection(item):
+    return item.get("inspection_coverage") == "FULL" and item["inspected"] and not item.get("inspection_limit")
+
+
+def _normalize_worker_results(results):
+    # Keep the legacy verdict and limit (which controls journal routing).
+    for item in results:
+        if item["reason"] == "CLEAN" and not _has_full_inspection(item):
+            item["reason"] = "INSPECTION_INCOMPLETE"
+    return results
+
+
 def _inspect_in_worker(uploads, status):
     # Use a worker timeout for stalled file I/O or policy regex evaluation.
     finished = subprocess.run(
@@ -354,7 +366,7 @@ def _inspect_in_worker(uploads, status):
         stderr=subprocess.DEVNULL, check=True, timeout=INSPECTION_TIMEOUT,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
-    return json.loads(finished.stdout)
+    return _normalize_worker_results(json.loads(finished.stdout))
 
 
 def _valid_worker_result(item, status):
@@ -374,7 +386,7 @@ def _valid_worker_result(item, status):
     if "inspection_coverage" in item:
         if coverage not in ("FULL", "PARTIAL", "UNSUPPORTED", "ERROR"):
             return False
-        if reason == "CLEAN" and coverage != "FULL":
+        if reason == "CLEAN" and not _has_full_inspection(item):
             return False
     digest, rules, policy_id = item["file_hash_sha256"], item["matched_rule_ids"], item["policy_id"]
     limit = item.get("inspection_limit")
@@ -426,7 +438,7 @@ def _inspect_verified_origin(uploads, status, origin):
             or any(item["verdict"] == "BLOCK" for item in results[:-1])
             or (len(results) < len(uploads) and results[-1]["verdict"] != "BLOCK")):
         raise ValueError("Invalid inspection reply")
-    return results
+    return _normalize_worker_results(results)
 
 
 def _run_origin_worker(token_handle):

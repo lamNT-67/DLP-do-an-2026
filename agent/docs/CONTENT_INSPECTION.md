@@ -63,7 +63,7 @@ CLIPBOARD dạng văn bản và NETWORK_WEB dạng kết nối không có điề
 | `FULL` | Engine đã đọc đủ số byte theo kích thước file tại thời điểm bắt đầu đọc, trích xuất phần văn bản mà bộ đọc hỗ trợ và quét xong với bộ rule. File text rỗng có thể đạt `FULL`. |
 | `PARTIAL` | Đã chạm giới hạn đọc, trích xuất hoặc quét, phải dùng bộ trích xuất chuỗi best-effort, hoặc policy đã quyết định trước khi quét. Ví dụ khác gồm ZIP có thành viên bị bỏ qua và PDF có trang không trả về text. |
 | `UNSUPPORTED` | Engine không thể trích xuất văn bản của file, chẳng hạn ảnh cần OCR, PDF thiếu thư viện đọc, PDF chỉ có trang không trả về text, hoặc file mã hoá cần mật khẩu. |
-| `ERROR` | Đọc file gặp lỗi, bộ trích xuất báo lỗi parse, hoặc một regex không biên dịch được khi quét. |
+| `ERROR` | Đọc file gặp lỗi, bộ trích xuất báo lỗi parse, hoặc một rule không biên dịch được khi quét. Dictionary có 0 từ khóa thực thi cũng ghi `scan=ERROR`. |
 
 `inspection_stages` ghi riêng ba bước `read`, `extract`, `scan`. Mỗi bước đánh giá phần đầu vào mà bước đó nhận được. Giá trị `NOT_RUN` chỉ xuất hiện ở từng bước. Ví dụ, một file đã đọc đủ nhưng phần text trích xuất vượt giới hạn ký tự có thể trả về kết quả sau.
 
@@ -82,6 +82,14 @@ Trạng thái tổng hợp ưu tiên `ERROR`, sau đó đến `UNSUPPORTED`. Ch�
 Khi quét và không có match, engine trả về `CLEAN` chỉ với `FULL`, các trường hợp còn lại trả về `INSPECTION_INCOMPLETE`. Nếu bộ trích xuất không trả về text, đường xử lý `NOT_INSPECTABLE` vẫn áp dụng. Một match trong lần quét chưa hoàn tất vẫn có thể cho `CONTENT_MATCH` và verdict `LOG` hoặc `BLOCK`. Cờ `inspected` cho biết engine đã gọi bộ quét text, kể cả khi phần text nhận được rỗng.
 
 `scan_text()` và `scan_content_with_rules()` trả về `inspection_coverage` cho riêng bước quét. Khi đạt giới hạn số match, bộ quét dừng tìm và ghi `PARTIAL`. Log JSON qua `to_log_inspection()` mang theo metadata hiện có. Worker cURL chuyển trạng thái tổng hợp vào journal và dùng trường `inspection_limit` cho các lần quét bị giới hạn. Payload của `to_report_fields()` tiếp tục dùng các trường báo cáo hiện có.
+
+Lỗi biên dịch của một rule (kể cả `OverflowError`) chỉ ảnh hưởng coverage của policy chứa rule đó. Các rule hợp lệ tiếp tục quét. Engine giữ match tìm được và chọn verdict theo thứ tự `BLOCK > LOG > ALLOW`. Kết quả ghi coverage của policy thắng.
+
+Với XLSX, engine đọc bảng shared strings khi gặp ô dùng chỉ mục. Nếu chỉ mục không phân giải được, engine ghi `XLSX_SHARED_STRING_SKIPPED` và `extract=PARTIAL` khi còn văn bản để quét. Nếu toàn bộ phần văn bản bị mất, engine ghi `XLSX_SHARED_STRING_ERROR` và `extract=ERROR`. Workbook dùng inline strings có thể đạt `FULL` khi thiếu bảng shared strings.
+
+Với ZIP, thiếu codec cho file cần đọc cho kết quả `UNSUPPORTED` với note `ZIP_CODEC_UNAVAILABLE`. Tính năng ZIP mà thư viện chưa hỗ trợ ghi `ZIP_FEATURE_UNSUPPORTED`. Lỗi cấu trúc, dữ liệu nén hỏng hoặc checksum sai cho kết quả `ERROR` với note `ZIP_CORRUPT`.
+
+Khi worker cURL cũ gửi `CLEAN` mà thiếu `inspection_coverage`, phía nhận dùng reason `INSPECTION_INCOMPLETE` và để trống bằng chứng coverage. Verdict, policy và trường `inspection_limit` (nếu có) của worker tiếp tục quyết định cách xử lý và ghi journal.
 
 ## 3. Nhận diện loại file thật (chống đổi đuôi)
 

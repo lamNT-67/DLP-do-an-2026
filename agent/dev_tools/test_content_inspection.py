@@ -5,12 +5,14 @@ Test tự động cho Content Inspection Engine (chỉ dùng thư viện chuẩn
     python -m unittest dev_tools.test_content_inspection -v
 """
 
+import io
 import os
 import shutil
 import sys
 import tempfile
 import time
 import unittest
+import zipfile
 from unittest.mock import patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -113,6 +115,64 @@ class TestInspectionCoverage(Base):
         with patch.object(ci, "MAX_TEXT_CHARS", 2):
             r = ci.scan_content_with_rules("blue", [rule, {"id": 2, "pattern": "bl"}])
             self.assertEqual((r["inspection_coverage"], r["matched_rule_ids"]), ("ERROR", [2]))
+
+    def test_empty_dictionary_is_an_error_and_valid_rules_still_match(self):
+        empty = {"id": 1, "rule_type": "DICTIONARY", "pattern": " , , "}
+        good = {"id": 2, "pattern": "green", "severity": "HIGH"}
+        for text in ("", "ordinary"):
+            r = ci.inspect_file(self.write("sample.txt", text), status(rules=[empty]))
+            self.check(r, "ALLOW", "INSPECTION_INCOMPLETE", "ERROR", "FULL", "FULL", "ERROR")
+        for rules in ([empty, good], [good, empty]):
+            r = ci.inspect_file(self.write("sample.txt", "green"), status(rules=rules))
+            self.check(r, "BLOCK", "CONTENT_MATCH", "ERROR", "FULL", "FULL", "ERROR")
+            self.assertEqual(r["matched_rule_ids"], [2])
+
+    def test_xlsx_only_requires_the_string_table_for_referenced_cells(self):
+        # Start with a workbook containing ordinary text and change only the cell representation.
+        with zipfile.ZipFile(io.BytesIO(ms.build_xlsx([["green"]]))) as original:
+            members = {name: original.read(name) for name in original.namelist()}
+        table = "xl/sharedStrings.xml"
+        sheet = "xl/worksheets/sheet1.xml"
+        cell = b'<c r="A1" t="s"><v>0</v></c>'
+        inline = b'<c r="B1" t="inlineStr"><is><t>green</t></is></c>'
+        self.assertIn(cell, members[sheet])
+        good = {"id": 3, "pattern": "green", "severity": "HIGH"}
+        cases = [
+            (False, inline, "FULL", "BLOCK", "CONTENT_MATCH"),
+            (False, cell, "ERROR", "ALLOW", "INSPECTION_INCOMPLETE"),
+            (False, cell + inline, "PARTIAL", "BLOCK", "CONTENT_MATCH"),
+            (True, cell, "FULL", "BLOCK", "CONTENT_MATCH"),
+            (True, inline, "FULL", "BLOCK", "CONTENT_MATCH"),
+        ]
+        for index in (b"-1", b"9", b"unknown", b""):
+            cases.append((True, cell.replace(b">0<", b">" + index + b"<"),
+                          "ERROR", "ALLOW", "INSPECTION_INCOMPLETE"))
+        for has_table, cells, coverage, verdict, reason in cases:
+            with self.subTest(has_table=has_table, cells=cells):
+                parts = dict(members)
+                if not has_table:
+                    del parts[table]
+                parts[sheet] = parts[sheet].replace(cell, cells)
+                r = ci.inspect_file(self.write("sample.xlsx", ms.build_zip(parts)), status(rules=[good]))
+                self.check(r, verdict, reason, coverage, "FULL", coverage, "FULL")
+                self.assertEqual(r["matched_rule_ids"], [3] if verdict == "BLOCK" else [])
+
+    def test_zip_codec_unavailable_and_integrity_error_are_distinct(self):
+        path = self.write("palette.zip", ms.build_zip({"palette.txt": "green"}))
+        self.check(ci.inspect_file(path, status()), "ALLOW", "CLEAN", "FULL", "FULL", "FULL", "FULL")
+        with patch.object(zipfile, "zlib", None):
+            r = ci.inspect_file(path, status())
+            self.check(r, "ALLOW", "NOT_INSPECTABLE", "UNSUPPORTED", "FULL", "UNSUPPORTED", "NOT_RUN")
+            self.assertEqual(r["notes"], ["ZIP_CODEC_UNAVAILABLE"])
+        with patch.object(zipfile.ZipFile, "read", side_effect=NotImplementedError):
+            r = ci.inspect_file(path, status())
+            self.check(r, "ALLOW", "NOT_INSPECTABLE", "UNSUPPORTED", "FULL", "UNSUPPORTED", "NOT_RUN")
+            self.assertEqual(r["notes"], ["ZIP_FEATURE_UNSUPPORTED"])
+        for fault in (zipfile.BadZipFile("CRC mismatch"), zipfile.zlib.error("invalid compressed data")):
+            with self.subTest(error=type(fault)), patch.object(zipfile.ZipFile, "read", side_effect=fault):
+                r = ci.inspect_file(path, status())
+                self.check(r, "ALLOW", "NOT_INSPECTABLE", "ERROR", "FULL", "ERROR", "NOT_RUN")
+                self.assertEqual(r["notes"], ["ZIP_CORRUPT"])
 
     def test_read_failure_and_policy_shortcuts(self):
         path = os.path.join(self.dir, "absent.txt")
