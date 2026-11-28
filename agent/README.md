@@ -73,6 +73,10 @@ Lưu ý:
 
 Bộ cài đăng ký Curl Agent để chạy khi người dùng đăng nhập tương tác lần tiếp theo. Chọn exit point `CLIENT_CURL` trong policy của thiết bị đã đăng ký. Cơ chế dò tiến trình có thể phát hiện sau khi dữ liệu đã đến đích. Bộ cài cần Python cài cho mọi người dùng trong Program Files. Khi cần, truyền `-CurlPython` với đường dẫn đến `python.exe` cho `install.ps1`. [Triển khai, chạy thủ công và kiểm thử Curl Agent](docs/CURL_AGENT.md)
 
+### Kiểm tra đích USB
+
+Công cụ chẩn đoán đọc metadata của thư mục đích và kiểm tra serial của thiết bị USB theo whitelist. [Cách chạy, quyền truy cập và kiểm thử](docs/USB_PREFLIGHT.md)
+
 5. Các chức năng của Agent
 
  Chặn truy cập web: Luật tường lửa Windows chặn domain/IP 

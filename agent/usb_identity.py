@@ -74,6 +74,8 @@ def _verified_serial(
     serial = _trimmed_text(owner.serial_number)
     if device_key is None or device_key.startswith("disk:") or serial is None:
         return None
+    if serial.casefold() in {"unknown", "n/a"} or re.fullmatch(r"0+", serial):
+        return None
 
     if sum(_identity_key(disk.device_id) == device_key for disk in inventory) != 1:
         return None

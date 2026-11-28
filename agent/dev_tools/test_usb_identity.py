@@ -27,6 +27,24 @@ class UsbWhitelistTests(unittest.TestCase):
                 self.assertEqual(classify_usb_whitelist("volume-a", [self.disk], policy),
                                  UsbWhitelistStatus.UNLISTED)
 
+    def test_placeholder_serials_are_unknown_even_when_whitelisted(self):
+        for serial in ("00000000", "0", "UNKNOWN", " UnKnOwN\t", "N/A", " n/a "):
+            with self.subTest(serial=serial):
+                disk = UsbDeviceIdentity("disk-a", serial, ("volume-a",))
+                policy = {"usb_whitelist": [{"serial_number": serial.strip()}]}
+                self.assertEqual(classify_usb_whitelist("volume-a", [disk], policy),
+                                 UsbWhitelistStatus.IDENTITY_UNKNOWN)
+
+    def test_valid_numeric_and_alphanumeric_serials_still_match_exactly(self):
+        for serial, different_serial in (("00001234", "1234"), ("Unknown-001", "unknown-001")):
+            disk = UsbDeviceIdentity("disk-a", f" {serial}\t", ("volume-a",))
+            for listed_serial, expected in ((serial, UsbWhitelistStatus.LISTED),
+                                            (different_serial, UsbWhitelistStatus.UNLISTED)):
+                with self.subTest(serial=serial, listed_serial=listed_serial):
+                    policy = {"usb_whitelist": [{"serial_number": "UNKNOWN"},
+                                                {"serial_number": f" {listed_serial} "}]}
+                    self.assertEqual(classify_usb_whitelist("volume-a", [disk], policy), expected)
+
     def test_group_assignment_does_not_control_whitelist_evaluation(self):
         policy = {**self.policy, "group_id": None, "is_assigned": False, "applicable_policies": []}
         self.assertEqual(classify_usb_whitelist("volume-a", [self.disk], policy),
@@ -121,6 +139,13 @@ class UsbWhitelistTests(unittest.TestCase):
                          UsbWhitelistStatus.WHITELIST_UNAVAILABLE)
         self.assertEqual(classify_usb_whitelist(None, None, {"usb_whitelist": []}),
                          UsbWhitelistStatus.IDENTITY_UNKNOWN)
+
+    def test_unavailable_whitelist_takes_precedence_over_placeholder_serial(self):
+        disk = UsbDeviceIdentity("disk-a", "UNKNOWN", ("volume-a",))
+        for policy in (None, {}, {"usb_whitelist": [{"serial_number": "UNKNOWN"}, {}]}):
+            with self.subTest(policy=policy):
+                self.assertEqual(classify_usb_whitelist("volume-a", [disk], policy),
+                                 UsbWhitelistStatus.WHITELIST_UNAVAILABLE)
 
     def test_each_call_uses_the_current_inventory_and_policy(self):
         replacement = UsbDeviceIdentity("disk-b", "Lab-002", ("volume-a",))
