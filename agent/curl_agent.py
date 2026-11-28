@@ -750,9 +750,10 @@ def _report_rule_ids(rule_ids):
 class CurlJournal:
     """Attempt local journaling before sending each report once in the background."""
 
-    def __init__(self, hostname, client):
+    def __init__(self, hostname, client, *, windows_scope=None):
         self.hostname = hostname
         self.client = client
+        self.windows_scope = windows_scope
         self.reports = Queue(maxsize=128)
         self.closing = threading.Event()
         self.abandon_reports = threading.Event()
@@ -775,10 +776,14 @@ class CurlJournal:
         event_id = uuid.uuid4().hex
         filename = os.path.basename(upload.path) if upload else None
         destination = upload.destination if upload else None
+        source = {"process_name": PROCESS_NAME, "process_pid": key[0], "process_create_time": key[1]}
+        if self.windows_scope is not None:
+            source.update(session_id=self.windows_scope.session_id,
+                          logon_luid=f"{self.windows_scope.authentication_id:016x}")
         try:
             write_log_event(
                 self.hostname, "curl", EXIT_POINT, event_type, result.get("policy_action"),
-                {"process_name": PROCESS_NAME, "process_pid": key[0], "process_create_time": key[1]},
+                source,
                 {"file_path": filename, "destination_value": destination}, result, action, False,
                 event_id=event_id, policy_id=result.get("policy_id"),
                 report_configured=should_report, durable=True, enforcement=enforcement,
@@ -1013,7 +1018,7 @@ def _wait_for_enrollment(config_path, stop):
 
 def _watch(client, stop, *, windows_scope=None):
     policy = CurlPolicy(client)
-    journal = CurlJournal(client.hostname, client)
+    journal = CurlJournal(client.hostname, client, windows_scope=windows_scope)
     monitor = CurlMonitor(journal.record, windows_scope=windows_scope)
     runtime_failed = False
     try:

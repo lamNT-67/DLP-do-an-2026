@@ -1,5 +1,6 @@
 """Managed enrollment and cooperative watcher shutdown without host changes."""
 
+import subprocess
 import sys
 import tempfile
 import threading
@@ -12,6 +13,7 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import curl_agent as curl
 import curl_lifecycle
+from curl_windows import LogonScope
 
 
 class ManagedEnrollmentTests(unittest.TestCase):
@@ -102,24 +104,60 @@ class ManagedShutdownTests(unittest.TestCase):
         with self.assertRaises(OSError):
             self.run_watcher(cleanup=OSError())
 
-    def test_unverified_job_stops_watcher_after_releasing_curl_suspension(self):
-        scope, stop = object(), threading.Event()
-        record = Mock()
-        monitor = curl.CurlMonitor(record, windows_scope=scope)
-        proc = Mock(pid=200, info={"name": "curl.exe"})
-        proc.create_time.return_value = 123
-        proc.cmdline.return_value = ["curl.exe", "-T", str(Path(__file__).resolve()), "https://dlp.test/"]
-        origin = Mock()
-        with (patch.object(curl, "open_origin", return_value=origin),
-              patch.object(curl, "_inspect_verified_origin", side_effect=curl.WorkerCleanupUnconfirmed())):
-            monitor.poll({"is_governed": True, "effective_action": "BLOCK"}, [proc], stop=stop)
-        proc.suspend.assert_called_once()
-        proc.resume.assert_called_once()
-        origin.close.assert_called_once()
-        self.assertEqual(record.call_args.args[2]["reason"], "WORKER_CLEANUP_UNCONFIRMED")
-        self.assertTrue(stop.is_set())
-        self.assertFalse(monitor.worker_cleanup_confirmed)
-        self.assertFalse(monitor.pending_resume)
+    def test_worker_cleanup_confirmation_controls_managed_receipt(self):
+        scope = LogonScope(b"test-user", 1234, 5, 8192)
+        poll = curl.CurlMonitor.poll
+        for worker_error, reason, confirmed in (
+            (subprocess.TimeoutExpired("inspection worker", curl.INSPECTION_TIMEOUT), "INSPECTION_TIMEOUT", True),
+            (curl.WorkerCleanupUnconfirmed(), "WORKER_CLEANUP_UNCONFIRMED", False),
+        ):
+            with self.subTest(reason=reason):
+                proc = Mock(pid=200, info={"name": "curl.exe"})
+                proc.create_time.return_value = 123
+                proc.cmdline.return_value = ["curl.exe", "-T", str(Path(__file__).resolve()), "https://dlp.test/"]
+                origin = Mock(token_handle=17)
+                journal = Mock()
+                journal.close.return_value = True
+                journal.reports.unfinished_tasks = 0
+                policy = Mock(status={"is_governed": True, "effective_action": "BLOCK"})
+                registry = Mock()
+                registry.maintenance.return_value = ""
+                registry.current_generation.return_value = True
+                stop_requested_by_monitor = []
+
+                def poll_once(monitor, status, *, stop):
+                    poll(monitor, status, [proc], stop=stop)
+                    stop_requested_by_monitor.append(stop.is_set())
+                    stop.set()
+
+                with (patch.object(curl_lifecycle, "_Registry", return_value=registry),
+                      patch.object(curl_lifecycle, "_singleton", return_value=nullcontext(True)),
+                      patch.object(curl, "_wait_for_enrollment", return_value=Mock(hostname="LAB")),
+                      patch.object(curl, "CurlPolicy", return_value=policy),
+                      patch.object(curl, "CurlJournal", return_value=journal),
+                      patch.object(curl.CurlMonitor, "poll", poll_once),
+                      patch.object(curl, "open_origin", return_value=origin),
+                      patch.object(curl, "run_inspection_worker", side_effect=worker_error) as run_worker,
+                      curl_lifecycle.ManagedInstance(scope) as instance):
+                    outcome = curl.run_managed_watcher(None, scope, instance.stop)
+                    state = instance.finish(outcome)
+
+                run_worker.assert_called_once()
+                proc.suspend.assert_called_once()
+                proc.resume.assert_called_once()
+                origin.close.assert_called_once()
+                self.assertEqual(journal.record.call_args.args[2]["reason"], reason)
+                self.assertEqual(stop_requested_by_monitor, [not confirmed])
+                self.assertEqual(outcome, {"pending_resumes": 0, "worker_cleanup_confirmed": confirmed,
+                                           "report_drained": True, "runtime_failed": False})
+                self.assertEqual(state, "complete" if confirmed else "incomplete")
+                registry.write.assert_called_once()
+                receipt = registry.write.call_args.args[0]
+                self.assertEqual((receipt["state"], receipt["worker_cleanup_confirmed"]), (state, confirmed))
+                if confirmed:
+                    registry.clear_logon.assert_called_once_with(instance.name, receipt["instance"])
+                else:
+                    registry.clear_logon.assert_not_called()
 
     def test_scope_failure_keeps_foreign_pid_out_of_journal(self):
         record = Mock()

@@ -13,11 +13,25 @@ function Reject([scriptblock]$Body, [string]$Pattern) {
     throw "Expected failure matching $Pattern"
 }
 function Bag {
-    $obj = [pscustomobject]@{ Values = @{}; Records = @{} }
+    $obj = [pscustomobject]@{ Values = @{}; Records = @{}; Children = @{}; Acl = $null; Options = '' }
     $obj | Add-Member ScriptMethod GetValue { param($k,$default) if ($this.Values.ContainsKey($k)) { $this.Values[$k] } else { $default } }
     $obj | Add-Member ScriptMethod SetValue { param($k,$v) $this.Values[$k] = $v }
     $obj | Add-Member ScriptMethod DeleteValue { param($k,$unused) $this.Values.Remove($k) }
     $obj | Add-Member ScriptMethod GetValueKind { param($k) 'String' }
+    $obj | Add-Member ScriptMethod GetSubKeyNames { $this.Children.Keys }
+    $obj | Add-Member ScriptMethod OpenSubKey { param($name) $this.Children[$name] }
+    $obj | Add-Member ScriptMethod CreateSubKey {
+        param($name,$mode,$options,$acl)
+        if (-not $this.Children.ContainsKey($name)) {
+            $child = Bag
+            $child.Acl = if ($acl) { $acl } else { $options }
+            if ($acl) { $child.Options = $options }
+            $this.Children[$name] = $child
+        }
+        return $this.Children[$name]
+    }
+    $obj | Add-Member ScriptMethod GetAccessControl { $this.Acl }
+    $obj | Add-Member ScriptMethod Dispose { }
     $obj | Add-Member ScriptMethod Flush { }
     return $obj
 }
@@ -54,12 +68,24 @@ function Context {
     return @{ Scheduler=$scheduler; Folder=$folder; Key=Bag; Instances=Bag; Owner='a'*32; Old=''; Staged='c'*32; Quiesced=$false; Switched=$false }
 }
 function Receipt([string]$State, [string]$Op) {
+    if ($State -ceq 'running') {
+        return [pscustomobject]@{version=1;instance='1'*32;local_stop='2'*32;state=$State;operation=''
+            pending_resumes=$null;worker_cleanup_confirmed=$null;report_drained=$null;runtime_failed=$null}
+    }
     return [pscustomobject]@{version=1;instance='1'*32;local_stop='2'*32;state=$State;operation=$Op
         pending_resumes=0;worker_cleanup_confirmed=$true;report_drained=$true;runtime_failed=$false}
 }
 # No test calls the OS process enumeration, registry, deployment filesystem or Scheduler.
 function Get-CimInstance { param($ClassName,$Filter,$Property,$ErrorAction) return $script:processes }
-function Get-CurlRecords($Instances) { return $Instances.Records }
+function Get-CurlRecords($Instances) {
+    $records = @{}
+    foreach ($record in $Instances.Records.Values) {
+        $bag = Bag
+        $bag.SetValue('Record', ($record | ConvertTo-Json -Compress))
+        $records[$record.instance] = Read-CurlRecord $bag $record.instance
+    }
+    return $records
+}
 function Remove-CurlRelease($Context,$Id) { $Context.Removed=$Id }
 $script:processes = @()
 
@@ -158,6 +184,78 @@ Check 'forced exit with running record keeps both runtimes and holds teardown' {
     Reject { Uninstall-CurlTask $c $true } '*without a complete receipt*'
     Assert (-not $c.Folder.Deleted -and -not $c.Task.Enabled -and $c.Key.Values.Maintenance -and -not $c.Quiesced)
 }
+function RestartContext {
+    $c=Context; $c.Old='b'*32; $c.Task=Register-CurlRelease $c $c.Old $false
+    $done=Receipt complete ('f'*32); $done.instance='7'*32
+    $first=Receipt running ''; $second=Receipt running ''; $second.instance='5'*32; $second.local_stop='6'*32
+    foreach ($record in $first,$second,$done) { $c.Instances.Records[$record.instance]=$record }
+    $c.Key.SetValue('Maintenance', $done.operation)
+    # An already-blocked v1 maintenance plan carries no restart evidence.
+    $c.Instances.SetValue('MaintenancePlan', (@{operation=$done.operation;enabled=$true
+        records=@(@($first,$second,$done) | Select-Object instance,local_stop,state,operation)
+    } | ConvertTo-Json -Compress -Depth 4))
+    return $c
+}
+function SimulateFullRestart($Context) {
+    foreach ($name in @($Context.Key.Children.Keys)) {
+        if ($Context.Key.Children[$name].Options -eq 'Volatile') { $Context.Key.Children.Remove($name) }
+    }
+}
+Check 'historical v1 records require a recorded fence and a later full restart' {
+    $c=RestartContext
+    $before=$c.Instances.Records | ConvertTo-Json -Compress -Depth 5
+    Reject { Enter-CurlMaintenance $c $c.Task } '*Use Windows Restart*'
+    $armed=$c.Instances.Values.MaintenancePlan
+    Assert (-not $c.Quiesced -and -not $c.Task.Enabled -and -not $c.Key.Children.ContainsKey('RestartEvidence'))
+    Reject { Enter-CurlMaintenance $c $c.Task } '*Forced exit or cleanup unconfirmed*'
+    Assert ($armed -ceq $c.Instances.Values.MaintenancePlan)
+    SimulateFullRestart $c
+    Enter-CurlMaintenance $c $c.Task
+    Assert ($c.Quiesced -and $c.Key.Children.RestartEvidence.Children.Count -eq 2)
+    Assert (($c.Instances.Records | ConvertTo-Json -Compress -Depth 5) -ceq $before)
+    $entry=$c.Key.Children.RestartEvidence.Children['1'*32].Values.Disposition | ConvertFrom-Json
+    Assert ($entry.reason -ceq 'abandoned_after_full_restart' -and ($entry.record | ConvertFrom-Json).state -ceq 'running')
+    Complete-CurlInstall $c
+    # A later, independent maintenance operation still sees the disposition.
+    $c.Old=$c.Staged; $c.Switched=$false; $c.Quiesced=$false
+    Enter-CurlMaintenance $c $c.Folder.Live
+    Assert ($c.Quiesced -and $c.Key.Children.RestartEvidence.Children.Count -eq 2)
+    $c.Instances.Records['1'*32].local_stop='3'*32
+    Reject { Enter-CurlMaintenance $c $c.Folder.Live } '*disposition or original record changed*'
+    Assert (-not $c.Quiesced)
+}
+Check 'fresh same-boot records still block despite verified restart for earlier records' {
+    $c=RestartContext
+    Reject { Enter-CurlMaintenance $c $c.Task } '*Use Windows Restart*'
+    SimulateFullRestart $c
+    $new=Receipt running ''; $new.instance='8'*32; $c.Instances.Records[$new.instance]=$new
+    Reject { Enter-CurlMaintenance $c $c.Task } '*Forced exit or cleanup unconfirmed*'
+    Assert (-not $c.Quiesced -and -not $c.Task.Enabled)
+    Assert (-not $c.Key.Children.RestartEvidence.Children.ContainsKey($new.instance))
+}
+Check 'an enumerated but unreadable witness does not prove restart' {
+    $c=RestartContext
+    Reject { Enter-CurlMaintenance $c $c.Task } '*Use Windows Restart*'
+    $c.Key | Add-Member ScriptMethod OpenSubKey { param($name) if ($name -notlike 'RestartWitness-*') { $this.Children[$name] } } -Force
+    Reject { Enter-CurlMaintenance $c $c.Task } '*Cannot read the existing Curl restart witness*'
+    Assert (-not $c.Quiesced -and -not $c.Task.Enabled -and -not $c.Key.Children.ContainsKey('RestartEvidence'))
+}
+Check 'a restart never converts missing, changed or incomplete evidence to cleanup' {
+    foreach ($change in 'missing','changed','incomplete','stale') {
+        $c=RestartContext
+        Reject { Enter-CurlMaintenance $c $c.Task } '*Use Windows Restart*'
+        SimulateFullRestart $c
+        $id='1'*32
+        switch ($change) {
+            'missing' { $c.Instances.Records.Remove($id); $expected='*missing instance*' }
+            'changed' { $c.Instances.Records[$id].local_stop='3'*32; $expected='*snapshot changed*' }
+            'incomplete' { $c.Instances.Records[$id]=Receipt incomplete ('f'*32); $expected='*cleanup incomplete*' }
+            'stale' { $c.Instances.Records[$id]=Receipt complete ('d'*32); $expected='*Stale Curl cleanup receipt*' }
+        }
+        Reject { Enter-CurlMaintenance $c $c.Task } $expected
+        Assert (-not $c.Quiesced -and -not $c.Task.Enabled -and -not $c.Key.Children.ContainsKey('RestartEvidence'))
+    }
+}
 Check 'malformed protected maintenance snapshot still disables the owned task' {
     $c=Context; $c.Old='b'*32; $c.Task=Register-CurlRelease $c $c.Old $false
     $c.Task.Enabled=$true; $c.Instances.SetValue('MaintenancePlan','{"operation":"bad"}')
@@ -182,6 +280,17 @@ Check 'rollback restores previous release and its prior enabled/disabled state' 
         Assert ($c.Key.Values.Current -ceq $c.Old -and $c.Folder.Live.Enabled -eq $enabled -and $c.Removed -ceq $c.Staged)
         Assert-CurlOwnership $c.Folder.Live $c.Owner $c.Old
     }
+}
+Check 'shared cutover failure restores the prior Curl definition in a fenced state' {
+    $c=Context; $c.Old='b'*32; $t=Register-CurlRelease $c $c.Old $false
+    $t.Enabled=$true
+    Enter-CurlMaintenance $c $t
+    $c.Switched=$true
+    Register-CurlRelease $c $c.Staged $true | Out-Null
+    $c.Key.SetValue('Current',$c.Staged)
+    Undo-CurlInstall $c -KeepDisabled
+    Assert ($c.Key.Values.Current -ceq $c.Old -and -not $c.Folder.Live.Enabled -and $c.Removed -ceq $c.Staged)
+    Assert-CurlOwnership $c.Folder.Live $c.Owner $c.Old
 }
 Check 'uninstall removes only the owned task after verified stop' {
     $c=Context; $c.Old='b'*32; $c.Task=Register-CurlRelease $c $c.Old $false

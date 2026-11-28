@@ -10,16 +10,18 @@ import sys
 import tempfile
 import threading
 import time
-from contextlib import contextmanager, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stdout
 from ctypes import wintypes
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 import psutil
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import curl_agent
+import curl_worker
 from curl_receiver_test import MARKER, Receiver, _policy
 from curl_windows import OriginUnavailable, impersonate_origin, open_origin, watcher_scope
 
@@ -151,6 +153,44 @@ def _probe_worker(origin_token):
         _emit(scope=_scope_fields(scope), synthetic_env_inherited=SYNTHETIC_ENV in os.environ)
 
 
+def _pin_fixture_members(kernel, job, witness, handles):
+    # Independently capture the live synthetic tree before the production
+    # termination call, including launchers and intermediate processes.
+    class JobProcessIds(ctypes.Structure):
+        _fields_ = [("assigned", wintypes.DWORD), ("count", wintypes.DWORD),
+                    ("pids", ctypes.c_size_t * 32)]
+
+    ids = JobProcessIds()
+    _require(kernel.QueryInformationJobObject(job, 3, ctypes.byref(ids), ctypes.sizeof(ids), None),
+             "Could not enumerate the synthetic job.")
+    _require(1 < ids.count <= len(ids.pids) and ids.count == ids.assigned,
+             "Could not enumerate the complete synthetic process tree.")
+    pids = ids.pids[:ids.count]
+    _require(len(set(pids)) == ids.count, "Synthetic job returned duplicate process IDs.")
+    accounting = curl_worker._JobAccounting()
+    _require(kernel.QueryInformationJobObject(job, 1, ctypes.byref(accounting), ctypes.sizeof(accounting), None)
+             and accounting.TotalProcesses == ids.count, "The fixture missed a synthetic job member.")
+    descendant_pid, descendant_created = json.loads(witness.read_text(encoding="ascii"))
+    _require(descendant_pid in pids, "The witnessed descendant is missing from the job.")
+
+    for pid in pids:
+        handle = kernel.OpenProcess(0x101000, False, pid)  # SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION
+        _require(handle, f"Could not open synthetic job member {pid}.")
+        handles.callback(kernel.CloseHandle, handle)
+        member = wintypes.BOOL()
+        _require(kernel.GetProcessId(handle) == pid and kernel.IsProcessInJob(handle, job, ctypes.byref(member))
+                 and member.value, f"Could not verify job membership for process {pid}.")
+        if pid == descendant_pid:
+            created, exited, kernel_time, user_time = (wintypes.FILETIME() for _ in range(4))
+            _require(kernel.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited),
+                                            ctypes.byref(kernel_time), ctypes.byref(user_time)),
+                     "Could not verify the synthetic descendant's creation time.")
+            ticks = created.dwHighDateTime << 32 | created.dwLowDateTime
+            seconds = (ticks - 116444736000000000) / 10000000
+            _require(abs(seconds - descendant_created) < 0.000002, "Synthetic descendant identity changed.")
+        yield pid, handle
+
+
 def _check_worker(origin, scope, root, run_worker):
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel.CreateEventW.argtypes = (wintypes.LPVOID, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR)
@@ -159,6 +199,17 @@ def _check_worker(origin, scope, root, run_worker):
     kernel.WaitForSingleObject.restype = wintypes.DWORD
     kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
     kernel.CloseHandle.restype = wintypes.BOOL
+    kernel.QueryInformationJobObject.argtypes = (wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                                 wintypes.DWORD, ctypes.POINTER(wintypes.DWORD))
+    kernel.QueryInformationJobObject.restype = wintypes.BOOL
+    kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.GetProcessId.argtypes = (wintypes.HANDLE,)
+    kernel.GetProcessId.restype = wintypes.DWORD
+    kernel.IsProcessInJob.argtypes = (wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL))
+    kernel.IsProcessInJob.restype = wintypes.BOOL
+    kernel.GetProcessTimes.argtypes = (wintypes.HANDLE,) + (ctypes.POINTER(wintypes.FILETIME),) * 4
+    kernel.GetProcessTimes.restype = wintypes.BOOL
     sentinel = kernel.CreateEventW(None, True, False, None)
     if not sentinel:
         raise ctypes.WinError(ctypes.get_last_error())
@@ -177,19 +228,27 @@ def _check_worker(origin, scope, root, run_worker):
 
     witness = root / "descendant.json"
     payload = json.dumps({"descendant": str(witness)}).encode("ascii")
-    try:
-        run_worker(SCRIPT, payload, origin.token_handle, 5)
-    except subprocess.TimeoutExpired:
-        _require(witness.is_file(), "Worker timed out before a descendant could be verified.")
-        pid, created = json.loads(witness.read_text(encoding="ascii"))
-        try:
-            survivor = psutil.Process(pid).create_time() == created
-        except psutil.NoSuchProcess:
-            survivor = False
-        _require(not survivor, "The synthetic worker descendant survived timeout cleanup.")
-        _emit(case="worker-tree-timeout", descendant_removed=True)
-    else:
-        raise RuntimeError("Synthetic worker did not time out.")
+    reap_job = curl_worker._reap_job
+    members = []
+    with ExitStack() as handles:
+        def observe_reap(worker_kernel, job, *args):
+            try:
+                _require(witness.is_file(), "Worker timed out before a descendant could be verified.")
+                members.extend(_pin_fixture_members(kernel, job, witness, handles))
+            finally:
+                reap_job(worker_kernel, job, *args)
+
+        with patch.object(curl_worker, "_reap_job", observe_reap):
+            try:
+                run_worker(SCRIPT, payload, origin.token_handle, 5)
+            except subprocess.TimeoutExpired:
+                _require(members, "The fixture did not capture the synthetic process tree.")
+                for pid, handle in members:
+                    _require(kernel.WaitForSingleObject(handle, 0) == 0,
+                             f"Synthetic job member {pid} did not signal exit before cleanup returned.")
+                _emit(case="worker-tree-timeout", descendant_removed=True, signaled_members=len(members))
+            else:
+                raise RuntimeError("Synthetic worker did not time out.")
 
 
 def _check_peer(args, scope):
@@ -260,18 +319,17 @@ def _run(args, parser):
         _check_source(curl, scope, args.check_source, args.expect_reason)
         return
 
-    from curl_worker import run_inspection_worker
-
     with tempfile.TemporaryDirectory(prefix="curl-runtime-check-") as directory:
         root = Path(directory)
-        with _serve(Receiver()) as receiver:
-            for name, action, expected in (("clean", "BLOCK", "ALLOW"), ("blocked", "BLOCK", "BLOCK"),
-                                           ("report", "REPORT_ONLY", "LOG")):
-                _transfer(curl, receiver, root, scope, name, action, expected)
+        if not args.worker_cleanup_only:
+            with _serve(Receiver()) as receiver:
+                for name, action, expected in (("clean", "BLOCK", "ALLOW"), ("blocked", "BLOCK", "BLOCK"),
+                                               ("report", "REPORT_ONLY", "LOG")):
+                    _transfer(curl, receiver, root, scope, name, action, expected)
         with _holding_origin(curl) as child:
             proc = psutil.Process(child.pid)
             with open_origin(proc.pid, proc.create_time(), scope) as origin:
-                _check_worker(origin, scope, root, run_inspection_worker)
+                _check_worker(origin, scope, root, curl_worker.run_inspection_worker)
 
 
 def main(argv=None):
@@ -280,6 +338,7 @@ def main(argv=None):
     mode.add_argument("--hold-origin", action="store_true", help="Hold an ordinary loopback curl for a peer scope check.")
     mode.add_argument("--origin-pid", type=int, help="Check the live PID printed by a --hold-origin instance.")
     mode.add_argument("--check-source", type=Path, help="Probe a deliberately inaccessible synthetic file.")
+    mode.add_argument("--worker-cleanup-only", action="store_true", help="Run only the worker handle and timeout checks.")
     mode.add_argument("--inspect-worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--origin-token", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--expect", choices=("same", "foreign"), default="same")

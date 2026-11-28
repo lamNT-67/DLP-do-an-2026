@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import curl_agent as curl
 import log_writer
+from curl_windows import LogonScope
 from policy_utils import get_exit_point_status
 
 
@@ -332,6 +333,23 @@ class TerminationTests(unittest.TestCase):
 
 
 class JournalTests(unittest.TestCase):
+    def test_managed_journal_records_the_verified_logon_for_local_notification(self):
+        scope = LogonScope(b"test-sid", 0x100000002, 3, 0x2000)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.log"
+            with patch.object(log_writer, "LOG_FILE", path):
+                for context in (scope, None):
+                    journal = curl.CurlJournal("test-host", None, windows_scope=context)
+                    journal.record((100, 1), curl.Upload("sample.txt", DESTINATION),
+                                   {"verdict": "BLOCK", "policy_action": "BLOCK"},
+                                   {"termination": "CONFIRMED", "termination_attempted": True})
+            managed, standalone = map(json.loads, path.read_text(encoding="utf-8").splitlines())
+        self.assertEqual((managed["source"]["session_id"], managed["source"]["logon_luid"]),
+                         (3, "0000000100000002"))
+        self.assertEqual(managed["action_taken"], standalone["action_taken"])
+        self.assertNotIn("session_id", standalone["source"])
+        self.assertNotIn("logon_luid", standalone["source"])
+
     def test_local_first_and_validated_delivery_without_sensitive_values(self):
         for outcome, ack, action in [
             ("CONFIRMED", 42, "BLOCKED_KILL"),

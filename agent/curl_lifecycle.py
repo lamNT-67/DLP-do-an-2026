@@ -106,9 +106,9 @@ class _Registry:
         except FileNotFoundError:
             pass
         else:
-            # A process can die between publishing a clean receipt and erasing its
-            # marker. Reconcile only that exact instance while holding the logon's mutex.
-            if kind != reg.REG_SZ or not _ID.fullmatch(previous) or not self._previous_clean(previous):
+            # A new boot can also reuse the logon identity. In either case,
+            # reconcile only this exact previous instance under the mutex.
+            if kind != reg.REG_SZ or not _ID.fullmatch(previous) or not self._previous_resolved(previous):
                 raise RuntimeError("Previous Curl cleanup for this logon is unconfirmed.")
         # Open (never create) the installer-owned inventory with the narrow creation right.
         with reg.OpenKey(self.control, "Instances", 0, self.view | reg.KEY_CREATE_SUB_KEY) as parent:
@@ -124,20 +124,41 @@ class _Registry:
         reg.SetValueEx(self.logon, name, 0, reg.REG_SZ, record["instance"])
         reg.FlushKey(self.logon)
 
-    def _previous_clean(self, previous):
+    def _previous_resolved(self, previous):
         reg = self.reg
         with reg.OpenKey(self.control, "Instances\\" + previous, 0, self.view | reg.KEY_QUERY_VALUE) as key:
             data, kind = reg.QueryValueEx(key, "Record")
-        if kind != reg.REG_SZ or len(data) > 2048:
+        if kind != reg.REG_SZ or not isinstance(data, str) or len(data) > 2048:
             return False
         record = json.loads(data)
-        return (isinstance(record, dict) and type(record.get("version")) is int and record["version"] == 1
-                and record.get("instance") == previous and record.get("state") == "complete"
-                and isinstance(record.get("operation"), str) and _ID.fullmatch(record["operation"])
-                and isinstance(record.get("local_stop"), str) and _ID.fullmatch(record["local_stop"])
-                and record["local_stop"] != previous and type(record.get("pending_resumes")) is int
+        if (not isinstance(record, dict) or type(record.get("version")) is not int or record["version"] != 1
+                or record.get("instance") != previous or not isinstance(record.get("local_stop"), str)
+                or not _ID.fullmatch(record["local_stop"]) or record["local_stop"] == previous):
+            return False
+        if record.get("state") == "running":
+            return self._previous_abandoned(previous, data)
+        return (record.get("state") == "complete" and isinstance(record.get("operation"), str)
+                and _ID.fullmatch(record["operation"]) and type(record.get("pending_resumes")) is int
                 and record["pending_resumes"] == 0 and record.get("worker_cleanup_confirmed") is True
                 and type(record.get("runtime_failed")) is bool and type(record.get("report_drained")) is bool)
+
+    def _previous_abandoned(self, previous, original):
+        # The installer owns this separate ledger. The watcher can query
+        # only the entry named by its existing opaque instance ID.
+        reg = self.reg
+        try:
+            with reg.OpenKey(self.control, "RestartEvidence\\" + previous, 0,
+                             self.view | reg.KEY_QUERY_VALUE) as key:
+                evidence, kind = reg.QueryValueEx(key, "Disposition")
+        except FileNotFoundError:
+            return False
+        if kind != reg.REG_SZ or not isinstance(evidence, str) or len(evidence) > 8192:
+            return False
+        disposition = json.loads(evidence)
+        return (isinstance(disposition, dict) and disposition.get("reason") == "abandoned_after_full_restart"
+                and disposition.get("record") == original
+                and all(isinstance(disposition.get(field), str) and _ID.fullmatch(disposition[field])
+                        for field in ("operation", "witness")))
 
     def write(self, record):
         data = json.dumps(record, separators=(",", ":"), allow_nan=False)

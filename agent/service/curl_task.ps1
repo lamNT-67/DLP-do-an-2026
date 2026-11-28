@@ -4,6 +4,8 @@ $CurlRoot = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'DLP-Curl'
 $CurlRegistry = 'SOFTWARE\DLP\ManagedCurl'
 $CurlRootAcl = 'D:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)(A;;KR;;;BU)'
 $CurlInstanceAcl = 'D:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)(A;CIIO;KA;;;CO)(A;;0x4;;;BU)'
+$CurlRecoveryRootAcl = 'D:P(A;CI;KA;;;SY)(A;CI;KA;;;BA)'
+$CurlRecoveryEntryAcl = 'D:P(A;;KA;;;SY)(A;;KA;;;BA)(A;;0x1;;;BU)'
 $CurlFiles = @('curl_managed.py', 'curl_lifecycle.py', 'curl_desktop.py', 'curl_agent.py',
     'curl_worker.py', 'curl_windows.py', 'content_inspection.py', 'log_writer.py',
     'policy_client.py', 'policy_utils.py', 'requirements.txt')
@@ -12,24 +14,35 @@ function Test-CurlId($Value) {
     $Value -is [string] -and $Value -cmatch '\A[0-9a-f]{32}\z'
 }
 
-function Assert-CurlAdminAcl($Acl, [int]$WriteMask) {
+function Assert-CurlAdminAcl($Acl, [int]$WriteMask, [string]$Path = 'ACL under validation', [switch]$ObjectOnly) {
     $trusted = @('S-1-5-18', 'S-1-5-32-544', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
     $sidType = [Security.Principal.SecurityIdentifier]
     # Generic bits can remain unmapped in access rules, including inherit-only ACEs.
     $writeRights = $WriteMask -bor 0x50000000  # GENERIC_WRITE | GENERIC_ALL
-    if ($Acl.GetOwner($sidType).Value -notin $trusted) { throw 'Curl runtime requires an administrator-owned installation.' }
+    $owner = $Acl.GetOwner($sidType).Value
+    if ($owner -notin $trusted) { throw [Security.SecurityException]::new("Unsafe owner on '$Path': owner SID $owner is not trusted.") }
+    $descriptor = [Security.AccessControl.RawSecurityDescriptor]::new($Acl.GetSecurityDescriptorBinaryForm(), 0)
+    if ($null -eq $descriptor.DiscretionaryAcl) {
+        throw [Security.SecurityException]::new("Unsafe permissions on '$Path': missing DACL grants unrestricted access.")
+    }
     foreach ($rule in $Acl.GetAccessRules($true, $true, $sidType)) {
         if ($rule.AccessControlType -ne 'Allow' -or $rule.IdentityReference.Value -in $trusted) { continue }
+        if ($ObjectOnly -and ($rule.PropagationFlags -band 2)) { continue }
         if ($rule.IdentityReference.Value -eq 'S-1-3-0' -and ($rule.PropagationFlags -band 2)) { continue }
         $rights = if ($Acl -is [Security.AccessControl.RegistrySecurity]) { $rule.RegistryRights } else { $rule.FileSystemRights }
-        if ([int]$rights -band $writeRights) { throw 'Curl runtime path grants write access outside Administrators and SYSTEM.' }
+        $offending = [int]$rights -band $writeRights
+        if ($offending) {
+            $origin = if ($rule.IsInherited) { 'inherited' } else { 'explicit' }
+            throw [Security.SecurityException]::new(("'{0}' grants write access to SID {1}: {2}, prohibited mask 0x{3:X8}, {4} ACE ({5}, {6})." -f
+                $Path, $rule.IdentityReference.Value, $rights, $offending, $origin, $rule.InheritanceFlags, $rule.PropagationFlags))
+        }
     }
 }
 
 function Assert-CurlProtectedPath([string]$Path) {
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
     if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Reparse point in managed Curl path: $Path" }
-    Assert-CurlAdminAcl (Get-Acl -LiteralPath $item.FullName -ErrorAction Stop) 0xD0156
+    Assert-CurlAdminAcl (Get-Acl -LiteralPath $item.FullName -ErrorAction Stop) 0xD0156 $item.FullName
 }
 
 function Initialize-CurlConfigRoot([string]$InstallDir) {
@@ -45,46 +58,6 @@ function Initialize-CurlConfigRoot([string]$InstallDir) {
         $config = Join-Path $dir 'config.ini'
         if (Test-Path -LiteralPath $config) { Assert-CurlProtectedPath $config }
     }
-}
-
-function Get-CurlProgramFiles([string]$Path) {
-    $full = [IO.Path]::GetFullPath($Path)
-    foreach ($base in @([Environment]::GetFolderPath('ProgramFiles'), [Environment]::GetFolderPath('ProgramFilesX86'))) {
-        if ($base -and $full.StartsWith($base + '\', 'OrdinalIgnoreCase')) { return $base }
-    }
-    throw 'Use -CurlPython with an all-users base python.exe installed under Program Files.'
-}
-
-function Resolve-CurlPython([string]$Choice, [string]$DefaultPython) {
-    $options = @()
-    if ($Choice) { $options = @($Choice) }
-    else {
-        $options += $DefaultPython
-        foreach ($entry in Get-ChildItem 'HKLM:\SOFTWARE\Python\PythonCore' -ErrorAction SilentlyContinue | Sort-Object PSChildName -Descending) {
-            $key = Get-Item -LiteralPath ($entry.PSPath + '\InstallPath') -ErrorAction SilentlyContinue
-            if ($key) {
-                if ($key.GetValue('ExecutablePath')) { $options += $key.GetValue('ExecutablePath') }
-                elseif ($key.GetValue('')) { $options += Join-Path $key.GetValue('') 'python.exe' }
-            }
-        }
-    }
-    foreach ($path in $options) {
-        if (-not $path -or [IO.Path]::GetFileName($path) -ne 'python.exe') { continue }
-        try {
-            $path = [IO.Path]::GetFullPath($path)
-            $base = Get-CurlProgramFiles $path
-            $component = $path
-            while ($component -ne $base) {
-                Assert-CurlProtectedPath $component
-                $component = Split-Path -Parent $component
-            }
-            Assert-CurlProtectedPath $base
-            # Don't select a venv as the base of another venv.
-            if (Test-Path -LiteralPath (Join-Path (Split-Path -Parent (Split-Path -Parent $path)) 'pyvenv.cfg')) { continue }
-            return $path
-        } catch { if ($Choice) { throw } }
-    }
-    throw 'Managed Curl needs an all-users installation. Pass -CurlPython with a protected Program Files base python.exe.'
 }
 
 function New-CurlRegistryAcl([string]$Sddl) {
@@ -103,8 +76,8 @@ function Assert-CurlRegistryAcl($Key, [string]$Expected) {
     }
 }
 
-function Get-CurlTask($Folder) {
-    try { return $Folder.GetTask($CurlTaskName) }
+function Get-RegisteredDlpTask($Folder, [string]$Name) {
+    try { return $Folder.GetTask($Name) }
     catch {
         for ($cause = $_.Exception; $cause; $cause = $cause.InnerException) {
             if ($cause.HResult -eq -2147024894) { return $null }  # ERROR_FILE_NOT_FOUND
@@ -112,6 +85,8 @@ function Get-CurlTask($Folder) {
         throw
     }
 }
+
+function Get-CurlTask($Folder) { Get-RegisteredDlpTask $Folder $CurlTaskName }
 
 function Get-CurlLayout([string]$Generation) {
     if (-not (Test-CurlId $Generation)) { throw 'Invalid managed Curl release ID.' }
@@ -207,6 +182,7 @@ function Read-CurlRecord($Key, [string]$Id) {
         $r.report_drained -isnot [bool] -or $r.runtime_failed -isnot [bool]) {
         throw 'Malformed terminal Curl receipt.'
     }
+    $r | Add-Member -NotePropertyName RawRecord -NotePropertyValue $value
     return $r
 }
 
@@ -226,7 +202,7 @@ function Get-CurlRecords($Instances) {
     return $records
 }
 
-function Assert-CurlCleanup($Records, $Plan) {
+function Assert-CurlCleanup($Records, $Plan, [hashtable]$Recovered = @{}) {
     $expected = @{}
     foreach ($prior in $Plan.records) {
         if (-not $Records.ContainsKey($prior.instance)) { throw 'A managed Curl instance record disappeared.' }
@@ -236,7 +212,10 @@ function Assert-CurlCleanup($Records, $Plan) {
     foreach ($r in $Records.Values) {
         $prior = $expected[$r.instance]
         if ($prior -and $prior.local_stop -cne $r.local_stop) { throw 'Curl instance identity changed during maintenance.' }
-        if ($r.state -ceq 'running') { $running = $true; continue }
+        if ($r.state -ceq 'running') {
+            if (-not $Recovered.ContainsKey($r.instance)) { $running = $true }
+            continue
+        }
         if ($r.state -cne 'complete' -or $r.pending_resumes -ne 0 -or -not $r.worker_cleanup_confirmed) {
             throw 'Curl cleanup incomplete. Keep the runtime and disabled task for investigation.'
         }
@@ -249,6 +228,126 @@ function Assert-CurlCleanup($Records, $Plan) {
         }
     }
     return (-not $running)
+}
+
+function Test-CurlRestartWitness($Control, [string]$Id) {
+    if (-not (Test-CurlId $Id)) { throw 'Invalid Curl restart witness ID.' }
+    $name = "RestartWitness-$Id"
+    # Establish absence through enumeration. An advertised key that
+    # cannot be opened is an observation failure, never restart evidence.
+    if ($name -notin $Control.GetSubKeyNames()) { return $false }
+    $key = $Control.OpenSubKey($name)
+    if (-not $key) { throw 'Cannot read the existing Curl restart witness.' }
+    try {
+        Assert-CurlRegistryAcl $key $CurlRecoveryRootAcl
+        return $true
+    } finally { $key.Dispose() }
+}
+
+function New-CurlRestartWitness($Control) {
+    # A volatile HKLM key survives sleep/hibernation and disappears when
+    # the machine hive unloads on a full shutdown. Never delete it in setup.
+    $id = [guid]::NewGuid().ToString('N')
+    $key = $Control.CreateSubKey("RestartWitness-$id", 'ReadWriteSubTree', 'Volatile', (New-CurlRegistryAcl $CurlRecoveryRootAcl))
+    try {
+        Assert-CurlRegistryAcl $key $CurlRecoveryRootAcl
+        $key.Flush()
+        return $id
+    } finally { $key.Dispose() }
+}
+
+function Get-CurlRecoveredRecords($Control, $Records) {
+    $result = @{}
+    $root = $Control.OpenSubKey('RestartEvidence')
+    if (-not $root) { return $result }
+    try {
+        Assert-CurlRegistryAcl $root $CurlRecoveryRootAcl
+        foreach ($id in $root.GetSubKeyNames()) {
+            if (-not (Test-CurlId $id) -or -not $Records.ContainsKey($id)) {
+                throw 'Curl restart evidence lacks its original instance record.'
+            }
+            $entry = $root.OpenSubKey($id)
+            try {
+                Assert-CurlRegistryAcl $entry $CurlRecoveryEntryAcl
+                $data = $entry.GetValue('Disposition', $null, 'DoNotExpandEnvironmentNames')
+                if ($null -eq $data) { continue }  # An interrupted creation has no evidence.
+                if ($data -isnot [string] -or $data.Length -gt 8192 -or $entry.GetValueKind('Disposition') -ne 'String') {
+                    throw "Invalid restart disposition for Curl instance $id."
+                }
+                $evidence = ConvertFrom-Json -InputObject $data -ErrorAction Stop
+                if ($evidence.reason -cne 'abandoned_after_full_restart' -or -not (Test-CurlId $evidence.operation) -or
+                    -not (Test-CurlId $evidence.witness) -or $Records[$id].state -cne 'running' -or
+                    $evidence.record -isnot [string] -or $evidence.record -cne $Records[$id].RawRecord -or
+                    (Test-CurlRestartWitness $Control $evidence.witness)) {
+                    throw "Restart disposition or original record changed for Curl instance $id."
+                }
+                $result[$id] = $true
+            } finally { if ($entry) { $entry.Dispose() } }
+        }
+    } finally { $root.Dispose() }
+    return $result
+}
+
+function Save-CurlRestartEvidence($Control, $Plan, $Records) {
+    $root = $Control.CreateSubKey('RestartEvidence', 'ReadWriteSubTree', (New-CurlRegistryAcl $CurlRecoveryRootAcl))
+    try {
+        Assert-CurlRegistryAcl $root $CurlRecoveryRootAcl
+        foreach ($record in $Records) {
+            # Users can query a known instance key, but cannot list this
+            # inventory or write a disposition.
+            $entry = $root.CreateSubKey($record.instance, 'ReadWriteSubTree', (New-CurlRegistryAcl $CurlRecoveryEntryAcl))
+            try {
+                Assert-CurlRegistryAcl $entry $CurlRecoveryEntryAcl
+                $evidence = @{ reason = 'abandoned_after_full_restart'; operation = $Plan.operation
+                    witness = $Plan.restart.witness; record = $record.RawRecord }
+                $entry.SetValue('Disposition', ($evidence | ConvertTo-Json -Compress), 'String')
+                $entry.Flush()
+            } finally { $entry.Dispose() }
+            Write-Warning "Curl instance $($record.instance) was abandoned after a verified full Windows restart. Cleanup remains unconfirmed."
+        }
+    } finally { $root.Dispose() }
+}
+
+function Confirm-CurlQuiescence($Context, $Plan, $Records) {
+    $recovered = Get-CurlRecoveredRecords $Context.Key $Records
+    $eligible = @()
+    $baseline = @{}
+    $sameBoot = $false
+    $restart = $Plan.PSObject.Properties['restart']
+    if ($restart -and $restart.Value) {
+        $sameBoot = Test-CurlRestartWitness $Context.Key $restart.Value.witness
+        if (-not $restart.Value.records) { throw 'Missing records in the Curl restart snapshot.' }
+        foreach ($prior in $restart.Value.records) {
+            if (-not (Test-CurlId $prior.instance) -or $baseline.ContainsKey($prior.instance) -or
+                -not $Records.ContainsKey($prior.instance) -or $prior.record -isnot [string] -or -not $prior.record) {
+                throw 'Invalid or missing instance in the Curl restart snapshot.'
+            }
+            $baseline[$prior.instance] = $true
+            $record = $Records[$prior.instance]
+            if ($record.state -cne 'running') { continue }  # Evaluate any receipt normally.
+            if ($record.RawRecord -cne $prior.record) { throw "Curl restart snapshot changed for instance $($prior.instance)." }
+            if (-not $sameBoot -and -not $recovered.ContainsKey($record.instance)) {
+                $eligible += $record
+                $recovered[$record.instance] = $true
+            }
+        }
+    }
+    # Validate all ordinary receipts before publishing any restart dispositions.
+    $clean = Assert-CurlCleanup $Records $Plan $recovered
+    if ($eligible.Count) { Save-CurlRestartEvidence $Context.Key $Plan $eligible }
+    if ($clean) { return }
+
+    $remaining = @($Records.Values | Where-Object { $_.state -ceq 'running' -and -not $recovered.ContainsKey($_.instance) })
+    if (-not $sameBoot -or @($remaining | Where-Object { -not $baseline.ContainsKey($_.instance) }).Count) {
+        $witness = New-CurlRestartWitness $Context.Key
+        $Plan | Add-Member -NotePropertyName restart -Force -NotePropertyValue @{
+            witness = $witness
+            records = @($remaining | ForEach-Object { @{ instance = $_.instance; record = $_.RawRecord } })
+        }
+        $Context.Instances.SetValue('MaintenancePlan', ($Plan | ConvertTo-Json -Compress -Depth 6))
+        $Context.Instances.Flush()
+    }
+    throw 'Curl interpreter/task exited without a complete receipt. Forced exit or cleanup unconfirmed. Unresolved records are preserved. Use Windows Restart, then retry the same operation.'
 }
 
 function Test-CurlInterpreterExited([string]$Generation) {
@@ -265,6 +364,7 @@ function Test-CurlInterpreterExited([string]$Generation) {
 }
 
 function Enter-CurlMaintenance($Context, $Task) {
+    $Context.Quiesced = $false
     try { Wait-CurlMaintenance $Context $Task }
     catch {
         # A corrupt snapshot/record can fail before the ordinary disable step.
@@ -291,7 +391,7 @@ function Wait-CurlMaintenance($Context, $Task) {
         $key.SetValue('Maintenance', $challenge)
         $key.Flush()
         $records = Get-CurlRecords $Context.Instances
-        $plan = @{ operation = $challenge; enabled = [bool]($Task -and $Task.Enabled)
+        $plan = [pscustomobject]@{ operation = $challenge; enabled = [bool]($Task -and $Task.Enabled)
             records = @($records.Values | Select-Object instance,local_stop,state,operation) }
         $Context.Instances.SetValue('MaintenancePlan', ($plan | ConvertTo-Json -Compress -Depth 4))
         $Context.Instances.Flush()
@@ -304,10 +404,8 @@ function Wait-CurlMaintenance($Context, $Task) {
         $generation = if ($Context.Switched -and $Task) { $Context.Staged } else { $Context.Old }
         $taskQuiet = -not $Task -or $Task.GetInstances(0).Count -eq 0
         if ($taskQuiet -and (Test-CurlInterpreterExited $generation)) {
-            if (-not (Assert-CurlCleanup (Get-CurlRecords $Context.Instances) $plan)) {
-                throw 'Curl interpreter/task exited without a complete receipt. Forced exit or cleanup unconfirmed.'
-            }
             if ($Task -and $Task.Enabled) { throw 'Curl task was re-enabled during maintenance.' }
+            Confirm-CurlQuiescence $Context $plan (Get-CurlRecords $Context.Instances)
             $Context.Quiesced = $true
             return
         }
@@ -350,7 +448,7 @@ function Open-CurlDeployment([bool]$Install) {
             }
             $parent = $hklm.CreateSubKey('SOFTWARE\DLP')
             try {
-                Assert-CurlAdminAcl ($parent.GetAccessControl()) 0xD0006
+                Assert-CurlAdminAcl ($parent.GetAccessControl()) 0xD0006 'HKLM\SOFTWARE\DLP'
                 if ($parent.GetSubKeyNames() -contains 'ManagedCurl') { throw 'Retry after concurrent Curl installer.' }
                 $ctx.Key = $parent.CreateSubKey('ManagedCurl', 'ReadWriteSubTree', (New-CurlRegistryAcl $CurlRootAcl))
             } finally { $parent.Dispose() }
@@ -394,15 +492,7 @@ function New-CurlRelease($Context, [string]$Source, [string]$Python) {
     foreach ($file in $CurlFiles) {
         Copy-Item -LiteralPath (Join-Path $Source $file) -Destination (Join-Path $layout.Dir $file) -ErrorAction Stop
     }
-    Push-Location -LiteralPath $layout.Dir
-    try {
-        & $Python -I -B -m venv --copies (Join-Path $layout.Dir 'venv')
-        if ($LASTEXITCODE) { throw 'Managed Curl venv creation failed.' }
-        & $layout.Python -I -B -m pip --isolated install --disable-pip-version-check -r (Join-Path $layout.Dir 'requirements.txt')
-        if ($LASTEXITCODE) { throw 'Managed Curl requirements installation failed.' }
-        & $layout.Python -I -B -c 'import psutil, requests, pypdf'
-        if ($LASTEXITCODE) { throw 'Managed Curl dependency preflight failed.' }
-    } finally { Pop-Location }
+    New-DlpPythonVenv $Python (Join-Path $layout.Dir 'venv') (Join-Path $layout.Dir 'requirements.txt') | Out-Null
 }
 
 function Remove-CurlRelease($Context, [string]$Id) {
@@ -420,10 +510,13 @@ function Remove-CurlRelease($Context, [string]$Id) {
     while ($pending.Count) {
         foreach ($item in Get-ChildItem -LiteralPath $pending.Pop() -Force -ErrorAction Stop) {
             if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Reparse point inside Curl release. Files preserved.' }
-            if ($item.PSIsContainer) { Assert-CurlProtectedPath $item.FullName; $pending.Push($item.FullName) }
+            Assert-CurlProtectedPath $item.FullName
+            if ($item.PSIsContainer) { $pending.Push($item.FullName) }
         }
     }
-    Remove-Item -LiteralPath $dir -Force -Recurse -ErrorAction Stop
+    $resolved = (Resolve-Path -LiteralPath $dir -ErrorAction Stop).ProviderPath
+    if ($resolved -ine $dir) { throw "Curl release path changed at '$dir'. Files preserved." }
+    Remove-Item -LiteralPath $resolved -Force -Recurse -ErrorAction Stop
 }
 
 function Complete-CurlInstall($Context) {
@@ -438,10 +531,13 @@ function Complete-CurlInstall($Context) {
     $task.Enabled = $true
     Assert-CurlSettings $task $true
     $Context.Installed = $true
-    if ($Context.Old) { Remove-CurlRelease $Context $Context.Old }
+    if ($Context.Old) {
+        try { Remove-CurlRelease $Context $Context.Old }
+        catch { Write-Warning ("Prior Curl release retained: " + $_.Exception.Message) }
+    }
 }
 
-function Undo-CurlInstall($Context) {
+function Undo-CurlInstall($Context, [switch]$KeepDisabled) {
     if (-not $Context -or $Context.Installed) { return }
     if ($Context.Quiesced) {
         $task = Get-CurlTask $Context.Folder
@@ -462,7 +558,11 @@ function Undo-CurlInstall($Context) {
         if ($Context.Old) { Assert-CurlOwnership $task $Context.Owner $Context.Old }
         $Context.Key.SetValue('Current', $Context.Old)
         Exit-CurlMaintenance $Context
-        if ($Context.Old) { $task.Enabled = $Context.OldEnabled; Assert-CurlSettings $task $Context.OldEnabled }
+        if ($Context.Old) {
+            $enable = [bool]($Context.OldEnabled -and -not $KeepDisabled)
+            $task.Enabled = $enable
+            Assert-CurlSettings $task $enable
+        }
     }
     # Only the new unregistered/rolled-back generation is disposable.
     if ($Context.Staged -and ($Context.Quiesced -or -not $Context.Switched)) { Remove-CurlRelease $Context $Context.Staged }
