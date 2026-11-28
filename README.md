@@ -122,7 +122,7 @@ Xem thêm: [Server README](server/README.md).
 
 ## 6. Cài đặt Agent Windows
 
-**Yêu cầu:** Windows 10/11, Python 3.10+, quyền Administrator, kết nối đến DLP Server. Agent không cần cài XAMPP.
+**Yêu cầu:** Windows 10/11 x64, quyền Administrator, kết nối đến DLP Server và nguồn tải thư viện. Bộ cài tự tìm hoặc cài Python cho mọi người dùng. [Chi tiết cài Python và xử lý lỗi](agent/docs/INSTALLER_PYTHON.md)
 
 1. Trên DLP Web → **Settings**, lấy enrollment key.
 2. Trên máy Windows Agent, clone/copy repo và vào:
@@ -133,9 +133,12 @@ Xem thêm: [Server README](server/README.md).
    - **Server URL:** ví dụ `http://192.168.106.142/server/api` hoặc `http://<IP>/dlp_server/api` tùy cách triển khai.
    - **Hostname:** tên thiết bị đăng ký.
    - **Enrollment Key:** lấy từ Server Settings.
-4. Installer tạo `C:\DLP\agent`, môi trường Python `C:\DLP\venv`, và hai service tự khởi động:
+4. Installer tạo `C:\DLP\agent` và môi trường Python `%ProgramFiles%\DLP-Runtimes\<release-id>`. Dùng đường dẫn **Shared agent Python** mà bộ cài in ra trong các ví dụ bên dưới. Khi nâng cấp, installer xác thực cấu hình thiết bị và giữ dữ liệu cũ trong thư mục phục hồi dưới `%ProgramFiles%\DLP-Setup`.
+
+   Các service tự khởi động:
    - `DLPNetworkAgent`
    - `DLPSftpScpAgent`
+   - `DLPBrowserAgent`
 5. Kiểm tra:
    ```powershell
    Get-Service DLPNetworkAgent, DLPSftpScpAgent
@@ -146,7 +149,7 @@ Xem thêm: [Server README](server/README.md).
 Để test Clipboard/Screen Capture trên branch `main`, mở terminal **trong phiên người dùng đang đăng nhập** rồi chạy thủ công:
 ```powershell
 cd C:\DLP\agent
-C:\DLP\venv\Scripts\python.exe clipboard_agent.py
+& 'C:\Program Files\DLP-Runtimes\<release-id>\Scripts\python.exe' clipboard_agent.py
 ```
 
 **Lưu ý:** Agent nhận policy theo chu kỳ; trạng thái heartbeat thành công chưa chứng minh đã có policy phù hợp. Không đăng tải `config.ini` chứa API token/enrollment key lên repository.
@@ -167,7 +170,7 @@ Curl Agent V1 được bộ cài đăng ký để tự chạy khi người dùng
 Test riêng engine bằng file lab:
 
 ```powershell
-C:\DLP\venv\Scripts\python.exe C:\DLP\agent\content_inspection.py C:\Lab\secret.txt
+& 'C:\Program Files\DLP-Runtimes\<release-id>\Scripts\python.exe' C:\DLP\agent\content_inspection.py C:\Lab\secret.txt
 ```
 
 Lệnh trên chỉ kiểm tra engine với rule mặc định dành cho CLI; **không chứng minh Agent đang thực thi policy được cấp từ Server**.
@@ -176,7 +179,7 @@ Kiểm tra policy mà Server trả cho Agent (không in token):
 
 ```powershell
 cd C:\DLP\agent
-C:\DLP\venv\Scripts\python.exe -c "from policy_client import PolicyClient; import configparser,json; c=configparser.ConfigParser(); c.read('config.ini'); a=c['agent']; p=PolicyClient(a['server_url'],a['hostname'],a['api_token']); d=p.get_policy(); print(json.dumps(d.get('applicable_policies',[]) if d else None,indent=2,ensure_ascii=False))"
+& 'C:\Program Files\DLP-Runtimes\<release-id>\Scripts\python.exe' -c "from policy_client import PolicyClient; import configparser,json; c=configparser.ConfigParser(); c.read('config.ini'); a=c['agent']; p=PolicyClient(a['server_url'],a['hostname'],a['api_token']); d=p.get_policy(); print(json.dumps(d.get('applicable_policies',[]) if d else None,indent=2,ensure_ascii=False))"
 ```
 
 **Chú ý riêng với SCP/SFTP:** Test trên VM/lab. Nếu Agent chặn theo firewall port/IP thì SSH hoặc cả các lần truyền file sạch tiếp theo cũng có thể bị ảnh hưởng và không sinh thêm log file-level. Cơ chế quan sát tiến trình không bảo đảm chặn trước khi file đã truyền xong.

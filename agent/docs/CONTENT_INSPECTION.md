@@ -154,3 +154,9 @@ python content_inspection.py dev_tools/dlp_samples
 ```
 
 Các test dùng fixture tổng hợp để kiểm tra verdict, giới hạn từng bước, trạng thái của PDF và archive, rule lỗi, định dạng log và tốc độ quét. Để chạy cả các consumer và giao thức worker cURL, dùng `python -m unittest discover -s dev_tools -p "test_*.py" -v` trong thư mục `agent`. Các test dùng API Win32 cần chạy trên Windows.
+
+### Kiểm chứng bản tích hợp trên Windows
+
+Chạy lại các test Python cần Win32 và năm suite PowerShell trong `agent/dev_tools` trên bản build từ merge commit. Ghi nhận phiên bản Windows, Python, kết quả và SHA. Kiểm tra cài mới với Python bootstrap, enrollment và redirect theo checklist release. [Installer release acceptance](INSTALLER_PYTHON.md#release-acceptance)
+
+Chạy `agent/dev_tools/curl_windows_runtime_check.py --worker-cleanup-only` trong phiên đăng nhập Windows tiêu chuẩn. Dùng file tổng hợp kiểm tra một lần quét đầy đủ và một lần quét chạm giới hạn qua worker thật. Đối chiếu verdict, reason và `inspection_coverage` trong journal của đúng phiên. Với hai phiên đăng nhập, xác nhận notification của `BLOCKED_KILL` đến đúng desktop và sự kiện coverage không tạo notification chặn. Khi kiểm tra upgrade hoặc uninstall, đối chiếu receipt `complete` với worker cleanup đã xác nhận và `pending_resumes=0`. Nếu cleanup chưa được xác nhận, receipt phải là `incomplete` và giữ marker của phiên. [Native worker cleanup](CURL_AGENT.md#native-worker-cleanup-verification) · [Thông báo cURL](CURL_AGENT.md#curl-notification-acceptance)

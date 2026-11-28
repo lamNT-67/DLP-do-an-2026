@@ -6,10 +6,10 @@ Agent Windows của hệ thống DLP trong đồ án, viết bằng Python. Agen
 Trước khi cài đặt, cần chuẩn bị:
 
 - Máy tính chạy Windows.
-- Python 3.10 trở lên, khi cài đặt nhớ tích chọn **Add python.exe to PATH**.
+- Windows x64 và Windows PowerShell 5.1 64-bit. Bộ cài tìm Python 3.10–3.14 cài cho mọi người dùng trong Program Files hoặc tự tải bản PSF đã ghim phiên bản và kiểm tra chữ ký. Xem [kiểm tra và xử lý lỗi bộ cài](docs/INSTALLER_PYTHON.md).
 - Mở PowerShell bằng quyền Administrator.
 - Máy chủ DLP đã chạy trên XAMPP. Máy cài Agent không cần cài XAMPP.
-- Máy cài Agent có kết nối mạng trong lúc cài (tải thư viện Python và công cụ NSSM).
+- Máy cài Agent có kết nối mạng trong lúc cài để tải Python khi cần, thư viện Python và công cụ NSSM.
 
 2. Lấy Enrollment Key
 
@@ -52,10 +52,10 @@ Ba tác vụ chạy khi người dùng đăng nhập:
 
 Ngoài ra bộ cài còn:
 
-- Cấp cho nhóm Users quyền ghi vào thư mục log C:\ProgramData\DLP\logs để agent clipboard ghi được log.
+- Cấp cho nhóm Users quyền đọc và nối dữ liệu vào hai tệp nhật ký dành cho agent clipboard trong `C:\ProgramData\DLP\logs`.
 - Đặt chính sách của Edge WebCaptureEnabled=0 để tắt công cụ Screenshot riêng của Edge. Chính sách này áp dụng cho cả máy.
 
-Trong lần chạy đầu tiên, Agent sẽ đăng ký với máy chủ và lưu token vào file cấu hình C:\DLP\agent\config.ini. Không cần tự nhập token nếu quá trình đăng ký thành công. Nếu cài lại, bộ cài giữ nguyên config.ini hiện có.
+Trong lần chạy đầu tiên, Agent mạng đăng ký với máy chủ và lưu token vào `C:\DLP\agent\config.ini`. Khi cài lại, bộ cài xác thực và giữ token, hostname và các tùy chọn được hỗ trợ. Nếu bản cũ có ACL không an toàn, hãy xác nhận URL của máy chủ để bộ cài kiểm tra thiết bị trước khi chuyển đổi. Xem [hướng dẫn chuyển đổi và phục hồi](docs/INSTALLER_PYTHON.md#legacy-migration-and-recovery).
 
 4. Bật extension trình duyệt (Edge / Chrome)
 
@@ -99,10 +99,10 @@ Agent làm mới policy mỗi 60 giây.
 - Trình duyệt: extension ở chế độ nhà phát triển có thể bị người dùng tắt; file trên 2 MiB bị chặn dù sạch; upload tạo bằng Blob/script chưa được quét; code trong trang không phải ranh giới bảo mật.
 - Chụp màn hình: ảnh chụp không được quét nội dung (chưa có OCR) nên policy BLOCK chặn mọi ảnh; không chặn OBS, ShareX hay chụp bằng điện thoại.
 - Clipboard: dữ liệu còn trong bộ nhớ vài mili giây trước khi bị xóa; kéo thả file không đi qua clipboard.
-- Quyền ghi log: nhóm `Users` có quyền ghi vào thư mục log nên người dùng thường có thể sửa log cục bộ (máy chủ vẫn giữ bản đã gửi).
+- Nhóm `Users` có quyền đọc và nối bản ghi vào hai tệp nhật ký dùng chung được cấp sẵn. Máy chủ giữ các bản ghi đã nhận. Nhật ký Curl được giữ riêng theo tài khoản.
 - Quản trị viên máy luôn có thể tắt agent. Đây là giới hạn chung của giải pháp chạy ở user-mode.
 
 
 7. Gỡ cài đặt
 
-Mở PowerShell bằng quyền Administrator, vào thư mục `agent\service` và nhấp đúp `uninstall.bat` (hoặc chạy `.\uninstall.bat`). Script dừng service, xóa tác vụ, xóa luật tường lửa `DLP_*` và xóa giá trị `WebCaptureEnabled` của Edge. Tham số `-RemoveFiles` của `uninstall.ps1` còn xóa `C:\DLP` và `C:\ProgramData\DLP`, nên hãy sao lưu `config.ini` trước.
+Trong thư mục bộ cài tin cậy, nhấp đúp `uninstall.bat` và chấp nhận UAC. Bộ gỡ cài đặt xác minh và dừng các service, tác vụ DLP trước khi gỡ đăng ký. Với `-RemoveFiles`, hai thư mục `C:\DLP` và `C:\ProgramData\DLP` được chuyển vào thư mục phục hồi được báo trên màn hình. Nhật ký Curl theo tài khoản được giữ lại.
