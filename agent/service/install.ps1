@@ -4,255 +4,228 @@ param(
     [string]$Hostname,
     [string]$EnrollmentKey,
     [switch]$NoPrompt,
-    [string]$CurlPython
+    [string]$CurlPython,
+    [switch]$AllowInsecureLabServer
 )
 $ErrorActionPreference = 'Stop'
 
+if (-not [Environment]::Is64BitProcess -or [Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne 'X64') {
+    Write-Host 'Use 64-bit Windows PowerShell on AMD64 Windows to run DLP setup.' -ForegroundColor Red
+    exit 1
+}
+
 # ---- Tu xin quyen Administrator ----
-$principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+$principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Write-Host 'Requesting Administrator rights...'
-    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $PSCommandPath))
-    foreach ($k in $PSBoundParameters.Keys) {
-        $v = $PSBoundParameters[$k]
-        if ($v -is [switch]) { if ($v.IsPresent) { $argList += "-$k" } }
-        else { $argList += "-$k"; $argList += ('"{0}"' -f $v) }
+    if ($EnrollmentKey) {
+        Write-Host 'Enter the enrollment key after elevation, or use -EnrollmentKey in an already elevated console.' -ForegroundColor Red
+        exit 1
     }
-    Start-Process powershell.exe -Verb RunAs -ArgumentList $argList
-    exit
+    Write-Host 'Requesting Administrator rights...'
+    # Serialize only the non-secret inputs. The child splats decoded values
+    # as data, including spaces, quotes and PowerShell metacharacters.
+    $request = @{ Script = $PSCommandPath; ServerUrl = $ServerUrl; Hostname = $Hostname
+        NoPrompt = [bool]$NoPrompt; CurlPython = $CurlPython
+        AllowInsecureLabServer = [bool]$AllowInsecureLabServer } | ConvertTo-Json -Compress
+    $data = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($request))
+    $command = @'
+$env:PSModulePath = [IO.Path]::Combine($PSHOME, 'Modules')
+$request = ConvertFrom-Json ([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('{0}')))
+$options = @{{ ServerUrl = $request.ServerUrl; Hostname = $request.Hostname
+    NoPrompt = $request.NoPrompt; CurlPython = $request.CurlPython
+    AllowInsecureLabServer = $request.AllowInsecureLabServer }}
+try {{
+    & $request.Script @options
+    exit $LASTEXITCODE
+}} catch {{
+    Write-Host ("DLP setup failed: " + $_.Exception.Message) -ForegroundColor Red
+    exit 1
+}}
+'@ -f $data
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
+    $powershell = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
+    try {
+        $child = Start-Process -FilePath $powershell -Verb RunAs -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded) -Wait -PassThru
+        exit $child.ExitCode
+    } catch {
+        for ($cause = $_.Exception; $cause; $cause = $cause.InnerException) {
+            if ($cause -is [ComponentModel.Win32Exception] -and $cause.NativeErrorCode -eq 1223) {
+                Write-Host 'Administrator approval was cancelled.'
+                exit 1223
+            }
+        }
+        Write-Host ("Could not start elevated DLP setup: " + $_.Exception.Message) -ForegroundColor Red
+        exit 1
+    }
 }
 
 $InstallDir = 'C:\DLP'
-$AgentDir   = Join-Path $InstallDir 'agent'
-$VenvDir    = Join-Path $InstallDir 'venv'
-$ToolsDir   = Join-Path $InstallDir 'tools'
-$LogDir     = 'C:\ProgramData\DLP\logs'
-$Source     = Split-Path $PSScriptRoot -Parent
-$Services   = @(
-    @{ Name = 'DLPNetworkAgent'; Script = 'network_agent.py'  },
-    @{ Name = 'DLPSftpScpAgent'; Script = 'sftp_scp_agent.py' },
-    @{ Name = 'DLPBrowserAgent'; Script = 'browser_agent.py' }
-)
+$AgentDir = Join-Path $InstallDir 'agent'
+$DataDir = 'C:\ProgramData\DLP'
+$LogDir = Join-Path $DataDir 'logs'
+$Source = Split-Path $PSScriptRoot -Parent
 
-function Step($m) { Write-Host ("`n==> " + $m) -ForegroundColor Cyan }
+function Step($Message) { Write-Host ([Environment]::NewLine + '==> ' + $Message) -ForegroundColor Cyan }
 
-function Get-IniValue($path, $key) {
-    $line = Get-Content $path | Where-Object { $_ -match "^\s*$key\s*=" } | Select-Object -First 1
-    if ($line) { return ($line -split '=', 2)[1].Trim() }
-    return ''
-}
-function Set-IniValue($path, $key, $value) {
-    $lines = @(Get-Content $path)
-    $found = $false
-    for ($i = 0; $i -lt $lines.Count; $i++) {
-        if ($lines[$i] -match "^\s*$key\s*=") { $lines[$i] = "$key = $value"; $found = $true }
-    }
-    if (-not $found) { throw "Khong thay khoa '$key' trong $path" }
-    [IO.File]::WriteAllLines($path, $lines, (New-Object Text.UTF8Encoding($false)))
-}
-function Invoke-Nssm {
-    $old = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    & $nssm @args 2>&1 | Out-Null
-    $ErrorActionPreference = $old
-}
-
-. (Join-Path $PSScriptRoot 'curl_task.ps1')
+$state = $null
+$layout = $null
+$recovery = $null
+$recoveryHandle = $null
 $curlDeployment = $null
-$installFailed = $false
+$enrollment = $null
+$sharedCutoverStarted = $false
+$installed = $false
+$createdServices = [Collections.Generic.List[string]]::new()
+$createdTasks = [Collections.Generic.List[string]]::new()
+$installExitCode = 0
+$originalModulePath = $env:PSModulePath
 try {
-    # ---- 1. Python ----
-    Step 'Tim Python'
-    $pyExe = $null
-    foreach ($c in 'python.exe', 'py.exe') {
-        $cmd = Get-Command $c -ErrorAction SilentlyContinue
-        if ($cmd -and $cmd.Source -notmatch 'WindowsApps') { $pyExe = $cmd.Source; break }
+    $env:PSModulePath = [IO.Path]::Combine($PSHOME, 'Modules')
+    foreach ($file in 'curl_task.ps1', 'installer_python.ps1', 'installer_migration.ps1', 'installer_enrollment.ps1', 'installer_services.ps1') {
+        . (Join-Path $PSScriptRoot $file)
     }
-    if (-not $pyExe) { throw 'Khong tim thay Python 3. Cai tu https://www.python.org/downloads/ (tick "Add python.exe to PATH") roi chay lai.' }
-    $pyArgs = @()
-    if ($pyExe -match 'py\.exe$') { $pyArgs = @('-3') }
-    & $pyExe @pyArgs --version
+    $state = Open-DlpSetupState
+    foreach ($root in $InstallDir, $DataDir, $state.Root, $DlpRuntimes, $CurlRoot) {
+        if ($Source -ieq $root -or $Source.StartsWith($root + '\', 'OrdinalIgnoreCase')) {
+            throw 'Run setup from a reviewed release source outside the installed and archived DLP directories.'
+        }
+    }
 
-    Step 'Stage managed Curl and request cooperative shutdown'
-    $curlBase = Resolve-CurlPython $CurlPython $pyExe
+    Step 'Inspect existing DLP paths and registrations'
+    $layout = Open-DlpLayout $InstallDir $DataDir
+    foreach ($issue in @($layout.InstallIssues) + @($layout.DataIssues)) {
+        if ($issue) { Write-Warning $issue }
+    }
     $curlDeployment = Open-CurlDeployment $true
-    Initialize-CurlConfigRoot $InstallDir
-    New-CurlRelease $curlDeployment $Source $curlBase
+    $folder = $curlDeployment.Folder
+    $inventory = Get-DlpSharedInventory $folder
+    Assert-DlpInstallIdentity $layout $inventory $curlDeployment
+
+    Step 'Validate enrollment before cutover'
+    $enrollment = Resolve-DlpEnrollment $layout $Source $ServerUrl $Hostname $EnrollmentKey -NoPrompt:$NoPrompt -AllowInsecureLabServer:$AllowInsecureLabServer
+
+    Step 'Select protected machine-wide Python'
+    $pyExe = Resolve-CurlPython $CurlPython
+    if (-not $pyExe) {
+        $bootstrap = Install-DlpMachinePython
+        if ($bootstrap.ExitCode -eq 3010) {
+            Write-Host 'Python setup requires a reboot. Restart Windows, then rerun DLP setup.'
+            exit 3010
+        }
+        $pyExe = $bootstrap.Path
+    }
+    Write-Host "Using '$pyExe' for both DLP runtimes."
+
+    Step 'Prepare fresh executable trees and retain verified enrollment'
+    $recovery = New-DlpRecoveryDirectory $state
+    $recoveryHandle = Open-DlpProtectedDirectory $recovery
+    Assert-DlpSameVolume $layout.Volume $recoveryHandle
+    New-DlpConfigFile (Join-Path $recovery 'verified-config.ini') $enrollment -Private
+    $nextInstall = Join-Path $recovery 'next-install'
+    $nextData = Join-Path $recovery 'next-data'
+    New-DlpDirectory $nextInstall -UsersRead
+    New-DlpDirectory $nextData -UsersRead
+    New-DlpLogFiles $nextData
+    $nextAgent = Join-Path $nextInstall 'agent'
+    $nextTools = Join-Path $nextInstall 'tools'
+    [IO.Directory]::CreateDirectory($nextAgent) | Out-Null
+    [IO.Directory]::CreateDirectory($nextTools) | Out-Null
+    & (Join-Path ([Environment]::SystemDirectory) 'robocopy.exe') $Source $nextAgent /E /XJ /R:0 /W:0 /NFL /NDL /NJH /NJS /NP /XD logs __pycache__ dev_tools tools service .git /XF config.ini curl_managed.py install.ps1 install.bat uninstall.ps1 uninstall.bat | Out-Null
+    if ($LASTEXITCODE -ge 8) { throw "Could not stage agent files at '$nextAgent' (robocopy exit $LASTEXITCODE)." }
+    foreach ($script in (@($DlpServiceScripts.Values) + @('clipboard_agent.py', 'requirements.txt'))) {
+        if (-not (Test-Path -LiteralPath (Join-Path $nextAgent $script) -PathType Leaf)) {
+            throw "Missing '$script' in the reviewed agent release."
+        }
+    }
+    New-DlpConfigFile (Join-Path $nextAgent 'config.ini') $enrollment
+    $notifier = Join-Path $PSScriptRoot 'notify.ps1'
+    if (Test-Path -LiteralPath $notifier -PathType Leaf) {
+        $notifyDir = Join-Path $nextInstall 'notify'
+        [IO.Directory]::CreateDirectory($notifyDir) | Out-Null
+        Copy-Item -LiteralPath $notifier -Destination (Join-Path $notifyDir 'notify.ps1')
+    } elseif ($inventory.Tasks.ContainsKey('DLPNotifier')) {
+        throw "The reviewed release is missing '$notifier' for the existing notifier task."
+    }
+    Save-DlpNssm (Join-Path $PSScriptRoot 'nssm.exe') $recovery (Join-Path $nextTools 'nssm.exe')
+    Assert-DlpProtectedTree $nextInstall
+
+    Step 'Stage shared and managed Curl Python runtimes'
+    New-DlpDirectory $DlpRuntimes -UsersRead
+    $venvDir = Join-Path $DlpRuntimes (Split-Path -Leaf $recovery)
+    $venvPy = New-DlpPythonVenv $pyExe $venvDir (Join-Path $nextAgent 'requirements.txt')
+    Write-Host "Shared agent Python: $venvPy"
+    New-CurlRelease $curlDeployment $Source $pyExe
+
+    Step 'Request cooperative Curl shutdown'
     Enter-CurlMaintenance $curlDeployment $curlDeployment.Task
 
-    # ---- 2. Dung service cu ----
-    Step 'Dung service cu (neu co)'
-    foreach ($s in $Services) {
-        if (Get-Service $s.Name -ErrorAction SilentlyContinue) {
-            Stop-Service $s.Name -Force -ErrorAction SilentlyContinue
-        }
-    }
+    Step 'Fence and verify shared services and task shutdown'
+    Start-DlpCutover $state $recovery
+    $sharedCutoverStarted = $true
+    Stop-DlpSharedWork $folder $inventory
 
-    # ---- 3. Chep file ----
-    Step "Chep agent vao $AgentDir"
-    New-Item -ItemType Directory -Force $AgentDir, $ToolsDir, $LogDir | Out-Null
-    robocopy $Source $AgentDir /E /NFL /NDL /NJH /NJS /NP /XD logs __pycache__ dev_tools tools service .git /XF config.ini curl_managed.py install.ps1 install.bat uninstall.ps1 uninstall.bat | Out-Null
-    if ($LASTEXITCODE -ge 8) { throw "robocopy loi (ma $LASTEXITCODE)" }
-
-    # ---- 4. config.ini ----
-    Step 'Cau hinh config.ini'
+    Step 'Archive the previous installation and publish the replacement'
+    Move-DlpLayout $layout $recoveryHandle $recovery -Publish
     $cfg = Join-Path $AgentDir 'config.ini'
-    if (Test-Path $cfg) {
-        Write-Host 'Giu nguyen config.ini hien co (khong ghi de token).'
-    } else {
-        $srcCfg  = Join-Path $Source 'config.ini'
-        $example = Join-Path $Source 'config.ini.example'
-        if (Test-Path $srcCfg) {
-            Copy-Item $srcCfg $cfg
-        } elseif (Test-Path $example) {
-            Copy-Item $example $cfg
-            if (-not $ServerUrl) {
-                $def = Get-IniValue $cfg 'server_url'
-                if ($NoPrompt) { $ServerUrl = $def }
-                else {
-                    $in = Read-Host "Server URL (vd http://192.168.1.10/dlp_server/api) [$def]"
-                    if ($in) { $ServerUrl = $in } else { $ServerUrl = $def }
-                }
-            }
-            if (-not $Hostname) {
-                $def = $env:COMPUTERNAME
-                if ($NoPrompt) { $Hostname = $def }
-                else {
-                    $in = Read-Host "Hostname cua may nay [$def]"
-                    if ($in) { $Hostname = $in } else { $Hostname = $def }
-                }
-            }
-            if (-not $EnrollmentKey -and -not $NoPrompt) {
-                $EnrollmentKey = Read-Host 'Enrollment key (lay trong trang Settings cua Admin Web)'
-            }
-            if ($EnrollmentKey) { Set-IniValue $cfg 'enrollment_key' $EnrollmentKey }
-            Set-IniValue $cfg 'server_url' $ServerUrl
-            Set-IniValue $cfg 'hostname' $Hostname
-        } else {
-            throw 'Khong co config.ini lan config.ini.example trong thu muc agent.'
-        }
-    }
+    Assert-DlpProtectedTree $InstallDir
+    foreach ($path in $DataDir, $LogDir) { Assert-CurlProtectedPath $path }
 
-    # ---- 5. venv + thu vien ----
-    Step 'Tao moi truong Python (venv) va cai thu vien'
-    $venvPy = Join-Path $VenvDir 'Scripts\python.exe'
-    if (-not (Test-Path $venvPy)) {
-        & $pyExe @pyArgs -m venv $VenvDir
-        if ($LASTEXITCODE -ne 0) { throw 'Tao venv that bai.' }
+    Step 'Register and verify replacement services'
+    Remove-DlpSharedRegistrations $folder $inventory
+    foreach ($name in $DlpServiceScripts.Keys) { Install-DlpService $name $venvPy $LogDir $createdServices }
+    Invoke-DlpSc @('config', 'DLPNetworkAgent', 'start=', 'demand')
+    Invoke-DlpNssm $DlpNssm @('start', 'DLPNetworkAgent')
+    if (-not $enrollment.agent.api_token) {
+        $enrolled = Wait-DlpEnrollment $cfg $enrollment
+        Publish-DlpEnrolledConfig $cfg $recovery $enrolled
     }
-    $req = Join-Path $AgentDir 'requirements.txt'
-    if (Test-Path $req) { & $venvPy -m pip install --disable-pip-version-check -r $req }
-    else { & $venvPy -m pip install --disable-pip-version-check psutil requests }
-    if ($LASTEXITCODE -ne 0) { throw 'pip install that bai (kiem tra ket noi mang).' }
+    foreach ($name in $DlpServiceScripts.Keys | Where-Object { $_ -ne 'DLPNetworkAgent' }) {
+        Invoke-DlpSc @('config', $name, 'start=', 'demand')
+        Invoke-DlpNssm $DlpNssm @('start', $name)
+    }
+    Wait-DlpServiceHealth $venvPy $pyExe
+    foreach ($name in $DlpServiceScripts.Keys) { Invoke-DlpSc @('config', $name, 'start=', 'auto') }
 
-    # ---- 6. NSSM ----
-    Step 'Chuan bi NSSM'
-    $nssm    = Join-Path $ToolsDir 'nssm.exe'
-    $bundled = Join-Path $PSScriptRoot 'nssm.exe'
-    if (Test-Path $bundled) {
-        Copy-Item $bundled $nssm -Force
-    } elseif (-not (Test-Path $nssm)) {
-        $found = Get-Command nssm -ErrorAction SilentlyContinue
-        if ($found) {
-            Copy-Item $found.Source $nssm -Force
-        } else {
-            Write-Host 'Dang tai NSSM tu nssm.cc ...'
-            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-            $zip = Join-Path $env:TEMP 'nssm.zip'
-            $tmp = Join-Path $env:TEMP 'nssm_extract'
-            Invoke-WebRequest 'https://nssm.cc/release/nssm-2.24.zip' -OutFile $zip -UseBasicParsing
-            Expand-Archive $zip $tmp -Force
-            $exe = Get-ChildItem $tmp -Recurse -Filter nssm.exe | Where-Object { $_.FullName -match 'win64' } | Select-Object -First 1
-            Copy-Item $exe.FullName $nssm -Force
-        }
+    $scheduler = $curlDeployment.Scheduler
+    if (Test-Path -LiteralPath (Join-Path $InstallDir 'notify\notify.ps1') -PathType Leaf) {
+        Register-DlpDesktopTask $scheduler $folder 'DLPNotifier' $DlpNotifierArgs $createdTasks
     }
-    if (-not (Test-Path $nssm)) { throw 'Khong co nssm.exe. Chep nssm.exe vao agent\service\ roi chay lai.' }
+    Register-DlpDesktopTask $scheduler $folder 'DLPClipboardAgent' (Get-DlpClipboardArgs $venvPy) $createdTasks
+    New-Item -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' -Force | Out-Null
+    New-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' -Name WebCaptureEnabled -PropertyType DWord -Value 0 -Force | Out-Null
 
-    # ---- 7. Cai service ----
-    Step 'Cai dat service'
-    foreach ($s in $Services) {
-        $n = $s.Name
-        if (Get-Service $n -ErrorAction SilentlyContinue) { Invoke-Nssm remove $n confirm; Start-Sleep 2 }
-        Invoke-Nssm install $n $venvPy "-u $AgentDir\$($s.Script)"
-        Invoke-Nssm set $n AppDirectory $AgentDir
-        Invoke-Nssm set $n DisplayName "DLP $n"
-        Invoke-Nssm set $n Description "DLP Agent - $($s.Script)"
-        Invoke-Nssm set $n Start SERVICE_AUTO_START
-        Invoke-Nssm set $n AppStdout "$LogDir\$n.out.log"
-        Invoke-Nssm set $n AppStderr "$LogDir\$n.err.log"
-        Invoke-Nssm set $n AppRotateFiles 1
-        Invoke-Nssm set $n AppRotateOnline 1
-        Invoke-Nssm set $n AppRotateBytes 5242880
-        Invoke-Nssm set $n AppExit Default Restart
-        Invoke-Nssm set $n AppRestartDelay 5000
-        Invoke-Nssm set $n AppEnvironmentExtra "DLP_LOG_DIR=$LogDir"
-        Invoke-Nssm start $n
-        Write-Host "  da cai: $n"
-    }
-
-    # ---- 7b. Thong bao tren may endpoint ----
-    Step 'Cai thong bao khi bi chan'
-    $NotifyDir = Join-Path $InstallDir 'notify'
-    New-Item -ItemType Directory -Force $NotifyDir | Out-Null
-    $notifySrc = Join-Path $PSScriptRoot 'notify.ps1'
-    if (Test-Path $notifySrc) {
-        Stop-ScheduledTask -TaskName 'DLPNotifier' -ErrorAction SilentlyContinue
-        Copy-Item $notifySrc (Join-Path $NotifyDir 'notify.ps1') -Force
-        $act = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File "C:\DLP\notify\notify.ps1"'
-        $trg = New-ScheduledTaskTrigger -AtLogOn
-        $pri = New-ScheduledTaskPrincipal -GroupId 'BUILTIN\Users' -RunLevel Limited
-        $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
-        Register-ScheduledTask -TaskName 'DLPNotifier' -Action $act -Trigger $trg -Principal $pri -Settings $set -Force | Out-Null
-        Start-ScheduledTask -TaskName 'DLPNotifier'
-        Write-Host '  da cai: DLPNotifier (thong bao khi bi chan)'
-    } else {
-        Write-Host '  khong thay notify.ps1, bo qua phan thong bao'
-    }
-
-    # ---- 7c. Clipboard / chup man hinh (phai chay trong phien nguoi dung, khong chay duoc o Session 0) ----
-    Step 'Cai agent clipboard va chup man hinh'
-    if (Test-Path (Join-Path $AgentDir 'clipboard_agent.py')) {
-        icacls $LogDir /grant 'BUILTIN\Users:(OI)(CI)(W)' | Out-Null
-        Stop-ScheduledTask -TaskName 'DLPClipboardAgent' -ErrorAction SilentlyContinue
-        Get-CimInstance Win32_Process -Filter "name='python.exe'" | Where-Object { $_.CommandLine -like '*clipboard_agent*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-        $act = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -Command "$env:DLP_LOG_DIR=''C:\ProgramData\DLP\logs''; Set-Location C:\DLP\agent; & C:\DLP\venv\Scripts\python.exe clipboard_agent.py"'
-        $trg = New-ScheduledTaskTrigger -AtLogOn
-        $pri = New-ScheduledTaskPrincipal -GroupId 'BUILTIN\Users' -RunLevel Limited
-        $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
-        Register-ScheduledTask -TaskName 'DLPClipboardAgent' -Action $act -Trigger $trg -Principal $pri -Settings $set -Force | Out-Null
-        Start-ScheduledTask -TaskName 'DLPClipboardAgent'
-        # Tat cong cu Screenshot rieng cua Edge (khong di qua phim/clipboard/thu muc ma agent theo doi)
-        New-Item -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' -Force | Out-Null
-        New-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' -Name WebCaptureEnabled -PropertyType DWord -Value 0 -Force | Out-Null
-        Write-Host '  da dat chinh sach Edge: tat Screenshot (WebCaptureEnabled=0), can mo lai Edge'
-        Write-Host '  da cai: DLPClipboardAgent (chan copy-paste va chup man hinh)'
-    } else {
-        Write-Host '  khong thay clipboard_agent.py, bo qua'
-    }
     Step 'Register managed Curl for the next eligible interactive logon'
-    foreach ($protected in $InstallDir, $AgentDir, $cfg) { Assert-CurlProtectedPath $protected }
+    foreach ($path in $InstallDir, $AgentDir, $cfg) { Assert-CurlProtectedPath $path }
     Complete-CurlInstall $curlDeployment
-
-    # ---- 8. Kiem tra ----
-    Step 'Ket qua'
-    Start-Sleep 8
-    Get-Service ($Services | ForEach-Object { $_.Name }) | Format-Table Status, Name -AutoSize
-    foreach ($s in $Services) {
-        $f = "$LogDir\$($s.Name).out.log"
-        if (Test-Path $f) { Write-Host "--- $f" -ForegroundColor DarkGray; Get-Content $f -Tail 5 }
+    $installed = $true
+    [IO.File]::Delete($state.Pending)
+    Write-Host "DLP setup complete. Services and workers verified. Logs: $LogDir" -ForegroundColor Green
+    if ($layout.Install -or $layout.Data) { Write-Host "Prior files and historical logs retained at '$recovery'." }
+} catch {
+    $installExitCode = 1
+    $message = $_.Exception.Message
+    foreach ($secret in $EnrollmentKey, $enrollment.agent.api_token, $enrollment.agent.enrollment_key) {
+        if ($secret) { $message = $message.Replace($secret, '[redacted]') }
     }
-    Write-Host "`nXong. Agent se tu chay moi khi may khoi dong." -ForegroundColor Green
+    Write-Host ("DLP setup failed. " + $message) -ForegroundColor Red
+    if ($sharedCutoverStarted) {
+        if (-not $installed) { Stop-DlpFailedInstall $folder $createdServices $createdTasks }
+        Write-Warning "Cutover is held for review. Recovery data: '$recovery'. See INSTALLER_PYTHON.md."
+    }
+    if ($curlDeployment) {
+        $holdCurl = $sharedCutoverStarted -or $layout.InstallIssues.Count
+        try { Undo-CurlInstall $curlDeployment -KeepDisabled:$holdCurl }
+        catch { Write-Warning ("Curl recovery held for review. " + $_.Exception.Message) }
+    }
+} finally {
+    try {
+        if ($recoveryHandle) { $recoveryHandle.Dispose() }
+        if ($layout) { Close-DlpLayout $layout }
+        if ($curlDeployment) { Close-CurlDeployment $curlDeployment }
+    } finally {
+        if ($state) { $state.Lock.Dispose() }
+        $env:PSModulePath = $originalModulePath
+    }
+    if (-not $NoPrompt) { Read-Host 'Press Enter to close' }
 }
-catch {
-    $installFailed = $true
-    Write-Host ("`nLOI: " + $_.Exception.Message) -ForegroundColor Red
-    try { Undo-CurlInstall $curlDeployment }
-    catch { Write-Warning ("Curl rollback held for review: " + $_.Exception.Message) }
-}
-finally {
-    Close-CurlDeployment $curlDeployment
-    if (-not $NoPrompt) { Read-Host "`nNhan Enter de dong" }
-}
-if ($installFailed) { exit 1 }
-
-
+exit $installExitCode

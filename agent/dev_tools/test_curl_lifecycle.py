@@ -189,6 +189,26 @@ class RegistryTests(unittest.TestCase):
         self.reg.OpenKey.assert_called_with(self.store.control, "Instances", 0, 0x104)
         self.assertEqual(self.reg.FlushKey.call_count, 2)
 
+    def test_reused_logon_requires_disposition_for_exact_previous_running_record(self):
+        previous = "e" * 32
+        original = json.dumps(dict(version=1, instance=previous, local_stop="d" * 32,
+                                   state="running", operation="", **dict.fromkeys(CLEAN)))
+        disposition = dict(reason="abandoned_after_full_restart", record=original,
+                           operation=OPERATION, witness="b" * 32)
+        for delta, allowed in (({}, True), ({"record": original + " "}, False),
+                               ({"reason": "complete"}, False), ({"witness": ""}, False)):
+            with self.subTest(delta=delta):
+                self.reg.QueryValueEx.side_effect = [
+                    (original, 1), (json.dumps(dict(disposition, **delta)), 1)]
+                self.assertEqual(self.store._previous_resolved(previous), allowed)
+                self.reg.OpenKey.assert_called_with(
+                    self.store.control, "RestartEvidence\\" + previous, 0, 0x101)
+        self.reg.QueryValueEx.side_effect = [
+            (previous, 1), (original, 1), (json.dumps(disposition), 1), FileNotFoundError()]
+        self.store.register("scope", {"instance": "a" * 32})
+        self.assertEqual(self.reg.SetValueEx.call_count, 2)
+        self.reg.SetValueEx.assert_called_with(self.store.logon, "scope", 0, 1, "a" * 32)
+
     def test_foreign_dirty_marker_never_removed(self):
         self.store.logon = object()
         self.reg.QueryValueEx.return_value = "b" * 32, 1

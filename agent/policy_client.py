@@ -17,7 +17,10 @@ class PolicyClient:
         payload = {"hostname": self.hostname, "enrollment_key": enrollment_key,
                    "os_info": os_info, "username": username, "agent_version": agent_version}
         try:
-            resp = requests.post(url, json=payload, timeout=DEFAULT_TIMEOUT)
+            resp = requests.post(url, json=payload, timeout=DEFAULT_TIMEOUT, allow_redirects=False)
+            if 300 <= resp.status_code < 400:
+                print("[policy_client] May chu chuyen huong yeu cau ghi danh. Dung dia chi API truc tiep.")
+                return None
             if resp.status_code == 409:
                 print("[policy_client] Hostname da dang ky roi. Dien lai api_token cu vao config.ini.")
                 return None
@@ -25,8 +28,10 @@ class PolicyClient:
             data = resp.json()
             self.api_token = data.get("api_token", "")
             return data
-        except requests.RequestException as e:
-            print(f"[policy_client] Loi register: {e}")
+        except (requests.RequestException, ValueError) as error:
+            response = getattr(error, "response", None)
+            detail = f" (HTTP {response.status_code})" if response is not None else ""
+            print(f"[policy_client] Loi register{detail}. Kiem tra ket noi va cau hinh ghi danh.")
             return None
 
     def get_policy(self):

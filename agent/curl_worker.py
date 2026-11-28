@@ -75,6 +75,13 @@ class _JobAccounting(ctypes.Structure):
     ]
 
 
+class _JobProcessIds(ctypes.Structure):
+    _fields_ = [
+        ("NumberOfAssignedProcesses", _DWORD), ("NumberOfProcessIdsInList", _DWORD),
+        ("ProcessIdList", _SIZE_T * 64),
+    ]
+
+
 def _kernel():
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     functions = {
@@ -83,6 +90,9 @@ def _kernel():
         "SetInformationJobObject": (wintypes.BOOL, _HANDLE, ctypes.c_int, _PTR, _DWORD),
         "QueryInformationJobObject": (wintypes.BOOL, _HANDLE, ctypes.c_int, _PTR, _DWORD, _PTR),
         "TerminateJobObject": (wintypes.BOOL, _HANDLE, wintypes.UINT),
+        "OpenProcess": (_HANDLE, _DWORD, wintypes.BOOL, _DWORD),
+        "GetProcessId": (_DWORD, _HANDLE),
+        "IsProcessInJob": (wintypes.BOOL, _HANDLE, _HANDLE, ctypes.POINTER(wintypes.BOOL)),
         "CreatePipe": (wintypes.BOOL, _PTR, _PTR, _PTR, _DWORD),
         "GetCurrentProcess": (_HANDLE,),
         "DuplicateHandle": (wintypes.BOOL, _HANDLE, _HANDLE, _HANDLE, _PTR,
@@ -180,26 +190,82 @@ def _create_process(kernel, job, interpreter, script, child_handles):
         kernel.DeleteProcThreadAttributeList(attributes)
 
 
-def _active_processes(kernel, job):
+def _job_accounting(kernel, job):
     accounting = _JobAccounting()
     _check(kernel.QueryInformationJobObject(job, 1, ctypes.byref(accounting),
                                             ctypes.sizeof(accounting), None))
-    return accounting.ActiveProcesses
+    return accounting
 
 
-def _reap_job(kernel, job, process, deadline):
+class _JobMembers:
+    def __init__(self, kernel, job, resources):
+        self.kernel = kernel
+        self.job = job
+        self.resources = resources
+        self.handles = {}
+
+    def add_worker(self, handle):
+        # CreateProcess returned the exact handle and assigned the job atomically.
+        self.handles[_check(self.kernel.GetProcessId(handle))] = handle
+
+    def discover(self):
+        listing = _JobProcessIds()
+        # Includes processes in nested jobs. An oversized or partial list
+        # cannot establish coverage of this small inspection job.
+        _check(self.kernel.QueryInformationJobObject(self.job, 3, ctypes.byref(listing),
+                                                     ctypes.sizeof(listing), None))
+        count = listing.NumberOfProcessIdsInList
+        if count != listing.NumberOfAssignedProcesses or count > len(listing.ProcessIdList):
+            raise OSError("Incomplete inspection job member list")
+        for pid in listing.ProcessIdList[:count]:
+            if pid in self.handles:
+                continue
+            # Retained handles keep their PID from being recycled. A new PID
+            # from a snapshot is only a hint until its opened object is verified.
+            handle = self.kernel.OpenProcess(0x101000, False, pid)  # SYNCHRONIZE | QUERY_LIMITED_INFORMATION
+            if not handle:
+                continue
+            try:
+                in_job = wintypes.BOOL()
+                if (self.kernel.GetProcessId(handle) == pid
+                        and self.kernel.IsProcessInJob(handle, self.job, ctypes.byref(in_job))
+                        and in_job.value):
+                    self.resources.callback(self.kernel.CloseHandle, handle)
+                    self.handles[pid] = handle
+                    handle = None
+            finally:
+                if handle:
+                    self.kernel.CloseHandle(handle)
+
+
+def _reap_job(kernel, job, members, deadline):
     try:
-        if _active_processes(kernel, job):
-            _check(kernel.TerminateJobObject(job, 1))
-        if process is not None:
-            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
-            if kernel.WaitForSingleObject(process, remaining_ms) != 0:
-                raise OSError("Inspection worker did not signal exit")
-        while _active_processes(kernel, job):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise OSError("Inspection job did not become empty")
-            time.sleep(min(remaining, 0.01))
+        minimum_total = 0
+        while True:
+            previous_count = len(members.handles)
+            try:
+                members.discover()
+            finally:
+                # Even a failed snapshot must attempt to stop the private job.
+                _check(kernel.TerminateJobObject(job, 1))
+            if minimum_total and len(members.handles) == previous_count:
+                raise OSError("Unable to verify every inspection job member")
+            for handle in members.handles.values():
+                remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+                if kernel.WaitForSingleObject(handle, remaining_ms) != 0:
+                    raise OSError("Inspection job member did not signal exit")
+            # No tracked process can start another child after it signals.
+            # Reconcile the lifetime count after the waits to catch members
+            # that joined late or exited between snapshots. Holds on signaled
+            # objects can outlast their execution and affect active accounting.
+            total = _job_accounting(kernel, job).TotalProcesses
+            if time.monotonic() > deadline:
+                raise OSError("Inspection job cleanup exceeded its deadline")
+            if total < max(minimum_total, len(members.handles)):
+                raise OSError("Inconsistent inspection job lifetime accounting")
+            if total == len(members.handles):
+                return
+            minimum_total = total
     except OSError as exc:
         # The parent's last non-inherited job handle still closes on this path.
         raise WorkerCleanupUnconfirmed("Could not confirm inspection job cleanup") from exc
@@ -269,12 +335,15 @@ class _PipeExchange:
             raise WorkerCleanupUnconfirmed("Inspection pipe I/O did not finish")
 
 
-def _monitor(kernel, process, exchange, deadline, timeout):
+def _monitor(kernel, process, exchange, members, deadline, timeout):
     while True:
         if exchange.overflow.is_set():
             raise ValueError("Inspection worker response exceeded its size limit")
         if exchange.failed.is_set():
             raise OSError("Inspection worker pipe failed")
+        if time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired("inspection worker", timeout)
+        members.discover()
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise subprocess.TimeoutExpired("inspection worker", timeout)
@@ -323,6 +392,7 @@ def run_inspection_worker(script_path: Path, payload: bytes, origin_token: int, 
 
     with ExitStack() as resources:
         job = _new_job(kernel, resources)
+        members = _JobMembers(kernel, job, resources)
         process = None
         exchange = None
         try:
@@ -342,14 +412,20 @@ def run_inspection_worker(script_path: Path, payload: bytes, origin_token: int, 
                                         for handle in (stdin_reader, stdout_writer, stderr_handle, origin_token))
                         process = _create_process(kernel, job, interpreter, script, handles)
                         resources.callback(kernel.CloseHandle, process)
+                        members.add_worker(process)
                     exchange = _PipeExchange(reader_fd, writer_fd, payload)
                     owned_fds.pop_all()  # Exchange owns both descriptors now.
             exchange.start()
-            return _monitor(kernel, process, exchange, deadline, timeout)
+            return _monitor(kernel, process, exchange, members, deadline, timeout)
         finally:
             cleanup_deadline = time.monotonic() + CLEANUP_TIMEOUT
             try:
-                _reap_job(kernel, job, process, cleanup_deadline)
-            finally:
-                if exchange is not None:
-                    exchange.close(cleanup_deadline)
+                try:
+                    _reap_job(kernel, job, members, cleanup_deadline)
+                finally:
+                    if exchange is not None:
+                        exchange.close(cleanup_deadline)
+            except WorkerCleanupUnconfirmed:
+                raise
+            except Exception as exc:
+                raise WorkerCleanupUnconfirmed("Could not confirm inspection worker cleanup") from exc

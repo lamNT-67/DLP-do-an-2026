@@ -1,47 +1,95 @@
-# Go agent: xoa service + firewall rule DLP_*. Them -RemoveFiles de xoa luon C:\DLP va log.
-param([switch]$RemoveFiles)
-$ErrorActionPreference = 'Continue'
+param([switch]$RemoveFiles, [switch]$NoPrompt)
+$ErrorActionPreference = 'Stop'
 
-$principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
-if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $PSCommandPath))
-    if ($RemoveFiles) { $argList += '-RemoveFiles' }
-    Start-Process powershell.exe -Verb RunAs -ArgumentList $argList
-    exit
-}
-
-. (Join-Path $PSScriptRoot 'curl_task.ps1')
-$curlDeployment = $null
-try {
-    $curlDeployment = Open-CurlDeployment $false
-    Uninstall-CurlTask $curlDeployment $RemoveFiles.IsPresent
-} catch {
-    Close-CurlDeployment $curlDeployment
-    Write-Error ("Uninstall stopped before shared teardown: " + $_.Exception.Message)
+if (-not [Environment]::Is64BitProcess -or [Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne 'X64') {
+    Write-Host 'Use 64-bit Windows PowerShell on AMD64 Windows to run DLP uninstall.' -ForegroundColor Red
     exit 1
 }
-try {
-$nssm = 'C:\DLP\tools\nssm.exe'
-foreach ($n in 'DLPNetworkAgent', 'DLPSftpScpAgent', 'DLPBrowserAgent') {
-    if (Get-Service $n -ErrorAction SilentlyContinue) {
-        Stop-Service $n -Force -ErrorAction SilentlyContinue
-        if (Test-Path $nssm) { & $nssm remove $n confirm 2>&1 | Out-Null }
-        else { sc.exe delete $n | Out-Null }
-        Write-Host "Da xoa service $n"
+$principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    $argsForChild = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $PSCommandPath))
+    if ($RemoveFiles) { $argsForChild += '-RemoveFiles' }
+    if ($NoPrompt) { $argsForChild += '-NoPrompt' }
+    $powershell = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
+    try {
+        $child = Start-Process -FilePath $powershell -Verb RunAs -ArgumentList $argsForChild -Wait -PassThru
+        exit $child.ExitCode
+    } catch {
+        for ($cause = $_.Exception; $cause; $cause = $cause.InnerException) {
+            if ($cause -is [ComponentModel.Win32Exception] -and $cause.NativeErrorCode -eq 1223) { exit 1223 }
+        }
+        Write-Host ("Could not start elevated DLP uninstall. " + $_.Exception.Message) -ForegroundColor Red
+        exit 1
     }
 }
 
-Stop-ScheduledTask -TaskName 'DLPNotifier' -ErrorAction SilentlyContinue
-Stop-ScheduledTask -TaskName 'DLPClipboardAgent' -ErrorAction SilentlyContinue; Get-CimInstance Win32_Process -Filter "name='python.exe'" | Where-Object { $_.CommandLine -like '*clipboard_agent*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; Unregister-ScheduledTask -TaskName 'DLPClipboardAgent' -Confirm:$false -ErrorAction SilentlyContinue; Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' -Name WebCaptureEnabled -ErrorAction SilentlyContinue; Unregister-ScheduledTask -TaskName 'DLPNotifier' -Confirm:$false -ErrorAction SilentlyContinue
-Write-Host 'Da xoa tac vu thong bao DLPNotifier'
-Get-NetFirewallRule -DisplayName 'DLP_*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
-Write-Host 'Da xoa firewall rule DLP_*'
+$state = $null
+$curlDeployment = $null
+$layout = $null
+$recovery = $null
+$recoveryHandle = $null
+$cutoverStarted = $false
+$exitCode = 0
+$originalModulePath = $env:PSModulePath
+try {
+    $env:PSModulePath = [IO.Path]::Combine($PSHOME, 'Modules')
+    foreach ($file in 'curl_task.ps1', 'installer_python.ps1', 'installer_migration.ps1', 'installer_services.ps1') {
+        . (Join-Path $PSScriptRoot $file)
+    }
+    $state = Open-DlpSetupState
+    $curlDeployment = Open-CurlDeployment $false
+    if ($curlDeployment) { $folder = $curlDeployment.Folder }
+    else {
+        $scheduler = New-Object -ComObject 'Schedule.Service'
+        $scheduler.Connect()
+        $folder = $scheduler.GetFolder('\')
+    }
+    $inventory = Get-DlpSharedInventory $folder
+    if ($RemoveFiles) {
+        $layout = Open-DlpLayout 'C:\DLP' 'C:\ProgramData\DLP'
+        Assert-DlpInstallIdentity $layout $inventory $curlDeployment
+    }
+    $recovery = New-DlpRecoveryDirectory $state
+    if ($layout) {
+        $recoveryHandle = Open-DlpProtectedDirectory $recovery
+        Assert-DlpSameVolume $layout.Volume $recoveryHandle
+    }
 
-if ($RemoveFiles) {
-    Start-Sleep 2
-    Remove-Item 'C:\DLP' -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item 'C:\ProgramData\DLP' -Recurse -Force -ErrorAction SilentlyContinue
-    Write-Host 'Da xoa C:\DLP va C:\ProgramData\DLP'
+    if ($curlDeployment) { Enter-CurlMaintenance $curlDeployment $curlDeployment.Task }
+    Start-DlpCutover $state $recovery
+    $cutoverStarted = $true
+    Stop-DlpSharedWork $folder $inventory
+    Remove-DlpSharedRegistrations $folder $inventory
+    Uninstall-CurlTask $curlDeployment $RemoveFiles.IsPresent
+    if ($layout) { Move-DlpLayout $layout $recoveryHandle $recovery }
+
+    if ($inventory.Tasks.ContainsKey('DLPClipboardAgent')) {
+        $edge = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge'
+        $setting = Get-ItemProperty -LiteralPath $edge -Name WebCaptureEnabled -ErrorAction SilentlyContinue
+        if ($setting -and $setting.WebCaptureEnabled -eq 0) { Remove-ItemProperty -LiteralPath $edge -Name WebCaptureEnabled }
+    }
+    $patterns = @()
+    if ($inventory.Services.ContainsKey('DLPNetworkAgent')) { $patterns += 'DLP_Block_*' }
+    if ($inventory.Services.ContainsKey('DLPSftpScpAgent')) { $patterns += 'DLP_BlockSftp_*' }
+    foreach ($pattern in $patterns) {
+        Get-NetFirewallRule -PolicyStore PersistentStore -DisplayName $pattern -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+    }
+    [IO.File]::Delete($state.Pending)
+    Write-Host 'DLP services and scheduled tasks withdrawn.'
+    if ($layout.Install -or $layout.Data) { Write-Host "Shared files and logs retained at '$recovery'." }
+} catch {
+    $exitCode = 1
+    Write-Host ("DLP uninstall failed. " + $_.Exception.Message) -ForegroundColor Red
+    if ($cutoverStarted) { Write-Warning "Cutover is held for review at '$recovery'. See INSTALLER_PYTHON.md." }
+} finally {
+    try {
+        if ($recoveryHandle) { $recoveryHandle.Dispose() }
+        if ($layout) { Close-DlpLayout $layout }
+        if ($curlDeployment) { Close-CurlDeployment $curlDeployment }
+    } finally {
+        if ($state) { $state.Lock.Dispose() }
+        $env:PSModulePath = $originalModulePath
+    }
+    if (-not $NoPrompt) { Read-Host 'Press Enter to close' }
 }
-} finally { Close-CurlDeployment $curlDeployment }
-Read-Host "`nNhan Enter de dong"
+exit $exitCode
